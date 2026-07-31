@@ -1,0 +1,65 @@
+{
+  "name": "酷狗音乐",
+  "type": "custom",
+  "search": {
+    "url": "http://mobilecdn.kugou.com/api/v3/search/song",
+    "method": "GET",
+    "params": {
+      "format": "json",
+      "keyword": "{keyword}",
+      "page": "1",
+      "pagesize": "20"
+    },
+    "headers": {
+      "Referer": "https://www.kugou.com/"
+    },
+    "response": {
+      "listPath": "data.info",
+      "songId": "hash",
+      "songIdStrip": "",
+      "songName": "songname",
+      "artist": "singername",
+      "album": "album_name",
+      "duration": "duration",
+      "coverUrl": "",
+      "coverPrefix": "",
+      "coverSuffix": "",
+      "isPay": ""
+    }
+  },
+  "play": {
+    "url": "https://music.haitangw.cc/kgqq/kg.php",
+    "method": "GET",
+    "params": {
+      "type": "mp3",
+      "id": "{songId}",
+      "level": "standard"
+    },
+    "headers": {
+      "Referer": "https://www.kugou.com/"
+    },
+    "response": {
+      "type": "json",
+      "urlPath": "url",
+      "codePath": "code",
+      "successCode": "200",
+      "urlPrefix": ""
+    }
+  },
+  "lyric": {
+    "url": "https://api.lrc.cx/lyrics",
+    "method": "GET",
+    "params": {
+      "song": "{songName}",
+      "artist": "{artist}"
+    },
+    "response": {
+      "type": "plain_text",
+      "listPath": "",
+      "lrcPath": "",
+      "tlyricPath": "",
+      "timeField": "time",
+      "textField": "lineLyric"
+    }
+  }
+}

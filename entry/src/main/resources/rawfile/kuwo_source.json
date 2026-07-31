@@ -1,0 +1,76 @@
+{
+  "name": "酷我音乐",
+  "type": "custom",
+  "search": {
+    "url": "http://search.kuwo.cn/r.s",
+    "method": "GET",
+    "params": {
+      "client": "kt",
+      "all": "{keyword}",
+      "pn": "0",
+      "rn": "20",
+      "ft": "music",
+      "rformat": "json",
+      "encoding": "utf8"
+    },
+    "headers": {
+      "Referer": "http://www.kuwo.cn/",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    },
+    "response": {
+      "listPath": "abslist",
+      "songId": "MUSICRID",
+      "songIdStrip": "MUSIC_",
+      "songName": "NAME",
+      "artist": "ARTIST",
+      "album": "ALBUM",
+      "duration": "DURATION",
+      "coverUrl": "",
+      "coverPrefix": "",
+      "coverSuffix": "",
+      "isPay": ""
+    }
+  },
+  "play": {
+    "url": "https://nmobi.kuwo.cn/mobi.s",
+    "method": "GET",
+    "params": {
+      "f": "web",
+      "source": "kwplayercar_ar_6.0.0.9_B_jiakong_vh.apk",
+      "type": "convert_url_with_sign",
+      "rid": "{songId}",
+      "br": "2000kflac",
+      "user": "0",
+      "loginUid": "0"
+    },
+    "headers": {
+      "Referer": "http://www.kuwo.cn/"
+    },
+    "response": {
+      "type": "json",
+      "urlPath": "data.url",
+      "codePath": "code",
+      "successCode": "200",
+      "urlPrefix": ""
+    }
+  },
+  "lyric": {
+    "url": "http://m.kuwo.cn/newh5/singles/songinfoandlrc",
+    "method": "GET",
+    "params": {
+      "musicId": "{songId}",
+      "httpsStatus": "1"
+    },
+    "headers": {
+      "Referer": "http://www.kuwo.cn/"
+    },
+    "response": {
+      "type": "json",
+      "listPath": "data.lrclist",
+      "lrcPath": "",
+      "tlyricPath": "",
+      "timeField": "time",
+      "textField": "lineLyric"
+    }
+  }
+}

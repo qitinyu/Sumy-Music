@@ -1,0 +1,68 @@
+{
+  "name": "QQ音乐",
+  "type": "custom",
+  "search": {
+    "url": "https://c.y.qq.com/soso/fcgi-bin/client_search_cp",
+    "method": "GET",
+    "params": {
+      "format": "json",
+      "w": "{keyword}",
+      "n": "20",
+      "p": "1"
+    },
+    "headers": {
+      "Referer": "https://y.qq.com/"
+    },
+    "response": {
+      "listPath": "data.song.list",
+      "songId": "songmid",
+      "songIdStrip": "",
+      "songName": "songname",
+      "artist": "singer[0].name",
+      "album": "albumname",
+      "duration": "interval",
+      "coverUrl": "albummid",
+      "coverPrefix": "https://y.gtimg.cn/music/photo_new/T002R300x300M000",
+      "coverSuffix": ".jpg",
+      "isPay": ""
+    }
+  },
+  "play": {
+    "url": "https://api.vkeys.cn/v2/music/tencent/geturl",
+    "method": "GET",
+    "params": {
+      "mid": "{songId}",
+      "quality": "6"
+    },
+    "headers": {
+      "Referer": "https://y.qq.com/"
+    },
+    "response": {
+      "type": "json",
+      "urlPath": "data.url",
+      "codePath": "code",
+      "successCode": "200",
+      "urlPrefix": ""
+    }
+  },
+  "lyric": {
+    "url": "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg",
+    "method": "GET",
+    "params": {
+      "songmid": "{songId}",
+      "format": "json",
+      "nobase64": "1"
+    },
+    "headers": {
+      "Referer": "https://y.qq.com/"
+    },
+    "response": {
+      "type": "json",
+      "listPath": "",
+      "lrcPath": "lyric",
+      "tlyricPath": "trans",
+      "timeField": "time",
+      "textField": "lineLyric"
+    }
+  }
+}
