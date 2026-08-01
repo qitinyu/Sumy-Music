@@ -73,7 +73,8 @@ const aboutItems: AboutItem[] = [
       '2. 适配剩余图标的沉浸光感\n' +
       '3. 增加华为账号登录(仅登录)\n' +
       '4. 增加自建本地歌单内页面增量防止底部栏遮盖\n' +
-      '5. 完整更新日志(https://yqamm.top/posts/sumy/sumygx/)',
+      '5. 完整更新日志\n' +
+      'https://yqamm.top/posts/sumy/sumygx/',
   },
 
   {
@@ -91,8 +92,8 @@ const aboutItems: AboutItem[] = [
     label: '更新',
     type: 'links',
     urls: [
-      { label: 'GitHub Release', url: 'https://github.com/qitinyu/SHMY/releases/tag/v2.0.0.1' },
-      { label: 'GitCode Release', url: 'https://gitcode.com/YQAMM/Sumy-Music/releases/V2.0.0.1' },
+      { label: 'GitHub Release', url: 'https://github.com/qitinyu/SHMY/releases/tag/v2.0.0.3' },
+      { label: 'GitCode Release', url: 'https://gitcode.com/YQAMM/Sumy-Music/releases/V2.0.0.3' },
     ],
   },
 ]
