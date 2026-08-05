@@ -134,6 +134,14 @@ struct Index {
     AppStorage.setOrCreate('showFullPlayer', false)
   }
 
+  onBackPress(): boolean {
+    if (this.showPlayerOverlay) {
+      this.closePlayerOverlay()
+      return true
+    }
+    return false
+  }
+
   private getBarFloatingStyle(): HdsTabsFloatingStyle {
     return {
       barBottomMargin: 20,
