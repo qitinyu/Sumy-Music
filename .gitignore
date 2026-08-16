@@ -1,0 +1,51 @@
+/node_modules
+/oh_modules
+local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# 签名证书和密钥（敏感）
+*.p12
+*.cer
+*.p7b
+.csr
+/fbzs/
+
+# 根目录 build-profile（含签名密码）
+/build-profile.json5
+
+# AGC 配置（含 client_secret / api_key，敏感）
+/entry/agconnect-services.json
+
+# 崩溃日志和临时文件
+hs_err_pid*.log
+replay_pid*.log
+*.log
+/log/
+
+# 临时脚本和截图
+write_musicapi.ps1
+img*.png
+
+# 本地参考项目 / 缓存 / 用户数据（不入库）
+/123/
+/lx/
+/material/
+/音源/
+
+# 开发辅助脚本与内部文档
+/check_plugins.js
+/fix_plugins.js
+/fix_plugins_deep.js
+/fix_plugins_strong.js
+/Sumy V1.0.9.md
+
+# AI 工具生成文件
+.codegenie/

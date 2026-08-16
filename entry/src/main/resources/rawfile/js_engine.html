@@ -1,0 +1,1405 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS Engine</title>
+</head>
+<body>
+<script>
+/* ================================================================
+ * SHMY 陋室 JS 音源引擎（LX Music 插件兼容层）
+ * 通过 registerJavaScriptProxy 注入的宿主对象 window.__host（全部同步方法）：
+ *   __host.httpStart(url, method, data, headersJson, contentType, timeoutMs) -> token
+ *   __host.httpPoll(token)   -> 请求结果 JSON {statusCode, body, headers, error}，未完成返回 ''
+ *   __host.httpDone(token)   -> 清理
+ *   __host.log(msg)
+ * 说明：async 代理方法在部分设备上 Promise 无法被 JS await，故统一改为同步启动+轮询模式。
+ * 插件代码可直接使用全局：request / http.get / http.post / log / crypto
+ * ================================================================ */
+
+/* ---------------- MD5（blueimp 风格，公共领域） ---------------- */
+var MD5 = (function () {
+  function safeAdd(x, y) {
+    var lsw = (x & 0xffff) + (y & 0xffff);
+    var msw = (x >> 16) + (y >> 16) + (lsw >> 16);
+    return (msw << 16) | (lsw & 0xffff);
+  }
+  function bitRotateLeft(num, cnt) { return (num << cnt) | (num >>> (32 - cnt)); }
+  function md5cmn(q, a, b, x, s, t) { return safeAdd(bitRotateLeft(safeAdd(safeAdd(a, q), safeAdd(x, t)), s), b); }
+  function md5ff(a, b, c, d, x, s, t) { return md5cmn((b & c) | (~b & d), a, b, x, s, t); }
+  function md5gg(a, b, c, d, x, s, t) { return md5cmn((b & d) | (c & ~d), a, b, x, s, t); }
+  function md5hh(a, b, c, d, x, s, t) { return md5cmn(b ^ c ^ d, a, b, x, s, t); }
+  function md5ii(a, b, c, d, x, s, t) { return md5cmn(c ^ (b | ~d), a, b, x, s, t); }
+  function binlMD5(x, len) {
+    x[len >> 5] |= 0x80 << (len % 32);
+    x[(((len + 64) >>> 9) << 4) + 14] = len;
+    var a = 1732584193, b = -271733879, c = -1732584194, d = 271733878;
+    for (var i = 0; i < x.length; i += 16) {
+      var olda = a, oldb = b, oldc = c, oldd = d;
+      a = md5ff(a, b, c, d, x[i], 7, -680876936);
+      d = md5ff(d, a, b, c, x[i + 1], 12, -389564586);
+      c = md5ff(c, d, a, b, x[i + 2], 17, 606105819);
+      b = md5ff(b, c, d, a, x[i + 3], 22, -1044525330);
+      a = md5ff(a, b, c, d, x[i + 4], 7, -176418897);
+      d = md5ff(d, a, b, c, x[i + 5], 12, 1200080426);
+      c = md5ff(c, d, a, b, x[i + 6], 17, -1473231341);
+      b = md5ff(b, c, d, a, x[i + 7], 22, -45705983);
+      a = md5ff(a, b, c, d, x[i + 8], 7, 1770035416);
+      d = md5ff(d, a, b, c, x[i + 9], 12, -1958414417);
+      c = md5ff(c, d, a, b, x[i + 10], 17, -42063);
+      b = md5ff(b, c, d, a, x[i + 11], 22, -1990404162);
+      a = md5ff(a, b, c, d, x[i + 12], 7, 1804603682);
+      d = md5ff(d, a, b, c, x[i + 13], 12, -40341101);
+      c = md5ff(c, d, a, b, x[i + 14], 17, -1502002290);
+      b = md5ff(b, c, d, a, x[i + 15], 22, 1236535329);
+      a = md5gg(a, b, c, d, x[i + 1], 5, -165796510);
+      d = md5gg(d, a, b, c, x[i + 6], 9, -1069501632);
+      c = md5gg(c, d, a, b, x[i + 11], 14, 643717713);
+      b = md5gg(b, c, d, a, x[i], 20, -373897302);
+      a = md5gg(a, b, c, d, x[i + 5], 5, -701558691);
+      d = md5gg(d, a, b, c, x[i + 10], 9, 38016083);
+      c = md5gg(c, d, a, b, x[i + 15], 14, -660478335);
+      b = md5gg(b, c, d, a, x[i + 4], 20, -405537848);
+      a = md5gg(a, b, c, d, x[i + 9], 5, 568446438);
+      d = md5gg(d, a, b, c, x[i + 14], 9, -1019803690);
+      c = md5gg(c, d, a, b, x[i + 3], 14, -187363961);
+      b = md5gg(b, c, d, a, x[i + 8], 20, 1163531501);
+      a = md5gg(a, b, c, d, x[i + 13], 5, -1444681467);
+      d = md5gg(d, a, b, c, x[i + 2], 9, -51403784);
+      c = md5gg(c, d, a, b, x[i + 7], 14, 1735328473);
+      b = md5gg(b, c, d, a, x[i + 12], 20, -1926607734);
+      a = md5hh(a, b, c, d, x[i + 5], 4, -378558);
+      d = md5hh(d, a, b, c, x[i + 8], 11, -2022574463);
+      c = md5hh(c, d, a, b, x[i + 11], 16, 1839030562);
+      b = md5hh(b, c, d, a, x[i + 14], 23, -35309556);
+      a = md5hh(a, b, c, d, x[i + 1], 4, -1530992060);
+      d = md5hh(d, a, b, c, x[i + 4], 11, 1272893353);
+      c = md5hh(c, d, a, b, x[i + 7], 16, -155497632);
+      b = md5hh(b, c, d, a, x[i + 10], 23, -1094730640);
+      a = md5hh(a, b, c, d, x[i + 13], 4, 681279174);
+      d = md5hh(d, a, b, c, x[i], 11, -358537222);
+      c = md5hh(c, d, a, b, x[i + 3], 16, -722521979);
+      b = md5hh(b, c, d, a, x[i + 6], 23, 76029189);
+      a = md5hh(a, b, c, d, x[i + 9], 4, -640364487);
+      d = md5hh(d, a, b, c, x[i + 12], 11, -421815835);
+      c = md5hh(c, d, a, b, x[i + 15], 16, 530742520);
+      b = md5hh(b, c, d, a, x[i + 2], 23, -995338651);
+      a = md5ii(a, b, c, d, x[i], 6, -198630844);
+      d = md5ii(d, a, b, c, x[i + 7], 10, 1126891415);
+      c = md5ii(c, d, a, b, x[i + 14], 15, -1416354905);
+      b = md5ii(b, c, d, a, x[i + 5], 21, -57434055);
+      a = md5ii(a, b, c, d, x[i + 12], 6, 1700485571);
+      d = md5ii(d, a, b, c, x[i + 3], 10, -1894986606);
+      c = md5ii(c, d, a, b, x[i + 10], 15, -1051523);
+      b = md5ii(b, c, d, a, x[i + 1], 21, -2054922799);
+      a = md5ii(a, b, c, d, x[i + 8], 6, 1873313359);
+      d = md5ii(d, a, b, c, x[i + 15], 10, -30611744);
+      c = md5ii(c, d, a, b, x[i + 6], 15, -1560198380);
+      b = md5ii(b, c, d, a, x[i + 13], 21, 1309151649);
+      a = md5ii(a, b, c, d, x[i + 4], 6, -145523070);
+      d = md5ii(d, a, b, c, x[i + 11], 10, -1120210379);
+      c = md5ii(c, d, a, b, x[i + 2], 15, 718787259);
+      b = md5ii(b, c, d, a, x[i + 9], 21, -343485551);
+      a = safeAdd(a, olda);
+      b = safeAdd(b, oldb);
+      c = safeAdd(c, oldc);
+      d = safeAdd(d, oldd);
+    }
+    return [a, b, c, d];
+  }
+  function binl2rstr(input) {
+    var output = '';
+    for (var i = 0; i < input.length * 32; i += 8) {
+      output += String.fromCharCode((input[i >> 5] >>> (i % 32)) & 0xff);
+    }
+    return output;
+  }
+  function rstr2binl(input) {
+    var output = [];
+    output[(input.length >> 2) - 1] = undefined;
+    for (var i = 0; i < output.length; i += 1) output[i] = 0;
+    for (var i = 0; i < input.length * 8; i += 8) {
+      output[i >> 5] |= (input.charCodeAt(i / 8) & 0xff) << (i % 32);
+    }
+    return output;
+  }
+  function rstrMD5(s) { return binl2rstr(binlMD5(rstr2binl(s), s.length * 8)); }
+  function rstr2hex(input) {
+    var hexTab = '0123456789abcdef';
+    var output = '';
+    for (var i = 0; i < input.length; i += 1) {
+      var x = input.charCodeAt(i);
+      output += hexTab.charAt((x >>> 4) & 0x0f) + hexTab.charAt(x & 0x0f);
+    }
+    return output;
+  }
+  function str2rstrUTF8(input) {
+    return unescape(encodeURIComponent(input));
+  }
+  return function (s) { return rstr2hex(rstrMD5(str2rstrUTF8(s))); };
+})();
+
+/* ---------------- SHA-1 ---------------- */
+var SHA1 = (function () {
+  function safeAdd(x, y) {
+    var lsw = (x & 0xffff) + (y & 0xffff);
+    var msw = (x >> 16) + (y >> 16) + (lsw >> 16);
+    return (msw << 16) | (lsw & 0xffff);
+  }
+  function rol(num, cnt) { return (num << cnt) | (num >>> (32 - cnt)); }
+  function ft(t, b, c, d) {
+    if (t < 20) return (b & c) | (~b & d);
+    if (t < 40) return b ^ c ^ d;
+    if (t < 60) return (b & c) | (b & d) | (c & d);
+    return b ^ c ^ d;
+  }
+  function kt(t) {
+    return (t < 20) ? 1518500249 : (t < 40) ? 1859775393 : (t < 60) ? -1894007588 : -899497514;
+  }
+  function str2binl(str) {
+    var bin = [];
+    bin[(str.length >> 2) - 1] = undefined;
+    for (var i = 0; i < bin.length; i += 1) bin[i] = 0;
+    for (var i = 0; i < str.length * 8; i += 8) {
+      bin[i >> 5] |= (str.charCodeAt(i / 8) & 0xff) << (i % 32);
+    }
+    return bin;
+  }
+  function binl2hex(binarray) {
+    var hexTab = '0123456789abcdef';
+    var str = '';
+    for (var i = 0; i < binarray.length * 4; i += 1) {
+      str += hexTab.charAt((binarray[i >> 2] >> ((3 - (i % 4)) * 8 + 4)) & 0xf) +
+        hexTab.charAt((binarray[i >> 2] >> ((3 - (i % 4)) * 8)) & 0xf);
+    }
+    return str;
+  }
+  function binlSHA1(x, len) {
+    x[len >> 5] |= 0x80 << (24 - (len % 32));
+    x[(((len + 64) >> 9) << 4) + 15] = len;
+    var w = [];
+    var a = 1732584193, b = -271733879, c = -1732584194, d = 271733878, e = -1009589776;
+    for (var i = 0; i < x.length; i += 16) {
+      var olda = a, oldb = b, oldc = c, oldd = d, olde = e;
+      for (var j = 0; j < 80; j += 1) {
+        if (j < 16) w[j] = x[i + j];
+        else w[j] = rol(w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16], 1);
+        var t = safeAdd(safeAdd(rol(a, 5), ft(j, b, c, d)), safeAdd(safeAdd(e, w[j]), kt(j)));
+        e = d; d = c; c = rol(b, 30); b = a; a = t;
+      }
+      a = safeAdd(a, olda); b = safeAdd(b, oldb); c = safeAdd(c, oldc);
+      d = safeAdd(d, oldd); e = safeAdd(e, olde);
+    }
+    return [a, b, c, d, e];
+  }
+  return function (s) {
+    return binl2hex(binlSHA1(str2binl(unescape(encodeURIComponent(s))), s.length * 8));
+  };
+})();
+
+/* ---------------- SHA-256 ---------------- */
+var SHA256 = (function () {
+  var K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+  function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+  function ch(x, y, z) { return (x & y) ^ (~x & z); }
+  function maj(x, y, z) { return (x & y) ^ (x & z) ^ (y & z); }
+  function bsig0(x) { return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22); }
+  function bsig1(x) { return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25); }
+  function ssig0(x) { return rotr(x, 7) ^ rotr(x, 18) ^ (x >>> 3); }
+  function ssig1(x) { return rotr(x, 17) ^ rotr(x, 19) ^ (x >>> 10); }
+  return function (msg) {
+    var msg2 = unescape(encodeURIComponent(msg));
+    var l = msg2.length, bitLenHi = 0, bitLenLo = l * 8;
+    var padded = [];
+    for (var i = 0; i < l; i++) padded.push(msg2.charCodeAt(i));
+    padded.push(0x80);
+    while (padded.length % 64 !== 56) padded.push(0);
+    padded.push((bitLenHi >>> 24) & 0xff, (bitLenHi >>> 16) & 0xff, (bitLenHi >>> 8) & 0xff, bitLenHi & 0xff);
+    padded.push((bitLenLo >>> 24) & 0xff, (bitLenLo >>> 16) & 0xff, (bitLenLo >>> 8) & 0xff, bitLenLo & 0xff);
+    var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var w = new Array(64);
+    for (var block = 0; block < padded.length; block += 64) {
+      for (var t = 0; t < 16; t++) {
+        var off = block + t * 4;
+        w[t] = ((padded[off] << 24) | (padded[off + 1] << 16) | (padded[off + 2] << 8) | padded[off + 3]) >>> 0;
+      }
+      for (var t2 = 16; t2 < 64; t2++) {
+        w[t2] = (ssig1(w[t2 - 2]) + w[t2 - 7] + ssig0(w[t2 - 15]) + w[t2 - 16]) >>> 0;
+      }
+      var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+      for (var t3 = 0; t3 < 64; t3++) {
+        var t1 = (h + bsig1(e) + ch(e, f, g) + K[t3] + w[t3]) >>> 0;
+        var t2 = (bsig0(a) + maj(a, b, c)) >>> 0;
+        h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+      H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+    }
+    var hex = '';
+    for (var i = 0; i < H.length; i++) {
+      hex += ('00000000' + (H[i] >>> 0).toString(16)).slice(-8);
+    }
+    return hex;
+  };
+})();
+
+/* ---------------- AES（Rijndael，支持 128/256 位，ECB/CBC，PKCS7） ---------------- */
+var AES = (function () {
+  var sbox = [], invSbox = [];
+  (function () {
+    var p = new Array(256), q = new Array(256);
+    var x = 1;
+    for (var i = 0; i < 256; i++) {
+      p[i] = x;
+      q[x] = i;
+      x = (x ^ ((x << 1) ^ ((x & 0x80) ? 0x1b : 0))) & 0xff;
+    }
+    function rotl8(v, n) { return ((v << n) | (v >>> (8 - n))) & 0xff; }
+    for (var i = 0; i < 256; i++) {
+      var inv = (i === 0) ? 0 : p[(255 - q[i]) % 255];
+      sbox[i] = (inv ^ rotl8(inv, 1) ^ rotl8(inv, 2) ^ rotl8(inv, 3) ^ rotl8(inv, 4) ^ 0x63) & 0xff;
+    }
+    for (var i = 0; i < 256; i++) invSbox[sbox[i]] = i;
+  })();
+  var RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
+  function xtime(a) { return ((a << 1) ^ ((a & 0x80) ? 0x1b : 0)) & 0xff; }
+  function mul(a, b) {
+    var res = 0;
+    while (b > 0) {
+      if (b & 1) res ^= a;
+      a = xtime(a);
+      b >>>= 1;
+    }
+    return res & 0xff;
+  }
+  function expandKey(keyBytes) {
+    var Nk = keyBytes.length / 4;
+    var Nr = Nk + 6;
+    var w = new Array(4 * (Nr + 1));
+    for (var i = 0; i < Nk; i++) {
+      w[i] = ((keyBytes[4 * i] << 24) | (keyBytes[4 * i + 1] << 16) | (keyBytes[4 * i + 2] << 8) | keyBytes[4 * i + 3]) >>> 0;
+    }
+    for (var i = Nk; i < w.length; i++) {
+      var temp = w[i - 1];
+      if (i % Nk === 0) {
+        temp = ((temp << 8) | (temp >>> 24)) >>> 0;
+        var r0 = sbox[(temp >>> 24) & 0xff], r1 = sbox[(temp >>> 16) & 0xff], r2 = sbox[(temp >>> 8) & 0xff], r3 = sbox[temp & 0xff];
+        temp = ((r0 << 24) | (r1 << 16) | (r2 << 8) | r3) ^ (RCON[i / Nk - 1] << 24);
+        temp >>>= 0;
+      } else if (Nk > 6 && i % Nk === 4) {
+        var c0 = sbox[(temp >>> 24) & 0xff], c1 = sbox[(temp >>> 16) & 0xff], c2 = sbox[(temp >>> 8) & 0xff], c3 = sbox[temp & 0xff];
+        temp = ((c0 << 24) | (c1 << 16) | (c2 << 8) | c3) >>> 0;
+      }
+      w[i] = (w[i - Nk] ^ temp) >>> 0;
+    }
+    return w;
+  }
+  function addRoundKey(state, w, round) {
+    for (var c = 0; c < 4; c++) {
+      var kw = w[round * 4 + c];
+      for (var r = 0; r < 4; r++) {
+        state[r + 4 * c] ^= (kw >>> (24 - 8 * r)) & 0xff;
+      }
+    }
+  }
+  function encryptBlock(w, Nr, input) {
+    var s = input.slice(0, 16);
+    addRoundKey(s, w, 0);
+    for (var round = 1; round < Nr; round++) {
+      for (var i = 0; i < 16; i++) s[i] = sbox[s[i]];
+      var tmp = s.slice(0);
+      for (var c = 0; c < 4; c++) {
+        for (var r = 0; r < 4; r++) s[r + 4 * c] = tmp[r + 4 * ((c + r) % 4)];
+      }
+      for (var c2 = 0; c2 < 4; c2++) {
+        var a0 = s[4 * c2], a1 = s[4 * c2 + 1], a2 = s[4 * c2 + 2], a3 = s[4 * c2 + 3];
+        s[4 * c2] = mul(a0, 2) ^ mul(a1, 3) ^ a2 ^ a3;
+        s[4 * c2 + 1] = a0 ^ mul(a1, 2) ^ mul(a2, 3) ^ a3;
+        s[4 * c2 + 2] = a0 ^ a1 ^ mul(a2, 2) ^ mul(a3, 3);
+        s[4 * c2 + 3] = mul(a0, 3) ^ a1 ^ a2 ^ mul(a3, 2);
+      }
+      addRoundKey(s, w, round);
+    }
+    for (var i2 = 0; i2 < 16; i2++) s[i2] = sbox[s[i2]];
+    var tmp2 = s.slice(0);
+    for (var c3 = 0; c3 < 4; c3++) {
+      for (var r2 = 0; r2 < 4; r2++) s[r2 + 4 * c3] = tmp2[r2 + 4 * ((c3 + r2) % 4)];
+    }
+    addRoundKey(s, w, Nr);
+    return s;
+  }
+  function decryptBlock(w, Nr, input) {
+    var s = input.slice(0, 16);
+    addRoundKey(s, w, Nr);
+    for (var round = Nr - 1; round >= 1; round--) {
+      var tmp = s.slice(0);
+      for (var c = 0; c < 4; c++) {
+        for (var r = 0; r < 4; r++) s[r + 4 * c] = tmp[r + 4 * ((c - r + 4) % 4)];
+      }
+      for (var i = 0; i < 16; i++) s[i] = invSbox[s[i]];
+      addRoundKey(s, w, round);
+      for (var c2 = 0; c2 < 4; c2++) {
+        var a0 = s[4 * c2], a1 = s[4 * c2 + 1], a2 = s[4 * c2 + 2], a3 = s[4 * c2 + 3];
+        s[4 * c2] = mul(a0, 14) ^ mul(a1, 11) ^ mul(a2, 13) ^ mul(a3, 9);
+        s[4 * c2 + 1] = mul(a0, 9) ^ mul(a1, 14) ^ mul(a2, 11) ^ mul(a3, 13);
+        s[4 * c2 + 2] = mul(a0, 13) ^ mul(a1, 9) ^ mul(a2, 14) ^ mul(a3, 11);
+        s[4 * c2 + 3] = mul(a0, 11) ^ mul(a1, 13) ^ mul(a2, 9) ^ mul(a3, 14);
+      }
+    }
+    var tmp2 = s.slice(0);
+    for (var c3 = 0; c3 < 4; c3++) {
+      for (var r2 = 0; r2 < 4; r2++) s[r2 + 4 * c3] = tmp2[r2 + 4 * ((c3 - r2 + 4) % 4)];
+    }
+    for (var i2 = 0; i2 < 16; i2++) s[i2] = invSbox[s[i2]];
+    addRoundKey(s, w, 0);
+    return s;
+  }
+  function strToBytes(str) {
+    var out = [];
+    for (var i = 0; i < str.length; i++) out.push(str.charCodeAt(i) & 0xff);
+    return out;
+  }
+  function bytesToLatin1(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return s;
+  }
+  function normalizeKey(key, keyLen) {
+    var raw = strToBytes(key);
+    var out = [];
+    for (var i = 0; i < keyLen; i++) out.push(i < raw.length ? raw[i] : 0);
+    return out;
+  }
+  function pkcs7Pad(input) {
+    var padLen = 16 - (input.length % 16);
+    var out = input.slice(0);
+    for (var i = 0; i < padLen; i++) out.push(padLen);
+    return out;
+  }
+  function pkcs7Unpad(input) {
+    var padLen = input[input.length - 1];
+    if (padLen < 1 || padLen > 16) return input;
+    return input.slice(0, input.length - padLen);
+  }
+  function crypt(str, keyStr, ivStr, mode, encrypt) {
+    var cipherUpper = (mode || 'ECB').toUpperCase();
+    var isCbc = cipherUpper.indexOf('CBC') >= 0;
+    // 16 字节以内视为 AES-128，超过按 AES-256（兼容 16/32 字节密钥）
+    var keyLen = keyStr.length <= 16 ? 16 : 32;
+    var key = normalizeKey(keyStr, keyLen);
+    var w = expandKey(key);
+    var Nr = w.length / 4 - 1;
+    var input = strToBytes(str);
+    var blocks = [];
+    if (encrypt) {
+      var padded = pkcs7Pad(input);
+      var iv = isCbc ? normalizeKey(ivStr || '', 16) : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+      for (var i = 0; i < padded.length; i += 16) {
+        var block = padded.slice(i, i + 16);
+        if (isCbc) {
+          for (var j = 0; j < 16; j++) block[j] ^= iv[j];
+        }
+        var enc = encryptBlock(w, Nr, block);
+        if (isCbc) iv = enc.slice(0);
+        blocks.push(enc);
+      }
+    } else {
+      var iv2 = isCbc ? normalizeKey(ivStr || '', 16) : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+      var prev = iv2.slice(0);
+      for (var k = 0; k < input.length; k += 16) {
+        var dec = decryptBlock(w, Nr, input.slice(k, k + 16));
+        if (isCbc) {
+          for (var m = 0; m < 16; m++) dec[m] ^= prev[m];
+          prev = input.slice(k, k + 16);
+        }
+        blocks.push(dec);
+      }
+    }
+    var flat = [];
+    for (var n = 0; n < blocks.length; n++) {
+      for (var o = 0; o < blocks[n].length; o++) flat.push(blocks[n][o]);
+    }
+    if (!encrypt) flat = pkcs7Unpad(flat);
+    return bytesToLatin1(flat);
+  }
+  return {
+    encrypt: function (str, key, iv, mode) { return crypt(str, key, iv || '', mode, true); },
+    decrypt: function (str, key, iv, mode) { return crypt(str, key, iv || '', mode, false); }
+  };
+})();
+
+/* ---------------- Base64 ---------------- */
+var Base64 = (function () {
+  var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  function encode(bytes) {
+    var out = '';
+    for (var i = 0; i < bytes.length; i += 3) {
+      var b0 = bytes[i], b1 = i + 1 < bytes.length ? bytes[i + 1] : 0, b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+      out += chars.charAt(b0 >> 2);
+      out += chars.charAt(((b0 & 3) << 4) | (b1 >> 4));
+      out += (i + 1 < bytes.length) ? chars.charAt(((b1 & 15) << 2) | (b2 >> 6)) : '=';
+      out += (i + 2 < bytes.length) ? chars.charAt(b2 & 63) : '=';
+    }
+    return out;
+  }
+  function decode(str) {
+    var s = str.replace(/[^A-Za-z0-9+/=]/g, '');
+    var out = [];
+    var buffer = 0, bits = 0;
+    for (var i = 0; i < s.length; i++) {
+      if (s.charAt(i) === '=') break;
+      var val = chars.indexOf(s.charAt(i));
+      buffer = (buffer << 6) | val;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out.push((buffer >> bits) & 0xff);
+      }
+    }
+    return out;
+  }
+  return { encode: encode, decode: decode };
+})();
+
+/* ---------------- crypto（同步，与 LX Music 插件兼容） ---------------- */
+function __hexToBytes(hexStr) {
+  var out = [];
+  var s = hexStr.replace(/\s/g, '');
+  if (s.length % 2 === 1) s = '0' + s;
+  for (var i = 0; i < s.length; i += 2) out.push(parseInt(s.substr(i, 2), 16));
+  return out;
+}
+function __bytesToHex(bytes) {
+  var hex = '0123456789abcdef';
+  var out = '';
+  for (var i = 0; i < bytes.length; i++) out += hex.charAt((bytes[i] >> 4) & 15) + hex.charAt(bytes[i] & 15);
+  return out;
+}
+function __latinToBytes(str) {
+  var out = [];
+  for (var i = 0; i < str.length; i++) out.push(str.charCodeAt(i) & 0xff);
+  return out;
+}
+function __bytesToLatin(bytes) {
+  var s = '';
+  for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return s;
+}
+
+function __utf8ToBytes(str) {
+  var s = unescape(encodeURIComponent(str));
+  var out = [];
+  for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 0xff);
+  return out;
+}
+
+function __bytesToUtf8(bytes) {
+  var s = '';
+  for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  try { return decodeURIComponent(escape(s)); } catch (e) { return s; }
+}
+
+var crypto = {
+  md5: function (str) { return MD5(String(str)); },
+  sha1: function (str) { return SHA1(String(str)); },
+  sha256: function (str) { return SHA256(String(str)); },
+  createHash: function (alg) {
+    var data = '';
+    return {
+      update: function (d) { data = String(d); return this; },
+      digest: function (enc) {
+        var hex = alg === 'md5' ? MD5(data) : alg === 'sha1' ? SHA1(data) : SHA256(data);
+        if (enc === 'latin1' || enc === 'binary') return __bytesToLatin(__hexToBytes(hex));
+        return hex;
+      }
+    };
+  },
+  // key/iv 按字节处理（兼容随机的 16 字节 iv）；明文/密文统一 UTF-8，避免中文截断
+  aesEncrypt: function (str, key, iv, mode, cipher) {
+    var m = (mode || '').toUpperCase() || (cipher || '').toUpperCase();
+    var b64 = /BASE64|B64/i.test(String(cipher)) || /BASE64|B64/i.test(String(mode));
+    var inputStr = typeof str === 'string' ? str : String(str);
+    var inputBytes = b64 ? Base64.decode(inputStr) : __utf8ToBytes(inputStr);
+    var hexKey = /HEX/i.test(String(cipher)) || /HEX/i.test(String(mode));
+    var keyStr = hexKey ? __bytesToLatin(__hexToBytes(String(key))) : unescape(encodeURIComponent(String(key)));
+    var ivStr = hexKey ? __bytesToLatin(__hexToBytes(String(iv || ''))) : unescape(encodeURIComponent(String(iv || '')));
+    var modeStr = /ECB/i.test(m) ? 'ECB' : /CBC/i.test(m) ? 'CBC' : /ECB/i.test(String(cipher)) ? 'ECB' : 'CBC';
+    var enc = AES.encrypt(__bytesToLatin(inputBytes), keyStr, ivStr, modeStr);
+    var out = __latinToBytes(enc);
+    return b64 ? Base64.encode(out) : __bytesToUtf8(out);
+  },
+  aesDecrypt: function (str, key, iv, mode, cipher) {
+    var m = (mode || '').toUpperCase() || (cipher || '').toUpperCase();
+    var b64 = /BASE64|B64/i.test(String(cipher)) || /BASE64|B64/i.test(String(mode));
+    var inputStr = typeof str === 'string' ? str : String(str);
+    var inputBytes = b64 ? Base64.decode(inputStr) : __utf8ToBytes(inputStr);
+    var hexKey = /HEX/i.test(String(cipher)) || /HEX/i.test(String(mode));
+    var keyStr = hexKey ? __bytesToLatin(__hexToBytes(String(key))) : unescape(encodeURIComponent(String(key)));
+    var ivStr = hexKey ? __bytesToLatin(__hexToBytes(String(iv || ''))) : unescape(encodeURIComponent(String(iv || '')));
+    var modeStr = /ECB/i.test(m) ? 'ECB' : /CBC/i.test(m) ? 'CBC' : /ECB/i.test(String(cipher)) ? 'ECB' : 'CBC';
+    var dec = AES.decrypt(__bytesToLatin(inputBytes), keyStr, ivStr, modeStr);
+    var out = __latinToBytes(dec);
+    return __bytesToUtf8(out);
+  },
+  randomBytes: function (size) {
+    var s = '';
+    for (var i = 0; i < size; i++) s += String.fromCharCode(Math.floor(Math.random() * 256));
+    return s;
+  },
+  hexToBytes: function (hex) { return __bytesToLatin(__hexToBytes(hex)); },
+  bytesToHex: function (s) { return __bytesToHex(__latinToBytes(String(s))); }
+};
+
+/* ---------------- Node 兼容垫片（V2.1.6：让现代 LX 插件可运行） ----------------
+ * 补齐 Buffer / zlib / process / setImmediate / url 等常见 Node 全局，
+ * 插件代码直接使用 globalThis.Buffer 或 require('buffer') 均可。 */
+
+function __hexToBytesArr(hexStr) {
+  var out = [];
+  var s = String(hexStr).replace(/\s/g, '');
+  if (s.length % 2 === 1) s = '0' + s;
+  for (var i = 0; i < s.length; i += 2) out.push(parseInt(s.substr(i, 2), 16));
+  return out;
+}
+function __bytesToHexStr(bytes) {
+  var hex = '0123456789abcdef';
+  var out = '';
+  for (var i = 0; i < bytes.length; i++) out += hex.charAt((bytes[i] >> 4) & 15) + hex.charAt(bytes[i] & 15);
+  return out;
+}
+function __utf8ToBytesArr(str) {
+  var s = unescape(encodeURIComponent(String(str)));
+  var out = [];
+  for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 0xff);
+  return out;
+}
+function __bytesArrToUtf8(bytes) {
+  var s = '';
+  for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  try { return decodeURIComponent(escape(s)); } catch (e) { return s; }
+}
+function __bytesToLatinStr(bytes) {
+  var s = '';
+  for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return s;
+}
+function __bufFromByteArray(arr) {
+  var b = new Uint8Array(arr.length);
+  for (var i = 0; i < arr.length; i++) b[i] = arr[i] & 0xff;
+  return b;
+}
+
+var Buffer = (function () {
+  function from() {
+    var args = arguments;
+    if (args[0] instanceof Uint8Array) return args[0];
+    if (args[0] instanceof ArrayBuffer) return new Uint8Array(args[0]);
+    if (Array.isArray(args[0])) return __bufFromByteArray(args[0]);
+    if (typeof args[0] === 'string') {
+      var enc = (args[1] || 'utf8').toLowerCase();
+      var str = String(args[0]);
+      if (enc === 'hex') return __bufFromByteArray(__hexToBytesArr(str));
+      if (enc === 'base64') return Base64.decode(str);
+      if (enc === 'binary' || enc === 'latin1') {
+        var b = new Uint8Array(str.length);
+        for (var i = 0; i < str.length; i++) b[i] = str.charCodeAt(i) & 0xff;
+        return b;
+      }
+      return __bufFromByteArray(__utf8ToBytesArr(str));
+    }
+    return new Uint8Array(0);
+  }
+  function alloc(size, fill) {
+    var b = new Uint8Array(size || 0);
+    if (fill !== undefined && fill !== null) {
+      if (typeof fill === 'number') { b.fill(fill); }
+      else {
+        var f = from(fill);
+        for (var i = 0; i < b.length; i++) b[i] = f[i % f.length];
+      }
+    }
+    return b;
+  }
+  function concat(list) {
+    var total = 0;
+    for (var i = 0; i < list.length; i++) total += list[i].length;
+    var out = new Uint8Array(total);
+    var off = 0;
+    for (var i = 0; i < list.length; i++) { out.set(list[i], off); off += list[i].length; }
+    return out;
+  }
+  function isBuffer(v) { return v instanceof Uint8Array; }
+  return {
+    from: from,
+    alloc: alloc,
+    allocUnsafe: alloc,
+    concat: concat,
+    isBuffer: isBuffer,
+    byteLength: function (v) { return from(v).length; }
+  };
+})();
+
+// Uint8Array.toString(encoding)：插件对 Buffer 调用 .toString('hex'/'base64') 时生效
+(function () {
+  var orig = Uint8Array.prototype.toString;
+  Uint8Array.prototype.toString = function (encoding) {
+    var enc = encoding ? String(encoding).toLowerCase() : '';
+    if (!enc || enc === 'utf8' || enc === 'utf-8') {
+      try { return __bytesArrToUtf8(this); } catch (e) { return orig.call(this); }
+    }
+    if (enc === 'hex') return __bytesToHexStr(this);
+    if (enc === 'base64') return Base64.encode(this);
+    if (enc === 'binary' || enc === 'latin1') return __bytesToLatinStr(this);
+    return orig.call(this);
+  };
+})();
+
+// zlib（基于流式 DecompressionStream/CompressionStream，返回 Promise，与 LX SDK 一致）
+async function __zlibTransform(bytes, fmt, compress) {
+  var stream = compress ? new CompressionStream(fmt) : new DecompressionStream(fmt);
+  var writer = stream.writable.getWriter();
+  writer.write(bytes);
+  writer.close();
+  var reader = stream.readable.getReader();
+  var chunks = [];
+  while (true) {
+    var r = await reader.read();
+    if (r.done) break;
+    chunks.push(new Uint8Array(r.value));
+  }
+  var total = 0;
+  for (var i = 0; i < chunks.length; i++) total += chunks[i].length;
+  var out = new Uint8Array(total);
+  var off = 0;
+  for (var i = 0; i < chunks.length; i++) { out.set(chunks[i], off); off += chunks[i].length; }
+  return out;
+}
+function __zlibInflateWrap(bytes, fmt) {
+  try {
+    return __zlibTransform(bytes, fmt, false);
+  } catch (e) {
+    return Promise.reject(e);
+  }
+}
+var zlib = {
+  inflate: function (b) { return __zlibInflateWrap(b, 'deflate'); },
+  inflateRaw: function (b) { return __zlibInflateWrap(b, 'deflate-raw'); },
+  gunzip: function (b) { return __zlibInflateWrap(b, 'gzip'); },
+  unzip: function (b) { return __zlibInflateWrap(b, 'deflate'); },
+  deflate: function (b) { return __zlibTransform(b, 'deflate', true); },
+  deflateRaw: function (b) { return __zlibTransform(b, 'deflate-raw', true); },
+  gzip: function (b) { return __zlibTransform(b, 'gzip', true); }
+};
+
+// url 模块轻量垫片（URL/URLSearchParams 为 WebView 原生）
+var urlShim = {
+  URL: (typeof URL !== 'undefined') ? URL : function () { throw new Error('URL not supported'); },
+  URLSearchParams: (typeof URLSearchParams !== 'undefined') ? URLSearchParams : function () { throw new Error('URLSearchParams not supported'); },
+  parse: function (str) {
+    var out = { href: String(str), pathname: '', search: '', query: {}, hash: '', protocol: '', host: '' };
+    try {
+      var u = new URL(String(str), 'https://localhost');
+      out.protocol = u.protocol;
+      out.host = u.host;
+      out.pathname = u.pathname;
+      out.search = u.search;
+      out.hash = u.hash;
+      if (u.search) {
+        var pairs = u.search.substring(1).split('&');
+        for (var i = 0; i < pairs.length; i++) {
+          var kv = pairs[i].split('=');
+          out.query[decodeURIComponent(kv[0])] = kv.length > 1 ? decodeURIComponent(kv[1]) : '';
+        }
+      }
+    } catch (e) {}
+    return out;
+  }
+};
+
+// process / setImmediate / global 等杂项垫片
+var processShim = { env: {}, browser: true, versions: { node: '16.0.0' }, platform: 'harmonyos', nextTick: function (fn) { setTimeout(fn, 0); } };
+if (typeof window.process === 'undefined') { try { window.process = processShim; } catch (e) {} }
+if (typeof globalThis.process === 'undefined') { try { globalThis.process = processShim; } catch (e) {} }
+if (typeof window.setImmediate === 'undefined') {
+  window.setImmediate = function (fn) { return setTimeout(fn, 0); };
+}
+if (typeof globalThis.setImmediate === 'undefined') {
+  globalThis.setImmediate = function (fn) { return setTimeout(fn, 0); };
+}
+window.Buffer = Buffer;
+globalThis.Buffer = Buffer;
+window.zlib = zlib;
+globalThis.zlib = zlib;
+window.urlShim = urlShim;
+globalThis.urlShim = urlShim;
+
+/* ---------------- HTTP（经宿主原生请求，无 CORS 限制） ----------------
+ * 统一走宿主同步桥：httpStart 立即返回 token → httpPoll 轮询结果 → httpDone 清理。
+ * 轮询间 await 让出事件循环，避免同步桥自身阻塞 JS 线程。 */
+async function __hostRequest(url, method, data, headersJson, contentType, timeout) {
+  // V1.2.2：提高轮询 deadline 上限至 25s，与宿主 readTimeout(20s)+connectTimeout(5s) 对齐，
+  // 避免轮询提前超时导致 HTTP 请求还在进行中就被截断。
+  // 插件（如全豆要）的 getUrl 超时 20s，search 超时 15s，需要足够长的等待时间。
+  var deadlineMs = (timeout && timeout > 0) ? Math.min(Number(timeout) + 5000, 25000) : 25000;
+  var token;
+  try {
+    token = window.__host.httpStart(url, method || 'GET', data || '', headersJson || '', contentType || '', timeout || 0);
+  } catch (e) {
+    return { statusCode: -1, body: '', headers: {}, error: 'host httpStart failed: ' + String(e) };
+  }
+  var resultJson = '';
+  var start = Date.now();
+  while (resultJson === '' && Date.now() - start < deadlineMs) {
+    try {
+      resultJson = window.__host.httpPoll(token);
+    } catch (e) {
+      resultJson = '{"statusCode":-1,"body":"","headers":{},"error":"host httpPoll failed: ' + String(e).replace(/"/g, "'") + '"}';
+      break;
+    }
+    if (resultJson === '') {
+      await new Promise(function (r) { setTimeout(r, 30); });
+    }
+  }
+  try {
+    window.__host.httpDone(token);
+  } catch (e) {}
+  if (resultJson === '') {
+    return { statusCode: -1, body: '', headers: {}, error: 'host request timeout' };
+  }
+  try {
+    return JSON.parse(resultJson);
+  } catch (e) {
+    return { statusCode: -1, body: '', headers: {}, error: 'host response parse error: ' + String(e) };
+  }
+}
+
+async function request(url, options) {
+  options = options || {};
+  var headers = options.headers || {};
+  var method = (options.method || 'GET').toUpperCase();
+  var headersJson = '';
+  try { headersJson = JSON.stringify(headers); } catch (e) {}
+  var timeout = options.timeout ? Number(options.timeout) : 0;
+  var result;
+  try {
+    if (method === 'POST') {
+      var data = options.data;
+      if (data === undefined || data === null) data = '';
+      if (typeof data === 'object') data = JSON.stringify(data);
+      var contentType = options.contentType || '';
+      if (!contentType && typeof options.data === 'object' && options.data !== null) contentType = 'application/json';
+      if (!contentType && typeof data === 'string') contentType = 'application/x-www-form-urlencoded';
+      result = await __hostRequest(url, 'POST', String(data), headersJson, contentType, timeout);
+    } else {
+      result = await __hostRequest(url, 'GET', '', headersJson, '', timeout);
+    }
+  } catch (e) {
+    result = { statusCode: -1, body: '', headers: {}, error: String(e) };
+  }
+  return { statusCode: result.statusCode, headers: result.headers || {}, body: result.body, error: result.error || '' };
+}
+
+var http = {
+  get: async function (url, options) {
+    options = options || {};
+    var params = options.params || {};
+    var qs = [];
+    for (var k in params) {
+      if (Object.prototype.hasOwnProperty.call(params, k)) {
+        qs.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
+      }
+    }
+    var full = qs.length > 0 ? (url + (url.indexOf('?') >= 0 ? '&' : '?') + qs.join('&')) : url;
+    var res = await request(full, { method: 'GET', headers: options.headers });
+    return { statusCode: res.statusCode, data: res.body };
+  },
+  post: async function (url, options) {
+    options = options || {};
+    var res = await request(url, { method: 'POST', data: options.data, headers: options.headers, contentType: options.contentType });
+    return { statusCode: res.statusCode, data: res.body };
+  }
+};
+
+function log() {
+  var args = [];
+  for (var i = 0; i < arguments.length; i++) {
+    var a = arguments[i];
+    args.push(typeof a === 'string' ? a : (function () { try { return JSON.stringify(a); } catch (e) { return String(a); } })());
+  }
+  try { window.__host.log(args.join(' ')); } catch (e) {}
+}
+
+/* ---------------- LX Music v3 SDK 兼容层（globalThis.lx） ----------------
+ * 现代 LX 插件（如全豆要）不导出 module.exports，而是：
+ *   1. 从 globalThis.lx 解构 { EVENT_NAMES, request, on, send }
+ *   2. on(EVENT_NAMES.request, handler) 注册动作分发
+ *   3. send(EVENT_NAMES.inited, { sources }) 上报音源列表
+ * 引擎按"插件名"隔离事件注册，经 __startV3Task 分发 musicSearch/musicUrl/lyric。
+ * ---------------- */
+var __v3State = {
+  currentPlugin: null,
+  plugins: {}
+};
+var LX_EVENT_NAMES = {
+  request: 'request',
+  inited: 'inited'
+};
+
+function __v3Request(url, options, callback) {
+  if (typeof options === 'function') {
+    callback = options;
+    options = {};
+  }
+  options = options || {};
+  var headers = options.headers || {};
+  var headersJson = '';
+  try { headersJson = JSON.stringify(headers); } catch (e) {}
+  var method = (options.method || 'GET').toUpperCase();
+  var body = options.body;
+  var isObjBody = body !== undefined && body !== null && typeof body === 'object';
+  var data = isObjBody ? JSON.stringify(body) : (body === undefined || body === null ? '' : String(body));
+  var timeout = options.timeout ? Number(options.timeout) : 0;
+  var ct = options.contentType || '';
+  if (!ct && isObjBody) ct = 'application/json';
+  if (!ct && data) ct = 'application/x-www-form-urlencoded';
+  var exec = (async function () {
+    var result;
+    try {
+      if (method === 'POST') {
+        result = await __hostRequest(url, 'POST', data, headersJson, ct, timeout);
+      } else {
+        result = await __hostRequest(url, 'GET', '', headersJson, '', timeout);
+      }
+    } catch (e) {
+      result = { statusCode: -1, body: '', headers: {}, error: String(e) };
+    }
+    // V1.2.2：失败时在返回对象上标记 _error，供回调分支判断是否需要触发 err 回调
+    // 插件（如全豆要）的 httpRequest 通过 if (err) 检测请求失败并触发 httpGetWithFallback 的 https→http 回退
+    var failed = result.statusCode < 0 || (result.error && result.error.length > 0);
+    return {
+      statusCode: result.statusCode,
+      headers: result.headers || {},
+      body: result.body,
+      statusMessage: result.error || '',
+      _error: failed
+    };
+  })();
+  if (typeof callback === 'function') {
+    exec.then(function (res) {
+      if (res._error) {
+        callback(new Error(res.statusMessage || 'request failed'), null);
+      } else {
+        callback(null, { statusCode: res.statusCode, headers: res.headers, body: res.body });
+      }
+    }, function (err) {
+      callback(err, null);
+    });
+  }
+  return exec;
+}
+
+function __v3On(name, cb) {
+  if (name !== LX_EVENT_NAMES.request) return;
+  var key = __v3State.currentPlugin;
+  if (!key) return;
+  if (!__v3State.plugins[key]) __v3State.plugins[key] = { handlers: [], sources: null };
+  __v3State.plugins[key].handlers.push(cb);
+}
+
+function __v3Send(name, payload) {
+  if (name !== LX_EVENT_NAMES.inited) return;
+  var key = __v3State.currentPlugin;
+  if (!key) return;
+  if (!__v3State.plugins[key]) __v3State.plugins[key] = { handlers: [], sources: null };
+  __v3State.plugins[key].sources = payload ? payload.sources : null;
+}
+
+var __lx = {
+  EVENT_NAMES: LX_EVENT_NAMES,
+  request: __v3Request,
+  on: __v3On,
+  send: __v3Send,
+  utils: {
+    crypto: crypto,
+    log: log,
+    http: http,
+    base64: Base64,
+    buffer: Buffer,
+    zlib: zlib,
+    randomBytes: crypto.randomBytes,
+    md5: crypto.md5,
+    sha1: crypto.sha1,
+    sha256: crypto.sha256
+  }
+};
+globalThis.lx = __lx;
+window.__lx = __lx;
+
+function __loadPluginV3(name, src) {
+  var prev = __v3State.currentPlugin;
+  __v3State.currentPlugin = name;
+  __v3State.plugins[name] = { handlers: [], sources: null };
+  try {
+    var mod = { exports: {} };
+    new Function('module', 'exports', 'require', 'log', src)(mod, mod.exports, __requireShim, log);
+  } catch (e) {
+    log('v3 插件执行异常: ' + String(e && e.message ? e.message : e));
+  }
+  var st = __v3State.plugins[name];
+  __v3State.currentPlugin = prev;
+  return st.handlers.length > 0 || st.sources !== null;
+}
+
+/** 确保 v3 插件已加载并返回其上报的音源列表 JSON（未上报返回 '{}'） */
+function __v3Sources(name, src) {
+  if (!__v3State.plugins[name] || (__v3State.plugins[name].sources === null && __v3State.plugins[name].handlers.length === 0)) {
+    __loadPluginV3(name, src);
+  }
+  var st = __v3State.plugins[name];
+  if (!st || !st.sources) return '{}';
+  try { return JSON.stringify(st.sources); } catch (e) { return '{}'; }
+}
+
+/** 启动 v3 动作任务（返回任务 id，结果经 __getTaskResult 轮询） */
+function __startV3Task(name, src, action, source, infoJson) {
+  var id = 't' + (++window.__taskSeq);
+  window.__results[id] = { done: false, ok: false, data: null, error: '' };
+  (async function () {
+    try {
+      if (!__v3State.plugins[name] || __v3State.plugins[name].handlers.length === 0) {
+        if (!__loadPluginV3(name, src)) {
+          window.__results[id] = { done: true, ok: false, data: null, error: 'v3 插件未就绪' };
+          return;
+        }
+      }
+      var st = __v3State.plugins[name];
+      if (st.handlers.length === 0) {
+        window.__results[id] = { done: true, ok: false, data: null, error: '插件未注册请求处理' };
+        return;
+      }
+      var info = {};
+      if (infoJson) {
+        try { info = JSON.parse(infoJson); } catch (e) {}
+      }
+      var dispatched = null;
+      var any = false;
+      var lastError = '';
+      for (var i = 0; i < st.handlers.length; i++) {
+        try {
+          var ret = await st.handlers[i]({ action: action, source: source, info: info });
+          if (ret !== undefined && ret !== null) {
+            dispatched = ret;
+            any = true;
+            break;
+          }
+        } catch (e2) {
+          lastError = String(e2 && e2.message ? e2.message : e2);
+          log('[v3task] handler reject: ' + lastError);
+        }
+      }
+      if (!any) {
+        window.__results[id] = { done: true, ok: false, data: null, error: lastError || '所有处理器均未返回结果' };
+        return;
+      }
+      window.__results[id] = { done: true, ok: true, data: dispatched, error: '' };
+    } catch (e) {
+      window.__results[id] = { done: true, ok: false, data: null, error: String(e && e.message ? e.message : e) };
+    }
+  })();
+  return id;
+}
+
+/**
+ * v3 多音源分发任务：按 sources 顺序依次向插件分发 action，
+ * 单个音源被拒绝（如 "action not support"）时自动尝试下一个音源，
+ * 取第一个成功返回的结果；全部失败时返回最后一个错误。
+ */
+function __startV3TaskMulti(name, src, action, sourcesJson, infoJson) {
+  var id = 't' + (++window.__taskSeq);
+  window.__results[id] = { done: false, ok: false, data: null, error: '' };
+  (async function () {
+    try {
+      if (!__v3State.plugins[name] || __v3State.plugins[name].handlers.length === 0) {
+        if (!__loadPluginV3(name, src)) {
+          window.__results[id] = { done: true, ok: false, data: null, error: 'v3 插件未就绪' };
+          return;
+        }
+      }
+      var st = __v3State.plugins[name];
+      if (st.handlers.length === 0) {
+        window.__results[id] = { done: true, ok: false, data: null, error: '插件未注册请求处理' };
+        return;
+      }
+      var info = {};
+      if (infoJson) {
+        try { info = JSON.parse(infoJson); } catch (e) {}
+      }
+      var sources = [];
+      if (sourcesJson) {
+        try { sources = JSON.parse(sourcesJson); } catch (e) {}
+      }
+      if (!sources.length) {
+        window.__results[id] = { done: true, ok: false, data: null, error: '未找到支持该操作的音源' };
+        return;
+      }
+      var lastError = '';
+      for (var s = 0; s < sources.length; s++) {
+        var dispatched = null;
+        var any = false;
+        for (var h = 0; h < st.handlers.length; h++) {
+          try {
+            var ret = await st.handlers[h]({ action: action, source: sources[s], info: info });
+            if (ret !== undefined && ret !== null) {
+              dispatched = ret;
+              any = true;
+              break;
+            }
+          } catch (e2) {
+            lastError = String(e2 && e2.message ? e2.message : e2);
+            log('[v3task] source(' + sources[s] + ') reject: ' + lastError);
+          }
+        }
+        if (any) {
+          window.__results[id] = { done: true, ok: true, data: dispatched, error: '' };
+          return;
+        }
+      }
+      window.__results[id] = { done: true, ok: false, data: null, error: lastError || '所有音源均未返回结果' };
+    } catch (e) {
+      window.__results[id] = { done: true, ok: false, data: null, error: String(e && e.message ? e.message : e) };
+    }
+  })();
+  return id;
+}
+
+/** 引擎诊断探针：返回各关键组件是否就绪 */
+function __probe() {
+  return JSON.stringify({
+    host: typeof window.__host,
+    lx: typeof globalThis.lx,
+    startTask: typeof window.__startTask,
+    v3Task: typeof window.__startV3Task,
+    v3TaskMulti: typeof window.__startV3TaskMulti,
+    getTaskResult: typeof window.__getTaskResult,
+    hasHttpStart: typeof window.__host !== 'undefined' && typeof window.__host.httpStart,
+    hasHttpPoll: typeof window.__host !== 'undefined' && typeof window.__host.httpPoll,
+    hasHttpDone: typeof window.__host !== 'undefined' && typeof window.__host.httpDone
+  });
+}
+
+/* 全局错误捕获：插件未捕获异常/未处理 Promise 拒绝记录到宿主日志，超时时可读取 */
+window.__lastError = '';
+window.addEventListener('error', function (ev) {
+  var msg = ev && ev.message ? ev.message : String(ev);
+  window.__lastError = String(msg).slice(0, 500);
+  try { window.__host.log('[plugin-error] ' + window.__lastError); } catch (e) {}
+});
+window.addEventListener('unhandledrejection', function (ev) {
+  var reason = ev && ev.reason ? ev.reason : '';
+  var msg = (reason && reason.stack ? reason.stack : String(reason)).slice(0, 800);
+  window.__lastError = msg;
+  try { window.__host.log('[plugin-rejection] ' + msg); } catch (e) {}
+});
+
+/* 任务诊断：任务超时时返回任务/桥/插件状态，定位挂起点 */
+function __taskDiag(id) {
+  var r = (id && window.__results[id]) ? window.__results[id] : null;
+  var v3 = {};
+  for (var k in __v3State.plugins) {
+    if (Object.prototype.hasOwnProperty.call(__v3State.plugins, k)) {
+      var p = __v3State.plugins[k];
+      v3[k] = { handlers: p.handlers.length, sources: p.sources ? Object.keys(p.sources).length : 0 };
+    }
+  }
+  return JSON.stringify({
+    task: r ? { done: r.done, ok: r.ok, error: String(r.error || '').slice(0, 300) } : null,
+    lastError: String(window.__lastError || '').slice(0, 300),
+    bridge: {
+      host: typeof window.__host,
+      httpStart: typeof window.__host !== 'undefined' && typeof window.__host.httpStart,
+      httpPoll: typeof window.__host !== 'undefined' && typeof window.__host.httpPoll,
+      httpDone: typeof window.__host !== 'undefined' && typeof window.__host.httpDone
+    },
+    v3Plugins: v3
+  });
+}
+
+/* ---------------- require 垫片 ---------------- */
+function __tryParseJson(s) {
+  if (typeof s !== 'string' || s.length === 0) return s;
+  try { return JSON.parse(s); } catch (e) { return s; }
+}
+
+/* ---------------- axios 垫片（MusicFree 格式插件 require('axios') 兼容） ----------------
+ * MusicFree 插件（kg_dd1.0/kuwo_cat1.0/qq_cat1.0 等）编译后经 __importDefault 调用
+ * axios_1.default.get/post 或直接 axios_1.default({...}) 函数式调用。
+ * 垫片本身是可调用函数 + get/post/create 属性，走宿主原生请求，响应 data 自动 JSON.parse。 */
+function __axiosBuildUrl(url, params) {
+  if (!params || typeof params !== 'object') return url;
+  var keys = Object.keys(params);
+  if (keys.length === 0) return url;
+  var qs = keys.map(function (k) {
+    return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
+  }).join('&');
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + qs;
+}
+async function __axiosGet(url, opts) {
+  opts = opts || {};
+  var headersJson = '';
+  try { headersJson = JSON.stringify(opts.headers || {}); } catch (e) {}
+  var timeout = opts.timeout ? Number(opts.timeout) : 15000;
+  var result = await __hostRequest(__axiosBuildUrl(url, opts.params), 'GET', '', headersJson, '', timeout);
+  return {
+    data: __tryParseJson(result.body),
+    status: result.statusCode,
+    statusCode: result.statusCode,
+    headers: result.headers || {},
+  };
+}
+async function __axiosPost(url, body, opts) {
+  opts = opts || {};
+  var data = body;
+  if (typeof data === 'object' && data !== null) data = JSON.stringify(data);
+  var headersJson = '';
+  try { headersJson = JSON.stringify(opts.headers || {}); } catch (e) {}
+  var contentType = (typeof body === 'object' && body !== null) ? 'application/json' : '';
+  var timeout = opts.timeout ? Number(opts.timeout) : 15000;
+  var result = await __hostRequest(url, 'POST', String(data), headersJson, contentType, timeout);
+  return {
+    data: __tryParseJson(result.body),
+    status: result.statusCode,
+    statusCode: result.statusCode,
+    headers: result.headers || {},
+  };
+}
+function axiosShim(url, opts) {
+  // 兼容 axios(config) 与 axios(url, config) 两种调用
+  var cfg = (typeof url === 'object' && url !== null) ? url : (opts || {});
+  var method = String(cfg.method || 'get').toLowerCase();
+  var target = typeof url === 'string' ? url : String(cfg.url || '');
+  var headers = cfg.headers || {};
+  var params = cfg.params || {};
+  var timeout = cfg.timeout ? Number(cfg.timeout) : 15000;
+  if (method === 'post' || method === 'put' || method === 'patch') {
+    var data = cfg.data !== undefined ? cfg.data : (cfg.body !== undefined ? cfg.body : '');
+    return __axiosPost(target, data, { headers: headers, params: params, timeout: timeout });
+  }
+  return __axiosGet(target, { headers: headers, params: params, timeout: timeout });
+}
+axiosShim.get = __axiosGet;
+axiosShim.post = __axiosPost;
+axiosShim.default = axiosShim;
+axiosShim.create = function () { return axiosShim; };
+
+/* ---------------- he 垫片（kuwo_cat 等插件 require('he') 转义 HTML 实体） ---------------- */
+var heShim = {
+  decode: function (s) {
+    if (typeof s !== 'string') return s;
+    return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ');
+  },
+  encode: function (s) { return String(s); },
+};
+
+/* ---------------- crypto-js enc 兼容（enc.Utf8/enc.Base64，QQ 歌词 Base64 解码用） ---------------- */
+crypto.enc = {
+  Utf8: {
+    parse: function (s) { return String(s); },
+    stringify: function (w) { return String(w); },
+  },
+  Hex: {
+    parse: function (s) { return String(s); },
+    stringify: function (w) { return String(w); },
+  },
+  Base64: {
+    parse: function (s) {
+      try { return __bytesToLatin(Base64.decode(String(s))); } catch (e) { return String(s); }
+    },
+    stringify: function (w) { return Base64.encode(__latinToBytes(String(w))); },
+  },
+};
+
+function __requireShim(name) {
+  if (name === 'crypto' || name === 'crypto-js') return crypto;
+  if (name === 'http' || name === 'https') return http;
+  if (name === 'request') return request;
+  if (name === 'log') return log;
+  if (name === 'base64') return Base64;
+  if (name === 'buffer') return Buffer;
+  if (name === 'zlib') return zlib;
+  if (name === 'url') return urlShim;
+  if (name === 'path' || name === 'fs' || name === 'os') return {};
+  if (name === 'axios') return axiosShim;
+  if (name === 'he') return heShim;
+  log('未知模块 require: ' + name);
+  return {};
+}
+
+/* ---------------- 插件加载与任务执行 ---------------- */
+window.__plugins = window.__plugins || {};
+window.__results = window.__results || {};
+window.__taskSeq = window.__taskSeq || 0;
+
+function __safeJson(o) {
+  try {
+    return JSON.stringify(o);
+  } catch (e) {
+    return JSON.stringify({ done: true, ok: false, data: null, error: '结果不可序列化' });
+  }
+}
+
+function __loadPlugin(name, src) {
+  try {
+    var mod = { exports: {} };
+    var fn = new Function('module', 'exports', 'require', 'log', src);
+    fn(mod, mod.exports, __requireShim, log);
+    var obj = mod.exports;
+    if (obj && typeof obj === 'object' && typeof obj.search === 'function') {
+      window.__plugins[name] = __wrapMusicFreeIfNeeded(obj, name);
+      return true;
+    }
+    if (typeof obj === 'function') {
+      window.__plugins[name] = { search: obj };
+      return true;
+    }
+  } catch (e) {
+    log('插件加载失败: ' + String(e && e.message ? e.message : e));
+  }
+  return false;
+}
+
+// MusicFree 格式插件适配器：将 search(query, page) → search(keyword, page, type)
+// 同时转换返回值 { isEnd, data } → [...]
+function __wrapMusicFreeIfNeeded(obj, name) {
+  // 精准检测 MusicFree 格式：有 primaryKey / supportedSearchType / srcUrl 独有字段，
+  // 且没有 getMusicUrl / getMusicInfo 方法（原生 V1 插件如 xiaogou.js 有此方法）
+  var isMusicFree = (obj.primaryKey || obj.supportedSearchType || obj.srcUrl || obj.imports) &&
+    !(typeof obj.getMusicUrl === 'function' || typeof obj.getMusicInfo === 'function');
+  if (!isMusicFree) return obj;
+  log('检测到 MusicFree 格式插件: ' + name + '，自动适配中...');
+  var wrapped = { platform: obj.platform || name, version: 'mf-adapter' };
+  wrapped.search = async function (keyword, page, type) {
+    var query = { keyword: keyword, toString: function () { return keyword; } };
+    var result = await obj.search(query, page || 1, type || 'music');
+    if (result && result.data && Array.isArray(result.data)) {
+      return result.data.map(function (item) {
+        return {
+          id: item.id || '',
+          songId: item.songId || item.id || '',
+          name: item.title || item.name || '',
+          title: item.title || '',
+          singer: item.artist || item.singer || item.artist || '',
+          artist: item.artist || '',
+          album: item.album || item.album_name || '',
+          albumName: item.album_name || item.album || '',
+          pic: item.artwork || item.pic || item.cover || '',
+          picUrl: item.artwork || item.pic || '',
+          url: item.url || '',
+          duration: item.duration || 0,
+          hash: item.hash || ''
+        };
+      });
+    }
+    return [];
+  };
+  // MusicFree 品质名映射：128k→low / 320k→standard / flac→high（getMediaSource 用）
+  function __mfQuality(q) {
+    var s = String(q || '').toLowerCase();
+    if (s === '128k' || s === '128' || s === 'low') return 'low';
+    if (s === '320k' || s === '320' || s === 'standard') return 'standard';
+    if (s === 'flac' || s === 'flac24bit' || s === 'high' || s === 'lossless') return 'high';
+    return s || 'low';
+  }
+  if (typeof obj.getMediaSource === 'function') {
+    // MusicFree 格式：取链/歌词/封面都来自 getMediaSource
+    wrapped.getMusicUrl = async function (songInfo, quality) {
+      try {
+        var result = await obj.getMediaSource(songInfo, __mfQuality(quality));
+        if (typeof result === 'string') return result;
+        if (result && result.url) return result.url;
+        return '';
+      } catch (_e) { return ''; }
+    };
+    wrapped.getMediaSource = async function (songInfo, quality) {
+      try {
+        var result = await obj.getMediaSource(songInfo, __mfQuality(quality));
+        if (typeof result === 'string') return result;
+        if (result && result.url) return result.url;
+        return '';
+      } catch (_e) { return ''; }
+    };
+    wrapped.getLyric = async function (songInfo) {
+      try {
+        var result = await obj.getMediaSource(songInfo, 'low');
+        if (result && result.rawLrc) return result.rawLrc;
+        return '';
+      } catch (_e) { return ''; }
+    };
+  } else if (typeof obj.getMusicInfo === 'function' || typeof obj.getMusicUrl === 'function') {
+    var getUrlFn = obj.getMusicInfo || obj.getMusicUrl;
+    wrapped.getMusicUrl = async function (songInfo, quality) {
+      try {
+        var result = await getUrlFn(songInfo, quality);
+        if (typeof result === 'string') return result;
+        if (result && result.url) return result.url;
+        return '';
+      } catch (_e) { return ''; }
+    };
+  } else {
+    wrapped.getMusicUrl = async function () { return ''; };
+  }
+  if (typeof obj.getLyric === 'function' && typeof obj.getMediaSource !== 'function') {
+    wrapped.getLyric = async function (songInfo) {
+      try {
+        var result = await obj.getLyric(songInfo);
+        if (typeof result === 'string') return result;
+        if (result && result.lyric) return result.lyric;
+        return '';
+      } catch (_e) { return ''; }
+    };
+  }
+  return wrapped;
+}
+
+function __startTask(name, src, func, argsJson) {
+  var id = 't' + (++window.__taskSeq);
+  window.__results[id] = { done: false, ok: false, data: null, error: '' };
+  (async function () {
+    try {
+      var plugin = window.__plugins[name];
+      if (!plugin) {
+        if (!__loadPlugin(name, src)) {
+          window.__results[id] = { done: true, ok: false, data: null, error: '插件加载失败' };
+          return;
+        }
+        plugin = window.__plugins[name];
+      }
+      var fn = plugin[func];
+      if (typeof fn !== 'function') {
+        window.__results[id] = { done: true, ok: false, data: null, error: '缺少方法: ' + func };
+        return;
+      }
+      var result = await fn.apply(plugin, JSON.parse(argsJson));
+      window.__results[id] = { done: true, ok: true, data: (result === undefined || result === null) ? null : result, error: '' };
+    } catch (e) {
+      window.__results[id] = { done: true, ok: false, data: null, error: String(e && e.message ? e.message : e) };
+    }
+  })();
+  return id;
+}
+
+function __getTaskResult(id) {
+  var r = window.__results[id];
+  if (!r) return JSON.stringify({ done: true, ok: false, data: null, error: '任务不存在' });
+  return __safeJson(r);
+}
+</script>
+</body>
+</html>

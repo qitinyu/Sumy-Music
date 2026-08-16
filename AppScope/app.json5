@@ -1,0 +1,10 @@
+{
+  "app": {
+    "bundleName": "com.sumy.music",
+    "vendor": "Sumy",
+    "versionCode": 2000000,
+    "versionName": "2.0.5.8",
+    "icon": "$media:layered_image",
+    "label": "$string:app_name"
+  }
+}

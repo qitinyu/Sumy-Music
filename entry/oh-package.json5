@@ -1,0 +1,12 @@
+{
+  "name": "shym1032",
+  "version": "1.0.0",
+  "description": "SHMY Music Player",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    "@ohos/axios": "^2.2.6",
+    "@ohos/crypto-js": "^2.0.5"
+  }
+}
