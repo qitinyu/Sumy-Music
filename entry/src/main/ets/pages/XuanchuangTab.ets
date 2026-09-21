@@ -28,6 +28,8 @@ import { systemShare } from '@kit.ShareKit'
 import { uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { common } from '@kit.AbilityKit'
 import { CloudTagEnricher } from '../utils/CloudTagEnricher'
+import { HdsNavDestination } from '@kit.UIDesignKit'
+import { SymbolGlyphModifier } from '@kit.ArkUI'
 
 type SubPage = 'main' | 'playlistDetail' | 'localMusicDetail' | 'cloudPlaylistDetail'
 
@@ -140,6 +142,8 @@ export struct XuanchuangTab {
 
   // Pull-to-refresh
   @State refreshing: boolean = false
+  // 歌单详情页下拉刷新（与主页独立，避免互相干扰）
+  @State detailRefreshing: boolean = false
 
   // Cloud playlists
   @State cloudPlaylists: Playlist[] = []
@@ -475,37 +479,9 @@ export struct XuanchuangTab {
 
     PlayerStore.play(song, queue, idx)
 
+    // 进度/时长/播完/出错回调由 AudioPlayer 中央化处理
     const player = AudioPlayer.getInstance()
-    player.onTimeUpdate = (time: number) => {
-      PlayerStore.updateTime(time)
-    }
-    player.onDurationUpdate = (duration: number) => {
-      PlayerStore.updateDuration(duration)
-    }
-    player.onPlayEnd = () => {
-      const nextTrack = PlayerStore.onTrackEnd()
-      if (nextTrack) {
-        this.playSong(nextTrack)
-      } else {
-        PlayerStore.pause()
-      }
-    }
-    player.onError = (error: string) => {
-      SourceStatus.markUnplayable(song.source)
-      PlayerStore.pause()
-      promptAction.showToast({
-        message: error || '播放失败，3秒后自动播放下一首',
-        duration: 3000,
-        bottom: '120vp'
-      })
-      setTimeout(() => {
-        const nextTrack = PlayerStore.onTrackEnd()
-        if (nextTrack) {
-          this.playSong(nextTrack)
-        }
-      }, 3000)
-    }
-
+    player.setCurrentSong(song)
     await player.play(song.playUrl)
 
     // 播放成功：标记该音源可用（恢复彩色标签）
@@ -556,48 +532,9 @@ export struct XuanchuangTab {
 
     PlayerStore.play(song, queue, playIdx)
 
+    // 进度/时长/播完/出错回调由 AudioPlayer 中央化处理（本地队列 SongInfo 已带 playUrl）
     const player = AudioPlayer.getInstance()
-    player.onTimeUpdate = (time: number) => {
-      PlayerStore.updateTime(time)
-    }
-    player.onDurationUpdate = (duration: number) => {
-      PlayerStore.updateDuration(duration)
-    }
-    player.onPlayEnd = () => {
-      const nextTrack = PlayerStore.onTrackEnd()
-      if (nextTrack) {
-        const nextLocalId = nextTrack.songId.replace('local_', '')
-        const nextLocal = this.localMusicList.find(lm => lm.id === nextLocalId)
-        if (nextLocal) {
-          this.playLocalSong(nextLocal)
-        } else {
-          PlayerStore.pause()
-        }
-      } else {
-        PlayerStore.pause()
-      }
-    }
-    player.onError = (error: string) => {
-      console.error('[XuanchuangTab] local play error:', error)
-      PlayerStore.pause()
-      promptAction.showToast({
-        message: error || '本地音乐播放失败，3秒后自动播放下一首',
-        duration: 3000,
-        bottom: '120vp'
-      })
-      setTimeout(() => {
-        const nextTrack = PlayerStore.onTrackEnd()
-        if (nextTrack) {
-          const nextLocalId = nextTrack.songId.replace('local_', '')
-          const nextLocal = this.localMusicList.find(lm => lm.id === nextLocalId)
-          if (nextLocal) {
-            this.playLocalSong(nextLocal)
-          } else if (nextTrack) {
-            this.playSong(nextTrack)
-          }
-        }
-      }, 3000)
-    }
+    player.setCurrentSong(song)
 
     try {
       await player.play(song.playUrl)
@@ -1062,15 +999,14 @@ export struct XuanchuangTab {
       if (onAdd) {
         if (this.supportImmersive) {
           Row() {
-            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(20)
-              .fontColor([this.themeTextPrimary])
+            Image($rawfile('sum.svg'))
+              .width(18)
+              .height(18)
           }
           .width(36)
           .height(36)
           .borderRadius(18)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
+          .backgroundColor(Color.Transparent)
           .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
           .justifyContent(FlexAlign.Center)
           .onClick(() => {
@@ -1078,16 +1014,15 @@ export struct XuanchuangTab {
           })
         } else {
           Row() {
-            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(20)
-              .fontColor([this.themeTextPrimary])
+            Image($rawfile('sum.svg'))
+              .width(18)
+              .height(18)
           }
           .width(36)
           .height(36)
           .borderRadius(18)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .blur(8)
+          .backgroundColor(Color.Transparent)
+          .backgroundEffect(MaterialCompat.effect(this.isDarkMode, this.themeCardBg, MaterialCompatStyle.THIN))
           .justifyContent(FlexAlign.Center)
           .onClick(() => {
             onAdd()
@@ -1124,7 +1059,7 @@ export struct XuanchuangTab {
       { icon: $r('sys.symbol.share'), label: '分享歌曲至', action: 'share_song' },
     ]
     if (!isCloud) {
-      actions.push({ icon: $r('sys.symbol.trash'), label: '彻底移除歌曲', action: 'delete_song', isDanger: true })
+      actions.push({ icon: $r('sys.symbol.trash'), label: '移除歌曲', action: 'delete_song', isDanger: true })
     }
     return actions
   }
@@ -1159,6 +1094,12 @@ export struct XuanchuangTab {
       case 'delete_song':
         if (isCloud) {
           this.showToastMsg('云端歌曲无法从应用内删除')
+        } else if (this.subPage === 'localMusicDetail') {
+          // 本地音乐存在 local_music 表，不在 playlist_song 表：必须走本地删除
+          const localId = song.songId.replace('local_', '')
+          await this.db.removeLocalMusic(localId)
+          await this.loadLocalMusic()
+          this.showToastMsg('已从本地音乐移除')
         } else {
           await this.removeSongFromPlaylist(song)
           this.showToastMsg('已从歌单删除')
@@ -1321,7 +1262,7 @@ export struct XuanchuangTab {
     }
     const count = songs.length
     promptAction.showDialog({
-      title: '彻底移除',
+      title: '移除歌曲',
       message: `确定要移除选中的 ${count} 首歌曲吗？`,
       buttons: [
         { text: '取消', color: this.themeTextSecondary },
@@ -1380,74 +1321,7 @@ export struct XuanchuangTab {
     }
   }
 
-  // ===== 歌单排序按钮与气泡弹窗 =====
-  @Builder
-  SortHeaderButton(isLocal: boolean) {
-    if (this.supportImmersive) {
-      Row() {
-        Column({ space: 1 }) {
-          SymbolGlyph($r('sys.symbol.chevron_up')).fontSize(10).fontColor([this.themeTextPrimary])
-          SymbolGlyph($r('sys.symbol.chevron_down')).fontSize(10).fontColor([this.themeTextPrimary])
-        }
-        .justifyContent(FlexAlign.Center)
-      }
-      .width(28).height(28)
-      .borderRadius(14)
-      .border({ width: 1, color: this.themeTextPrimary })
-      .backgroundColor(this.themeCardBg)
-      .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-      .justifyContent(FlexAlign.Center)
-      .flexShrink(0)
-      .bindPopup(isLocal ? this.sortPopupTarget === 'local' : this.sortPopupTarget === 'playlist', {
-        builder: this.SortModePopup(),
-        placement: Placement.Bottom,
-        onStateChange: (e: PopupStateChangeParam) => {
-          if (!e.isVisible) {
-            this.sortPopupTarget = ''
-          }
-        }
-      })
-      .onClick(() => {
-        if (isLocal) {
-          this.sortPopupTarget = this.sortPopupTarget === 'local' ? '' : 'local'
-        } else {
-          this.sortPopupTarget = this.sortPopupTarget === 'playlist' ? '' : 'playlist'
-        }
-      })
-    } else {
-      Row() {
-        Column({ space: 1 }) {
-          SymbolGlyph($r('sys.symbol.chevron_up')).fontSize(10).fontColor([this.themeTextPrimary])
-          SymbolGlyph($r('sys.symbol.chevron_down')).fontSize(10).fontColor([this.themeTextPrimary])
-        }
-        .justifyContent(FlexAlign.Center)
-      }
-      .width(28).height(28)
-      .borderRadius(14)
-      .border({ width: 1, color: this.themeTextPrimary })
-      .backgroundColor(this.themeCardBg)
-      .blur(8)
-      .justifyContent(FlexAlign.Center)
-      .flexShrink(0)
-      .bindPopup(isLocal ? this.sortPopupTarget === 'local' : this.sortPopupTarget === 'playlist', {
-        builder: this.SortModePopup(),
-        placement: Placement.Bottom,
-        onStateChange: (e: PopupStateChangeParam) => {
-          if (!e.isVisible) {
-            this.sortPopupTarget = ''
-          }
-        }
-      })
-      .onClick(() => {
-        if (isLocal) {
-          this.sortPopupTarget = this.sortPopupTarget === 'local' ? '' : 'local'
-        } else {
-          this.sortPopupTarget = this.sortPopupTarget === 'playlist' ? '' : 'playlist'
-        }
-      })
-    }
-  }
-
+  // ===== 歌单排序气泡弹窗 =====
   @Builder
   SortModePopup() {
     Column({ space: 4 }) {
@@ -1623,7 +1497,7 @@ export struct XuanchuangTab {
               SymbolGlyph($r('sys.symbol.trash'))
                 .fontSize(18)
                 .fontColor([this.themeDanger])
-              Text('彻底移除歌曲')
+              Text('移除歌曲')
                 .fontSize(15)
                 .fontColor(this.themeDanger)
                 .fontWeight(FontWeight.Medium)
@@ -1694,14 +1568,14 @@ export struct XuanchuangTab {
               this.handleFloatingAction('share_song', this.floatingSong!)
             })
 
-            // 彻底移除歌曲（仅非云端歌单显示）
+            // 移除歌曲（仅非云端歌单显示）
             if (this.floatingSong?.source !== 'webdav') {
               Divider().color(this.themeDivider).margin({ left: 44, right: 16 })
               Row({ space: 12 }) {
                 SymbolGlyph($r('sys.symbol.trash'))
                   .fontSize(18)
                   .fontColor([this.themeDanger])
-                Text('彻底移除歌曲')
+                Text('移除歌曲')
                   .fontSize(15)
                   .fontColor(this.themeDanger)
                   .fontWeight(FontWeight.Medium)
@@ -2325,18 +2199,18 @@ export struct XuanchuangTab {
               Stack({ alignContent: Alignment.Start }) {
                 Row()
                   .width('100%')
-                  .height(8)
-                  .borderRadius(4)
+                  .height(5)
+                  .borderRadius(2.5)
                   .backgroundColor(this.themeDivider)
                 Row()
                   .width(`${this.levelInfo.percent}%`)
-                  .height(8)
-                  .borderRadius(4)
+                  .height(5)
+                  .borderRadius(2.5)
                   .backgroundColor(this.themePrimary)
-                  .constraintSize({ minWidth: this.levelInfo.percent > 0 ? 4 : 0 })
+                  .constraintSize({ minWidth: this.levelInfo.percent > 0 ? 3 : 0 })
               }
               .layoutWeight(1)
-              .height(8)
+              .height(5)
               .constraintSize({ maxWidth: 120 })
 
               Text(`${this.levelInfo.current}/${this.levelInfo.need}`)
@@ -2369,32 +2243,17 @@ export struct XuanchuangTab {
         }
       })
 
-      // 右侧：电源图标，未登录点击退出软件，登录后弹出菜单选择
+      // 右侧：设置图标（无字样），点击以全屏侧边栏形式展开设置页
       Row() {
-        SymbolGlyph($r('sys.symbol.power'))
-          .fontSize(18)
-          .fontColor([this.themeTextPrimary])
+        Image($rawfile('sz.svg'))
+          .width(18)
+          .height(18)
       }
       .width(40)
       .height(40)
       .justifyContent(FlexAlign.Center)
       .onClick(() => {
-        if (!this.isLoggedIn) {
-          this.exitApp()
-        } else {
-          this.showAccountMenu = !this.showAccountMenu
-        }
-      })
-      .bindPopup(this.showAccountMenu, {
-        builder: this.AccountMenuBuilder,
-        placement: Placement.Bottom,
-        systemMaterial: MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN),
-        autoCancel: true,
-        onStateChange: (e: PopupStateChangeParam) => {
-          if (!e.isVisible) {
-            this.showAccountMenu = false
-          }
-        }
+        AppStorage.setOrCreate('showSettingsSidebar', true)
       })
     }
     .width('100%')
@@ -2553,7 +2412,7 @@ export struct XuanchuangTab {
     .shadow({ radius: 4, color: '#00000008', offsetY: 2 })
   }
 
-  // ===== 歌单列表 Section V2 =====
+  // ===== 歌单列表 Section V2（区块包裹：题头与子歌单同一容器） =====
   @Builder
   PlaylistsSectionV2() {
     Column({ space: 10 }) {
@@ -2587,15 +2446,14 @@ export struct XuanchuangTab {
         } else {
           if (this.supportImmersive) {
             Row() {
-              SymbolGlyph($r('sys.symbol.plus'))
-                .fontSize(16)
-                .fontColor([this.themeTextPrimary])
+              Image($rawfile('sum.svg'))
+                .width(16)
+                .height(16)
             }
             .width(28)
             .height(28)
             .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
+            .backgroundColor(Color.Transparent)
             .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
             .justifyContent(FlexAlign.Center)
             .onClick(() => {
@@ -2606,16 +2464,15 @@ export struct XuanchuangTab {
             })
           } else {
             Row() {
-              SymbolGlyph($r('sys.symbol.plus'))
-                .fontSize(16)
-                .fontColor([this.themeTextPrimary])
+              Image($rawfile('sum.svg'))
+                .width(16)
+                .height(16)
             }
             .width(28)
             .height(28)
             .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .blur(8)
+            .backgroundColor(Color.Transparent)
+            .backgroundEffect(MaterialCompat.effect(this.isDarkMode, this.themeCardBg, MaterialCompatStyle.THIN))
             .justifyContent(FlexAlign.Center)
             .onClick(() => {
               this.editPlaylistTarget = null
@@ -2641,13 +2498,18 @@ export struct XuanchuangTab {
         .height(80)
         .justifyContent(FlexAlign.Center)
         .alignItems(HorizontalAlign.Center)
-        .backgroundColor(this.themeCardBg)
-        .borderRadius(14)
       } else {
-        Column({ space: 8 }) {
-          ForEach(this.reorderMode ? this.reorderedIds : this.playlists.map(p => p.id), (id: string) => {
-            if (this.playlists.find(p => p.id === id)) {
-              this.PlaylistCardV2(this.playlists.find(p => p.id === id)!)
+        Column() {
+          ForEach(this.reorderMode ? this.reorderedIds : this.playlists.map(p => p.id), (id: string, index: number) => {
+            Column() {
+              if (index > 0) {
+                Divider()
+                  .color(this.themeDivider)
+                  .margin({ left: 64 })
+              }
+              if (this.playlists.find(p => p.id === id)) {
+                this.PlaylistCardV2(this.playlists.find(p => p.id === id)!)
+              }
             }
           }, (id: string) => id)
         }
@@ -2655,6 +2517,9 @@ export struct XuanchuangTab {
       }
     }
     .width('100%')
+    .padding(14)
+    .backgroundColor(this.themeCardBg)
+    .borderRadius(16)
   }
 
   // ===== 歌单卡片 V2 =====
@@ -2782,14 +2647,12 @@ export struct XuanchuangTab {
         .flexShrink(0)
     }
     .width('100%')
-    .padding(12)
-    .backgroundColor(this.themeCardBg)
-    .borderRadius(14)
+    .padding({ left: 12, right: 12, top: 10, bottom: 10 })
     .animation({ duration: 200 })
     .offset({ y: this.draggingPlaylistId === playlist.id ? this.dragOffset : 0 })
     .zIndex(this.draggingPlaylistId === playlist.id ? 10 : 0)
     .scale({ x: this.draggingPlaylistId === playlist.id ? 1.05 : 1, y: this.draggingPlaylistId === playlist.id ? 1.05 : 1 })
-    .shadow({ radius: 6, color: this.draggingPlaylistId === playlist.id ? '#33000000' : '#00000005', offsetY: this.draggingPlaylistId === playlist.id ? 6 : 1 })
+    .shadow({ radius: 6, color: this.draggingPlaylistId === playlist.id ? '#33000000' : Color.Transparent, offsetY: this.draggingPlaylistId === playlist.id ? 6 : 0 })
     .onClick(() => {
       if (this.reorderMode) {
         const idx = this.reorderedIds.indexOf(playlist.id)
@@ -2812,7 +2675,7 @@ export struct XuanchuangTab {
     )
   }
 
-  // ===== 本地歌单卡片（与自建歌单统一风格：单卡片 + 号按钮 + 长按菜单） =====
+  // ===== 本地歌单区块（题头 + 单行入口） =====
   @Builder
   LocalMusicSimpleCard() {
     Column({ space: 10 }) {
@@ -2831,7 +2694,7 @@ export struct XuanchuangTab {
       }
       .width('100%')
 
-      // 单卡片：本地歌单统一入口
+      // 单行入口：本地歌单统一入口
       Row({ space: 12 }) {
         // 封面：第一首歌的封面或默认图标
         Stack() {
@@ -2905,17 +2768,18 @@ export struct XuanchuangTab {
           .flexShrink(0)
       }
       .width('100%')
-      .padding(12)
-      .backgroundColor(this.themeCardBg)
-      .borderRadius(14)
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
       .onClick(() => {
         this.subPage = 'localMusicDetail'
       })
     }
     .width('100%')
+    .padding(14)
+    .backgroundColor(this.themeCardBg)
+    .borderRadius(16)
   }
 
-  // ===== 云端歌单 Section =====
+  // ===== 云端歌单区块（题头 + 云端歌单列表，无右上角刷新） =====
   @Builder
   CloudPlaylistSection() {
     Column({ space: 10 }) {
@@ -2931,44 +2795,6 @@ export struct XuanchuangTab {
           .margin({ left: 8 })
 
         Blank().layoutWeight(1)
-
-        if (this.supportImmersive) {
-          Row() {
-            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(16).fontColor([this.themeTextPrimary])
-          }
-          .width(28).height(28)
-          .borderRadius(14)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            if (!this.webdavConfigured) {
-              this.showToastMsg('请在陋室配置 WebDAV')
-            } else {
-              this.refreshCloudPlaylists()
-            }
-          })
-        } else {
-          Row() {
-            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(16).fontColor([this.themeTextPrimary])
-          }
-          .width(28).height(28)
-          .borderRadius(14)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .blur(8)
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            if (!this.webdavConfigured) {
-              this.showToastMsg('请在陋室配置 WebDAV')
-            } else {
-              this.refreshCloudPlaylists()
-            }
-          })
-        }
       }
       .width('100%')
 
@@ -2993,8 +2819,8 @@ export struct XuanchuangTab {
           SymbolGlyph($r('sys.symbol.chevron_right'))
             .fontSize(16).fontColor([this.themeTextSecondary]).flexShrink(0)
         }
-        .width('100%').padding(12)
-        .backgroundColor(this.themeCardBg).borderRadius(14)
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 10, bottom: 10 })
         .onClick(() => {
           this.showToastMsg('请在陋室配置 WebDAV')
         })
@@ -3007,9 +2833,8 @@ export struct XuanchuangTab {
             .fontSize(14).fontColor(this.themeTextSecondary)
         }
         .width('100%').padding(16)
-        .backgroundColor(this.themeCardBg).borderRadius(14)
       } else if (this.cloudPlaylists.length === 0) {
-        // 已配置但无歌单
+        // 已配置但无歌单：点击加载云端歌单
         Row({ space: 12 }) {
           Row() {
             SymbolGlyph($r('sys.symbol.cloud'))
@@ -3022,66 +2847,82 @@ export struct XuanchuangTab {
           Column({ space: 4 }) {
             Text('WebDAV 已配置')
               .fontSize(15).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Medium)
-            Text('点击右上角刷新按钮加载云端歌单')
+            Text('点击加载云端歌单')
               .fontSize(12).fontColor(this.themeTextSecondary)
           }
           .alignItems(HorizontalAlign.Start).layoutWeight(1)
+
+          SymbolGlyph($r('sys.symbol.chevron_right'))
+            .fontSize(16).fontColor([this.themeTextSecondary]).flexShrink(0)
         }
-        .width('100%').padding(12)
-        .backgroundColor(this.themeCardBg).borderRadius(14)
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+        .onClick(() => {
+          this.refreshCloudPlaylists()
+        })
       } else {
-        Column({ space: 8 }) {
-          ForEach(this.cloudPlaylists, (playlist: Playlist) => {
-            Row({ space: 12 }) {
-              Stack() {
-                Row() {
-                  Image($r('app.media.music_note')).width(24).height(24)
+        Column() {
+          ForEach(this.cloudPlaylists, (playlist: Playlist, index: number) => {
+            Column() {
+              if (index > 0) {
+                Divider()
+                  .color(this.themeDivider)
+                  .margin({ left: 64 })
+              }
+              Row({ space: 12 }) {
+                Stack() {
+                  Row() {
+                    Image($r('app.media.music_note')).width(24).height(24)
+                  }
+                  .width(52).height(52).borderRadius(10)
+                  .backgroundColor(this.themePlaceholder).justifyContent(FlexAlign.Center)
+                }.flexShrink(0)
+
+                Column({ space: 4 }) {
+                  Text(playlist.name)
+                    .fontSize(15).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Medium)
+                    .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                  Text(`${playlist.songCount} 首`)
+                    .fontSize(12).fontColor(this.themeTextSecondary)
                 }
-                .width(52).height(52).borderRadius(10)
-                .backgroundColor(this.themePlaceholder).justifyContent(FlexAlign.Center)
-              }.flexShrink(0)
+                .alignItems(HorizontalAlign.Start).layoutWeight(1)
 
-              Column({ space: 4 }) {
-                Text(playlist.name)
-                  .fontSize(15).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Medium)
-                  .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                Text(`${playlist.songCount} 首`)
-                  .fontSize(12).fontColor(this.themeTextSecondary)
-              }
-              .alignItems(HorizontalAlign.Start).layoutWeight(1)
+                // 播放按钮
+                Row() {
+                  SymbolGlyph($r('sys.symbol.play_fill'))
+                    .fontSize(16)
+                    .fontColor([this.themePrimary])
+                }
+                .width(32)
+                .height(32)
+                .borderRadius(16)
+                .backgroundColor(this.themePrimaryLight)
+                .justifyContent(FlexAlign.Center)
+                .flexShrink(0)
+                .onClick(() => {
+                  this.playPlaylist(playlist)
+                })
 
-              // 播放按钮
-              Row() {
-                SymbolGlyph($r('sys.symbol.play_fill'))
-                  .fontSize(16)
-                  .fontColor([this.themePrimary])
+                SymbolGlyph($r('sys.symbol.chevron_right'))
+                  .fontSize(16).fontColor([this.themeTextSecondary]).flexShrink(0)
               }
-              .width(32)
-              .height(32)
-              .borderRadius(16)
-              .backgroundColor(this.themePrimaryLight)
-              .justifyContent(FlexAlign.Center)
-              .flexShrink(0)
+              .width('100%')
+              .padding({ left: 12, right: 12, top: 10, bottom: 10 })
               .onClick(() => {
-                this.playPlaylist(playlist)
-              })
-
-              SymbolGlyph($r('sys.symbol.chevron_right'))
-                .fontSize(16).fontColor([this.themeTextSecondary]).flexShrink(0)
-            }
-            .width('100%').padding(12)
-            .backgroundColor(this.themeCardBg).borderRadius(14)
-            .onClick(() => {
                 this.selectedCloudPlaylist = playlist
                 this.subPage = 'cloudPlaylistDetail'
                 this.loadCloudPlaylistSongs(playlist)
               })
-          })
+            }
+          }, (playlist: Playlist) => playlist.id)
         }
         .width('100%')
       }
     }
     .width('100%')
+    .padding(14)
+    .backgroundColor(this.themeCardBg)
+    .borderRadius(16)
   }
 
   private async refreshCloudPlaylists() {
@@ -3370,15 +3211,14 @@ export struct XuanchuangTab {
 
           if (this.supportImmersive) {
             Row() {
-              SymbolGlyph($r('sys.symbol.plus'))
-                .fontSize(16)
-                .fontColor([this.themeTextPrimary])
+              Image($rawfile('sum.svg'))
+                .width(16)
+                .height(16)
             }
             .width(28)
             .height(28)
             .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
+            .backgroundColor(Color.Transparent)
             .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
             .justifyContent(FlexAlign.Center)
             .onClick(() => {
@@ -3386,16 +3226,15 @@ export struct XuanchuangTab {
             })
           } else {
             Row() {
-              SymbolGlyph($r('sys.symbol.plus'))
-                .fontSize(16)
-                .fontColor([this.themeTextPrimary])
+              Image($rawfile('sum.svg'))
+                .width(16)
+                .height(16)
             }
             .width(28)
             .height(28)
             .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .blur(8)
+            .backgroundColor(Color.Transparent)
+            .backgroundEffect(MaterialCompat.effect(this.isDarkMode, this.themeCardBg, MaterialCompatStyle.THIN))
             .justifyContent(FlexAlign.Center)
             .onClick(() => {
               this.importLocalMusic()
@@ -3877,124 +3716,91 @@ export struct XuanchuangTab {
 
   @Builder
   PlaylistDetailContent() {
-    Column() {
-      Row({ space: 12 }) {
-        Row() {
-          SymbolGlyph($r('sys.symbol.chevron_left'))
-            .fontSize(24)
-            .fontColor([this.themeTextPrimary])
-        }
-        .width(36)
-        .height(36)
-        .justifyContent(FlexAlign.Center)
-        .onClick(() => {
-          if (this.multiSelectMode) {
-            this.exitMultiSelectMode()
-          } else {
-            this.subPage = 'main'
-          }
-        })
+    HdsNavDestination() {
+      Column() {
+        // 多选模式：标题栏整体隐藏，使用自定义头部
+        if (this.multiSelectMode) {
+          Row({ space: 12 }) {
+            Row() {
+              SymbolGlyph($r('sys.symbol.chevron_left'))
+                .fontSize(24)
+                .fontColor([this.themeTextPrimary])
+            }
+            .width(36)
+            .height(36)
+            .justifyContent(FlexAlign.Center)
+            .onClick(() => {
+              this.exitMultiSelectMode()
+            })
 
-        Column({ space: 2 }) {
-          Row({ space: 8 }) {
-            Text(this.multiSelectMode
-              ? `已选 ${this.selectedSongKeys.size} 项`
-              : (this.selectedPlaylist?.name ?? '歌单详情'))
+            Text(`已选 ${this.selectedSongKeys.size} 项`)
               .fontSize(17)
               .fontColor(this.themeTextPrimary)
               .fontWeight(FontWeight.Bold)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
+              .layoutWeight(1)
 
-          if (!this.multiSelectMode) {
-            Text(`${this.playlistSongs.length} 首`)
-              .fontSize(12)
-              .fontColor(this.themeTextSecondary)
+            // 全选/取消按钮
+            if (this.supportImmersive) {
+              Row() {
+                SymbolGlyph(this.selectedSongKeys.size === this.playlistSongs.length && this.playlistSongs.length > 0
+                  ? $r('sys.symbol.checkmark_circle_fill')
+                  : $r('sys.symbol.checkmark_circle'))
+                  .fontSize(16)
+                  .fontColor([this.themeTextPrimary])
+              }
+              .width(28)
+              .height(28)
+              .borderRadius(14)
+              .backgroundColor(Color.Transparent)
+              .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
+              .justifyContent(FlexAlign.Center)
+              .onClick(() => { this.toggleSelectAll() })
+            } else {
+              Row() {
+                SymbolGlyph(this.selectedSongKeys.size === this.playlistSongs.length && this.playlistSongs.length > 0
+                  ? $r('sys.symbol.checkmark_circle_fill')
+                  : $r('sys.symbol.checkmark_circle'))
+                  .fontSize(16)
+                  .fontColor([this.themeTextPrimary])
+              }
+              .width(28)
+              .height(28)
+              .borderRadius(14)
+              .backgroundColor(Color.Transparent)
+              .backgroundEffect(MaterialCompat.effect(this.isDarkMode, this.themeCardBg, MaterialCompatStyle.THIN))
+              .justifyContent(FlexAlign.Center)
+              .onClick(() => { this.toggleSelectAll() })
+            }
           }
+          .width('100%')
+          .height(56)
+          .padding({ left: 8, right: 16 })
+          .alignItems(VerticalAlign.Center)
         }
-        .layoutWeight(1)
-        .alignItems(HorizontalAlign.Start)
 
-        // 多选模式下的全选/取消按钮
-        if (this.multiSelectMode) {
-          if (this.supportImmersive) {
-            Row() {
-              SymbolGlyph(this.selectedSongKeys.size === this.playlistSongs.length && this.playlistSongs.length > 0
-                ? $r('sys.symbol.checkmark_circle_fill')
-                : $r('sys.symbol.checkmark_circle'))
-                .fontSize(16)
-                .fontColor([this.themeTextPrimary])
+        // 排序弹窗隐藏锚点（由标题栏菜单 px 图标触发）
+        Row()
+          .width(1)
+          .height(1)
+          .bindPopup(this.sortPopupTarget === 'playlist', {
+            builder: this.SortModePopup(),
+            placement: Placement.Bottom,
+            onStateChange: (e: PopupStateChangeParam) => {
+              if (!e.isVisible) {
+                this.sortPopupTarget = ''
+              }
             }
-            .width(28)
-            .height(28)
-            .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => { this.toggleSelectAll() })
-          } else {
-            Row() {
-              SymbolGlyph(this.selectedSongKeys.size === this.playlistSongs.length && this.playlistSongs.length > 0
-                ? $r('sys.symbol.checkmark_circle_fill')
-                : $r('sys.symbol.checkmark_circle'))
-                .fontSize(16)
-                .fontColor([this.themeTextPrimary])
-            }
-            .width(28)
-            .height(28)
-            .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .blur(8)
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => { this.toggleSelectAll() })
-          }
-        } else {
-          // 排序按钮（新在前/旧在前/按字母，歌单独立记忆）
-          this.SortHeaderButton(false)
+          })
 
-          // 多选编辑图标
-          if (this.supportImmersive) {
-            Row() {
-              SymbolGlyph($r('sys.symbol.list_bullet'))
-                .fontSize(16)
-                .fontColor([this.themeTextPrimary])
-            }
-            .width(28)
-            .height(28)
-            .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => { this.enterMultiSelectMode() })
-          } else {
-            Row() {
-              SymbolGlyph($r('sys.symbol.list_bullet'))
-                .fontSize(16)
-                .fontColor([this.themeTextPrimary])
-            }
-            .width(28)
-            .height(28)
-            .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .blur(8)
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => { this.enterMultiSelectMode() })
-          }
+        // 标题栏悬浮于内容之上：非多选时为返回/排序/多选按钮让出高度
+        if (!this.multiSelectMode) {
+          Column().height(64)
         }
-      }
-      .width('100%')
-      .height(56)
-      .padding({ left: 8, right: 16 })
-      .alignItems(VerticalAlign.Center)
 
       if (this.playlistSongs.length === 0) {
-        EmptyState({ icon: '', title: '歌单是空的', subtitle: '在设置页面搜索并添加歌曲' })
+        EmptyState({ icon: '', title: '歌单是空的', subtitle: '在搜索页搜索并添加歌曲' })
       } else {
+        Refresh({ refreshing: $$this.detailRefreshing, offset: 64 }) {
         Scroll() {
           Column({ space: 8 }) {
             ForEach(this.playlistSongs, (song: SongInfo, index?: number) => {
@@ -4110,11 +3916,60 @@ export struct XuanchuangTab {
         .scrollBar(BarState.Auto)
         .edgeEffect(EdgeEffect.Spring)
         .align(Alignment.Top)
+        }
+        .onRefreshing(() => {
+          this.detailRefreshing = true
+          this.reloadPlaylistSongs().then(() => {
+            this.detailRefreshing = false
+          })
+        })
       }
+      }
+      .width('100%')
+      .height('100%')
+      .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
     }
+    .titleBar({
+      content: {
+        title: {
+          mainTitle: this.selectedPlaylist?.name ?? '歌单详情',
+          subTitle: `${this.playlistSongs.length} 首`,
+        },
+        menu: {
+          value: [
+            {
+              content: {
+                icon: $rawfile('px.svg'),
+                action: (): void => {
+                  this.sortPopupTarget = this.sortPopupTarget === 'playlist' ? '' : 'playlist'
+                },
+              },
+            },
+            {
+              content: {
+                icon: $rawfile('dx.svg'),
+                action: (): void => {
+                  this.enterMultiSelectMode()
+                },
+              },
+            },
+          ],
+        },
+        backIcon: {
+          icon: new SymbolGlyphModifier($r('sys.symbol.chevron_left')),
+          action: (): void => {
+            if (this.multiSelectMode) {
+              this.exitMultiSelectMode()
+            } else {
+              this.subPage = 'main'
+            }
+          },
+        },
+      },
+    })
+    .hideTitleBar(this.multiSelectMode)
     .width('100%')
     .height('100%')
-    .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
   }
 
   @Builder
@@ -4243,113 +4098,72 @@ export struct XuanchuangTab {
   // ===== 本地音乐详情页 =====
   @Builder
   LocalMusicDetailContent() {
-    Column() {
-      Row({ space: 12 }) {
-        Row() {
-          SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(24).fontColor([this.themeTextPrimary])
-        }
-        .width(36).height(36).justifyContent(FlexAlign.Center)
-        .onClick(() => {
-          if (this.multiSelectMode) {
-            this.exitMultiSelectMode()
-          } else {
-            this.subPage = 'main'
-          }
-        })
-
-        Column({ space: 2 }) {
-          Text(this.multiSelectMode ? `已选 ${this.selectedSongKeys.size} 项` : '本地音乐')
-            .fontSize(17).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Bold)
-          if (!this.multiSelectMode) {
-            Text(`${this.localMusicList.length} 首`).fontSize(12).fontColor(this.themeTextSecondary)
-          }
-        }
-        .alignItems(HorizontalAlign.Start).layoutWeight(1)
-
+    HdsNavDestination() {
+      Column() {
+        // 多选模式：标题栏整体隐藏，使用自定义头部
         if (this.multiSelectMode) {
-          if (this.supportImmersive) {
+          Row({ space: 12 }) {
             Row() {
-              SymbolGlyph(this.selectedSongKeys.size === this.localMusicList.length && this.localMusicList.length > 0
-                ? $r('sys.symbol.checkmark_circle_fill')
-                : $r('sys.symbol.checkmark_circle'))
-                .fontSize(16).fontColor([this.themeTextPrimary])
+              SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(24).fontColor([this.themeTextPrimary])
             }
-            .width(28).height(28)
-            .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => { this.toggleSelectAll() })
-          } else {
-            Row() {
-              SymbolGlyph(this.selectedSongKeys.size === this.localMusicList.length && this.localMusicList.length > 0
-                ? $r('sys.symbol.checkmark_circle_fill')
-                : $r('sys.symbol.checkmark_circle'))
-                .fontSize(16).fontColor([this.themeTextPrimary])
-            }
-            .width(28).height(28)
-            .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .blur(8)
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => { this.toggleSelectAll() })
-          }
-        } else {
-          // 排序按钮（新在前/旧在前/按字母）
-          this.SortHeaderButton(true)
+            .width(36).height(36).justifyContent(FlexAlign.Center)
+            .onClick(() => {
+              this.exitMultiSelectMode()
+            })
 
-          if (this.supportImmersive) {
-            Row() {
-              SymbolGlyph($r('sys.symbol.list_bullet')).fontSize(16).fontColor([this.themeTextPrimary])
-            }
-            .width(28).height(28)
-            .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => { this.enterMultiSelectMode() })
-          } else {
-            Row() {
-              SymbolGlyph($r('sys.symbol.list_bullet')).fontSize(16).fontColor([this.themeTextPrimary])
-            }
-            .width(28).height(28)
-            .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .blur(8)
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => { this.enterMultiSelectMode() })
-          }
+            Text(`已选 ${this.selectedSongKeys.size} 项`)
+              .fontSize(17).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Bold)
+              .layoutWeight(1)
 
-          if (this.supportImmersive) {
-            Row() {
-              SymbolGlyph($r('sys.symbol.plus')).fontSize(16).fontColor([this.themeTextPrimary])
+            if (this.supportImmersive) {
+              Row() {
+                SymbolGlyph(this.selectedSongKeys.size === this.localMusicList.length && this.localMusicList.length > 0
+                  ? $r('sys.symbol.checkmark_circle_fill')
+                  : $r('sys.symbol.checkmark_circle'))
+                  .fontSize(16).fontColor([this.themeTextPrimary])
+              }
+              .width(28).height(28)
+              .borderRadius(14)
+              .backgroundColor(Color.Transparent)
+              .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
+              .justifyContent(FlexAlign.Center)
+              .onClick(() => { this.toggleSelectAll() })
+            } else {
+              Row() {
+                SymbolGlyph(this.selectedSongKeys.size === this.localMusicList.length && this.localMusicList.length > 0
+                  ? $r('sys.symbol.checkmark_circle_fill')
+                  : $r('sys.symbol.checkmark_circle'))
+                  .fontSize(16).fontColor([this.themeTextPrimary])
+              }
+              .width(28).height(28)
+              .borderRadius(14)
+              .backgroundColor(Color.Transparent)
+              .backgroundEffect(MaterialCompat.effect(this.isDarkMode, this.themeCardBg, MaterialCompatStyle.THIN))
+              .justifyContent(FlexAlign.Center)
+              .onClick(() => { this.toggleSelectAll() })
             }
-            .width(28).height(28)
-            .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-            .justifyContent(FlexAlign.Center).flexShrink(0)
-            .onClick(() => { this.importLocalMusic() })
-          } else {
-            Row() {
-              SymbolGlyph($r('sys.symbol.plus')).fontSize(16).fontColor([this.themeTextPrimary])
-            }
-            .width(28).height(28)
-            .borderRadius(14)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .blur(8)
-            .justifyContent(FlexAlign.Center).flexShrink(0)
-            .onClick(() => { this.importLocalMusic() })
           }
+          .width('100%').height(56).padding({ left: 8, right: 16 }).alignItems(VerticalAlign.Center)
         }
-      }
-      .width('100%').height(56).padding({ left: 8, right: 16 }).alignItems(VerticalAlign.Center)
+
+        // 排序弹窗隐藏锚点（由标题栏菜单 px 图标触发）
+        Row()
+          .width(1)
+          .height(1)
+          .bindPopup(this.sortPopupTarget === 'local', {
+            builder: this.SortModePopup(),
+            placement: Placement.Bottom,
+            onStateChange: (e: PopupStateChangeParam) => {
+              if (!e.isVisible) {
+                this.sortPopupTarget = ''
+              }
+            }
+          })
+
+        // 标题栏悬浮于内容之上：非多选时为返回/排序/多选按钮让出高度
+        if (!this.multiSelectMode) {
+          Column().height(64)
+        }
 
       if (this.localMusicList.length === 0) {
         Column({ space: 12 }) {
@@ -4362,6 +4176,7 @@ export struct XuanchuangTab {
         }
         .width('100%').layoutWeight(1).justifyContent(FlexAlign.Center).alignItems(HorizontalAlign.Center)
       } else {
+        Refresh({ refreshing: $$this.detailRefreshing, offset: 64 }) {
         Scroll() {
           Column({ space: 8 }) {
             ForEach(this.localMusicList, (item: LocalMusicItem) => {
@@ -4467,67 +4282,76 @@ export struct XuanchuangTab {
           .width('100%').padding({ left: 16, right: 16, top: 8, bottom: 168 })
         }
         .layoutWeight(1).scrollBar(BarState.Auto).edgeEffect(EdgeEffect.Spring).align(Alignment.Top)
+        }
+        .onRefreshing(() => {
+          this.detailRefreshing = true
+          this.loadLocalMusic().then(() => {
+            this.detailRefreshing = false
+          })
+        })
       }
+      }
+      .width('100%').height('100%')
+      .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
     }
-    .width('100%').height('100%')
-    .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
+    .titleBar({
+      content: {
+        title: {
+          mainTitle: '本地音乐',
+          subTitle: `${this.localMusicList.length} 首`,
+        },
+        menu: {
+          value: [
+            {
+              content: {
+                icon: $rawfile('px.svg'),
+                action: (): void => {
+                  this.sortPopupTarget = this.sortPopupTarget === 'local' ? '' : 'local'
+                },
+              },
+            },
+            {
+              content: {
+                icon: $rawfile('dx.svg'),
+                action: (): void => {
+                  this.enterMultiSelectMode()
+                },
+              },
+            },
+            {
+              content: {
+                icon: $rawfile('sum.svg'),
+                action: (): void => {
+                  this.importLocalMusic()
+                },
+              },
+            },
+          ],
+        },
+        backIcon: {
+          icon: new SymbolGlyphModifier($r('sys.symbol.chevron_left')),
+          action: (): void => {
+            if (this.multiSelectMode) {
+              this.exitMultiSelectMode()
+            } else {
+              this.subPage = 'main'
+            }
+          },
+        },
+      },
+    })
+    .hideTitleBar(this.multiSelectMode)
+    .width('100%')
+    .height('100%')
   }
 
   // ===== 云端歌单详情页 =====
   @Builder
   CloudPlaylistDetailContent() {
-    Column() {
-      Row({ space: 12 }) {
-        Row() {
-          SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(24).fontColor([this.themeTextPrimary])
-        }
-        .width(36).height(36).justifyContent(FlexAlign.Center)
-        .onClick(() => { this.subPage = 'main' })
-
-        Column({ space: 2 }) {
-          Text(this.selectedCloudPlaylist?.name ?? '云端歌单')
-            .fontSize(17).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Bold)
-            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(`${this.cloudPlaylistSongs.length} 首`)
-            .fontSize(12).fontColor(this.themeTextSecondary)
-        }
-        .layoutWeight(1).alignItems(HorizontalAlign.Start)
-
-        if (this.supportImmersive) {
-          Row() {
-            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(16).fontColor([this.themeTextPrimary])
-          }
-          .width(28).height(28)
-          .borderRadius(14)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            if (this.selectedCloudPlaylist) {
-              this.loadCloudPlaylistSongs(this.selectedCloudPlaylist)
-            }
-          })
-        } else {
-          Row() {
-            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(16).fontColor([this.themeTextPrimary])
-          }
-          .width(28).height(28)
-          .borderRadius(14)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .blur(8)
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            if (this.selectedCloudPlaylist) {
-              this.loadCloudPlaylistSongs(this.selectedCloudPlaylist)
-            }
-          })
-        }
-      }
-      .width('100%').height(56).padding({ left: 8, right: 16 }).alignItems(VerticalAlign.Center)
+    HdsNavDestination() {
+      Column() {
+        // 标题栏悬浮于内容之上：为返回/刷新按钮让出高度
+        Column().height(64)
 
       if (this.cloudPlaylistLoadingSongs) {
         Column() {
@@ -4538,6 +4362,7 @@ export struct XuanchuangTab {
       } else if (this.cloudPlaylistSongs.length === 0) {
         EmptyState({ icon: '', title: '歌单是空的', subtitle: '请检查网盘目录是否有音乐文件' })
       } else {
+        Refresh({ refreshing: $$this.detailRefreshing, offset: 64 }) {
         Scroll() {
           Column({ space: 8 }) {
             ForEach(this.cloudPlaylistSongs, (song: SongInfo, index?: number) => {
@@ -4615,10 +4440,52 @@ export struct XuanchuangTab {
           .width('100%').padding({ top: 12, left: 16, right: 16, bottom: 200 })
         }
         .layoutWeight(1).scrollBar(BarState.Auto).edgeEffect(EdgeEffect.Spring)
+        }
+        .onRefreshing(() => {
+          if (this.selectedCloudPlaylist) {
+            this.detailRefreshing = true
+            this.loadCloudPlaylistSongs(this.selectedCloudPlaylist).then(() => {
+              this.detailRefreshing = false
+            })
+          } else {
+            this.detailRefreshing = false
+          }
+        })
       }
+      }
+      .width('100%').height('100%')
+      .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
     }
-    .width('100%').height('100%')
-    .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
+    .titleBar({
+      content: {
+        title: {
+          mainTitle: this.selectedCloudPlaylist?.name ?? '云端歌单',
+          subTitle: `${this.cloudPlaylistSongs.length} 首`,
+        },
+        menu: {
+          value: [
+            {
+              content: {
+                icon: $rawfile('sx.svg'),
+                action: (): void => {
+                  if (this.selectedCloudPlaylist) {
+                    this.loadCloudPlaylistSongs(this.selectedCloudPlaylist)
+                  }
+                },
+              },
+            },
+          ],
+        },
+        backIcon: {
+          icon: new SymbolGlyphModifier($r('sys.symbol.chevron_left')),
+          action: (): void => {
+            this.subPage = 'main'
+          },
+        },
+      },
+    })
+    .width('100%')
+    .height('100%')
   }
 
   private async loadCloudPlaylistSongs(playlist: Playlist) {

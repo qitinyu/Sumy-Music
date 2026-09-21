@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Sumy MusicFree Plugin Host</title>
+<script>
+/**
+ * XHR / fetch 桥补丁 —— 必须先于 axios 等库加载
+ * （axios 初始化时探测 XMLHttpRequest 存在性以选择 adapter）
+ */
+(function () {
+  'use strict';
+  var mfNative = window.mfNative;
+
+  window.__mfHttpCallbacks = {};
+  window.__mfHttpSeq = 0;
+
+  // ---------- base64 / bytes ----------
+  function mfBytesToB64(bytes) {
+    var bin = '';
+    var CHUNK = 0x8000;
+    for (var i = 0; i < bytes.length; i += CHUNK) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(bin);
+  }
+  function mfUtf8ToB64(str) {
+    return mfBytesToB64(new TextEncoder().encode(str));
+  }
+  function mfB64ToBytes(b64) {
+    if (!b64) {
+      return new Uint8Array(0);
+    }
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; ++i) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    return bytes;
+  }
+  function mfBytesToUtf8(bytes) {
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+  function mfEncodeBody(body) {
+    if (body === null || body === undefined) {
+      return '';
+    }
+    if (typeof body === 'string') {
+      return mfUtf8ToB64(body);
+    }
+    if (body instanceof ArrayBuffer) {
+      return mfBytesToB64(new Uint8Array(body));
+    }
+    if (typeof body === 'object' && body.buffer instanceof ArrayBuffer) {
+      return mfBytesToB64(new Uint8Array(body.buffer, body.byteOffset || 0, body.byteLength));
+    }
+    return mfUtf8ToB64(String(body));
+  }
+
+  window.__mfBytesToB64 = mfBytesToB64;
+  window.__mfB64ToBytes = mfB64ToBytes;
+  window.__mfBytesToUtf8 = mfBytesToUtf8;
+  window.__mfEncodeBody = mfEncodeBody;
+
+  // ---------- XMLHttpRequest ----------
+  function BridgeXHR() {
+    this.readyState = 0;
+    this.status = 0;
+    this.statusText = '';
+    this.responseText = '';
+    this.response = null;
+    this.responseType = '';
+    this.responseURL = '';
+    this.timeout = 0;
+    this.withCredentials = false;
+    this.onreadystatechange = null;
+    this.onload = null;
+    this.onerror = null;
+    this.onabort = null;
+    this.ontimeout = null;
+    this.onloadend = null;
+    this._method = 'GET';
+    this._url = '';
+    this._requestHeaders = {};
+    this._responseHeaders = null;
+    this._callId = null;
+    this._done = false;
+    this._localTimer = 0;
+    this.upload = {
+      addEventListener: function () {
+      }
+    };
+  }
+  BridgeXHR.prototype.open = function (method, url) {
+    this._method = method || 'GET';
+    this._url = url;
+    this.readyState = 1;
+    this.responseURL = url;
+    this._fireStateChange();
+  };
+  BridgeXHR.prototype.setRequestHeader = function (name, value) {
+    if (this._requestHeaders.hasOwnProperty(name)) {
+      this._requestHeaders[name] = this._requestHeaders[name] + ', ' + value;
+    } else {
+      this._requestHeaders[name] = value;
+    }
+  };
+  BridgeXHR.prototype.getResponseHeader = function (name) {
+    if (!this._responseHeaders || !name) {
+      return null;
+    }
+    var lower = String(name).toLowerCase();
+    var v = this._responseHeaders[lower];
+    if (v === undefined || v === null) {
+      return null;
+    }
+    if (Array.isArray(v)) {
+      return v.join(', ');
+    }
+    return v;
+  };
+  BridgeXHR.prototype.getAllResponseHeaders = function () {
+    if (!this._responseHeaders) {
+      return '';
+    }
+    var lines = [];
+    var keys = Object.keys(this._responseHeaders);
+    for (var i = 0; i < keys.length; ++i) {
+      var k = keys[i];
+      var v = this._responseHeaders[k];
+      if (Array.isArray(v)) {
+        for (var j = 0; j < v.length; ++j) {
+          lines.push(k + ': ' + v[j]);
+        }
+      } else {
+        lines.push(k + ': ' + v);
+      }
+    }
+    return lines.join('\r\n');
+  };
+  BridgeXHR.prototype.abort = function () {
+    if (this._done) {
+      return;
+    }
+    this._done = true;
+    if (this._localTimer) {
+      clearTimeout(this._localTimer);
+      this._localTimer = 0;
+    }
+    if (this._callId) {
+      delete window.__mfHttpCallbacks[this._callId];
+      this._callId = null;
+    }
+    this.readyState = 4;
+    this.status = 0;
+    this._fireStateChange();
+    if (typeof this.onabort === 'function') {
+      this.onabort();
+    }
+    this._fireLoadEnd();
+  };
+  BridgeXHR.prototype.send = function (body) {
+    var self = this;
+    window.__mfHttpSeq += 1;
+    var callId = 'h' + window.__mfHttpSeq;
+    this._callId = callId;
+    this.readyState = 2;
+    this._fireStateChange();
+
+    window.__mfHttpCallbacks[callId] = function (status, headers, bodyB64) {
+      self._localOnResult(status, headers, bodyB64);
+    };
+    var timeoutMs = this.timeout && this.timeout > 0 ? this.timeout : 8000;
+    if (this.timeout && this.timeout > 0) {
+      this._localTimer = setTimeout(function () {
+        if (self._done) {
+          return;
+        }
+        self._done = true;
+        delete window.__mfHttpCallbacks[callId];
+        self.readyState = 4;
+        self.status = 0;
+        self._fireStateChange();
+        if (typeof self.ontimeout === 'function') {
+          self.ontimeout();
+        }
+        self._fireLoadEnd();
+      }, this.timeout);
+    }
+    try {
+      mfNative.httpRequest(callId, this._url, this._method,
+        JSON.stringify(this._requestHeaders), mfEncodeBody(body), timeoutMs);
+    } catch (e) {
+      this._localOnResult(0, {}, '');
+    }
+  };
+  BridgeXHR.prototype._localOnResult = function (status, headers, bodyB64) {
+    if (this._done) {
+      return;
+    }
+    this._done = true;
+    if (this._localTimer) {
+      clearTimeout(this._localTimer);
+      this._localTimer = 0;
+    }
+    this.readyState = 4;
+    this.status = status || 0;
+    this._responseHeaders = headers || {};
+    var bytes = mfB64ToBytes(bodyB64);
+    var text = bytes.length > 0 ? mfBytesToUtf8(bytes) : '';
+    this.responseText = text;
+    if (this.responseType === 'arraybuffer') {
+      this.response = bytes.buffer;
+    } else if (this.responseType === 'json') {
+      try {
+        this.response = JSON.parse(text);
+      } catch (e) {
+        this.response = null;
+      }
+    } else {
+      // '' / 'text' / 'blob'（blob 退化为文本）
+      this.response = text;
+    }
+    this._fireStateChange();
+    if (this.status === 0) {
+      if (typeof this.onerror === 'function') {
+        this.onerror();
+      }
+    } else if (typeof this.onload === 'function') {
+      this.onload();
+    }
+    this._fireLoadEnd();
+  };
+  BridgeXHR.prototype._fireStateChange = function () {
+    if (typeof this.onreadystatechange === 'function') {
+      this.onreadystatechange();
+    }
+  };
+  BridgeXHR.prototype._fireLoadEnd = function () {
+    if (typeof this.onloadend === 'function') {
+      this.onloadend();
+    }
+  };
+  window.XMLHttpRequest = BridgeXHR;
+
+  // ---------- fetch ----------
+  function mfCollectHeaders(h, out) {
+    if (!h) {
+      return;
+    }
+    if (typeof h.forEach === 'function') {
+      try {
+        h.forEach(function (v, k) {
+          if (typeof k === 'string') {
+            out[k] = typeof v === 'string' ? v : String(v);
+          }
+        });
+      } catch (e) {
+      }
+      return;
+    }
+    var keys = Object.keys(h);
+    for (var i = 0; i < keys.length; ++i) {
+      var k = keys[i];
+      var v = h[k];
+      out[k] = typeof v === 'string' ? v : String(v);
+    }
+  }
+
+  window.fetch = function (input, init) {
+    init = init || {};
+    var url;
+    var method;
+    var headers = {};
+    var body = null;
+    if (typeof input === 'string') {
+      url = input;
+      method = (init.method || 'GET').toUpperCase();
+    } else if (input && typeof input === 'object' && typeof input.url === 'string') {
+      url = input.url;
+      method = (init.method || input.method || 'GET').toUpperCase();
+      mfCollectHeaders(input.headers, headers);
+    } else {
+      url = String(input);
+      method = (init.method || 'GET').toUpperCase();
+    }
+    mfCollectHeaders(init.headers, headers);
+    if (init.body !== undefined && init.body !== null) {
+      body = init.body;
+    }
+    return new Promise(function (resolve, reject) {
+      window.__mfHttpSeq += 1;
+      var callId = 'f' + window.__mfHttpSeq;
+      window.__mfHttpCallbacks[callId] = function (status, respHeaders, bodyB64) {
+        if (!status || status === 0) {
+          reject(new TypeError('Network request failed'));
+          return;
+        }
+        var bytes = window.__mfB64ToBytes(bodyB64);
+        try {
+          var headersObj = new Headers(respHeaders || {});
+          var bodyArg = (status === 204 || status === 304) ? null : bytes;
+          resolve(new Response(bodyArg, { status: status, headers: headersObj }));
+        } catch (e) {
+          reject(new TypeError('Network request failed'));
+        }
+      };
+      try {
+        mfNative.httpRequest(callId, url, method, JSON.stringify(headers),
+          window.__mfEncodeBody(body), 60000);
+      } catch (e) {
+        reject(new TypeError('Network request failed'));
+      }
+    });
+  };
+})();
+</script>
+<script src="libs/big-integer.min.js"></script>
+<script src="libs/axios.min.js"></script>
+<script src="libs/crypto-js.min.js"></script>
+<script src="libs/dayjs.min.js"></script>
+<script src="libs/he.js"></script>
+<script src="libs/qs.js"></script>
+<script src="libs/cheerio.iife.js"></script>
+<script src="libs/webdav.iife.js"></script>
+</head>
+<body>
+<script>
+/**
+ * MusicFree 插件沙箱运行时（Sumy 移植自 MusicFreeOH）
+ * 宿主协议：
+ *   __mf.load(key, funcCode, env, callId)   — funcCode 源码字符串；env 对象
+ *   __mf.call(key, method, args, callId)    — args 数组
+ *   __mf.onHttpResult(callId, status, headers, bodyB64) — headers 对象
+ * 宿主经 runJavaScript 以脚本字面量传参，eval 求值后即为上述类型，严禁二次 JSON.parse
+ * 结果回传：mfNative.onPluginResult(callId, ok, json)
+ *   ok: json = {"info": {...}}（load）或方法返回值（call）
+ *   失败: json = {"message": "..."}
+ */
+(function () {
+  'use strict';
+  var mfNative = window.mfNative;
+
+  var pluginInstances = {};
+  var pluginNameHolders = {};
+
+  // ---------- require ----------
+  var deprecatedCookieManager = {
+    get: function () {
+    },
+    set: function () {
+    },
+    flush: function () {
+    }
+  };
+  var packages = {
+    'axios': window.axios,
+    'crypto-js': window.CryptoJS,
+    'dayjs': window.dayjs,
+    'big-integer': window.bigInt,
+    'qs': window.qs,
+    'he': window.he,
+    'cheerio': window.__mfCheerio,
+    'webdav': window.__mfWebdav,
+    '@react-native-cookies/cookies': deprecatedCookieManager
+  };
+  window.__mfPackages = packages;
+
+  function mfRequire(name) {
+    var pkg = packages[name];
+    if (pkg === undefined || pkg === null) {
+      throw new Error('Cannot find module \'' + name + '\'');
+    }
+    try {
+      if (!pkg.default) {
+        pkg.default = pkg;
+      }
+    } catch (e) {
+      // ESM 命名空间不可写，忽略
+    }
+    return pkg;
+  }
+
+  // ---------- console ----------
+  function mfFmtArgs(args) {
+    var parts = [];
+    for (var i = 0; i < args.length; ++i) {
+      var a = args[i];
+      if (typeof a === 'string') {
+        parts.push(a);
+      } else {
+        try {
+          parts.push(JSON.stringify(a));
+        } catch (e) {
+          parts.push(String(a));
+        }
+      }
+    }
+    return parts.join(' ');
+  }
+  function mfNativeLog(level, args) {
+    try {
+      mfNative.log(level, mfFmtArgs(args));
+    } catch (e) {
+    }
+  }
+  var mfConsole = {
+    log: function () {
+      mfNativeLog('log', arguments);
+    },
+    warn: function () {
+      mfNativeLog('warn', arguments);
+    },
+    info: function () {
+      mfNativeLog('info', arguments);
+    },
+    error: function () {
+      mfNativeLog('error', arguments);
+    }
+  };
+
+  // ---------- axios 对齐 RN 默认配置 ----------
+  if (window.axios) {
+    window.axios.defaults.timeout = 2000;
+    window.axios.interceptors.response.use(function (response) {
+      // 统一 set-cookie 格式（对齐 RN：单元素数组时按逗号拆分）
+      var setCookie = response.headers && response.headers['set-cookie'];
+      if (setCookie && setCookie.length === 1) {
+        response.headers['set-cookie'] = setCookie[0].split(',');
+        response.headers['x-set-cookie'] = setCookie;
+      }
+      return response;
+    });
+  }
+
+  // ---------- 结果回传 ----------
+  function mfRespond(callId, ok, json) {
+    try {
+      mfNative.onPluginResult(callId, ok, json);
+    } catch (e) {
+    }
+  }
+  function mfFail(callId, err) {
+    var msg = (err && err.message) ? err.message : String(err);
+    mfRespond(callId, false, JSON.stringify({ message: msg }));
+  }
+
+  // ---------- load ----------
+  function mfLoad(key, funcCode, envJson, callId) {
+    try {
+      var envBase = (envJson && typeof envJson === 'string') ? JSON.parse(envJson) : (envJson || {});
+      var nameHolder = { name: '' };
+      pluginNameHolders[key] = nameHolder;
+
+      // 插件环境变量（用户变量暂不支持，返回空对象保持协议完整）
+      var env = {
+        getUserVariables: function () {
+          var raw = '{}';
+          try {
+            raw = mfNative.getUserVariables(nameHolder.name || '') || '{}';
+          } catch (e) {
+          }
+          try {
+            return JSON.parse(raw);
+          } catch (e) {
+            return {};
+          }
+        },
+        get userVariables() {
+          return this.getUserVariables();
+        },
+        appVersion: envBase.appVersion,
+        os: envBase.os,
+        lang: envBase.lang
+      };
+      var processShim = {
+        platform: 'harmony',
+        version: envBase.appVersion,
+        env: env
+      };
+
+      var moduleShim = { exports: {} };
+      var factory = Function(
+        '"use strict";\n' +
+        'return function(require, __musicfree_require, module, exports, console, env, URL, process) {\n' +
+        funcCode + '\n' +
+        '};'
+      )();
+      factory(mfRequire, mfRequire, moduleShim, moduleShim.exports, mfConsole, env, window.URL, processShim);
+
+      var instance = moduleShim.exports.default || moduleShim.exports;
+      if (!instance || typeof instance !== 'object') {
+        throw new Error('插件导出无效');
+      }
+      if (Array.isArray(instance.userVariables)) {
+        instance.userVariables = instance.userVariables.filter(function (it) {
+          return it && it.key;
+        });
+      }
+      nameHolder.name = typeof instance.platform === 'string' ? instance.platform : '';
+
+      var supportedMethods = [];
+      var keys = Object.keys(instance);
+      for (var i = 0; i < keys.length; ++i) {
+        var k = keys[i];
+        if (Object.prototype.hasOwnProperty.call(instance, k) && typeof instance[k] === 'function') {
+          supportedMethods.push(k);
+        }
+      }
+      pluginInstances[key] = instance;
+
+      mfRespond(callId, true, JSON.stringify({
+        info: {
+          platform: instance.platform,
+          version: instance.version,
+          srcUrl: instance.srcUrl,
+          author: instance.author,
+          cacheControl: instance.cacheControl,
+          appVersion: instance.appVersion,
+          supportedSearchType: instance.supportedSearchType,
+          userVariables: instance.userVariables,
+          supportedMethods: supportedMethods,
+          description: typeof instance.description === 'string' ? instance.description : '',
+          hints: (instance.hints && typeof instance.hints === 'object') ? instance.hints : {}
+        }
+      }));
+    } catch (e) {
+      mfFail(callId, e);
+    }
+  }
+
+  // ---------- call ----------
+  function mfCall(key, method, argsJson, callId) {
+    try {
+      var instance = pluginInstances[key];
+      if (!instance) {
+        throw new Error('插件未挂载');
+      }
+      var fn = instance[method];
+      if (typeof fn !== 'function') {
+        throw new Error('方法不存在: ' + method);
+      }
+      var argsRaw = (argsJson && typeof argsJson === 'string') ? JSON.parse(argsJson) : argsJson;
+      var args = Array.isArray(argsRaw) ? argsRaw : [];
+      Promise.resolve(fn.apply(instance, args)).then(function (result) {
+        var json;
+        try {
+          json = JSON.stringify(result === undefined ? null : result);
+        } catch (e) {
+          mfFail(callId, e);
+          return;
+        }
+        mfRespond(callId, true, json);
+      }, function (err) {
+        mfFail(callId, err);
+      });
+    } catch (e) {
+      mfFail(callId, e);
+    }
+  }
+
+  // ---------- HTTP 结果分发 ----------
+  function mfOnHttpResult(callId, status, headersJson, bodyB64) {
+    var cb = window.__mfHttpCallbacks[callId];
+    if (!cb) {
+      return;
+    }
+    delete window.__mfHttpCallbacks[callId];
+    var headers = {};
+    try {
+      if (headersJson && typeof headersJson === 'string') {
+        headers = JSON.parse(headersJson);
+      } else if (headersJson) {
+        headers = headersJson;
+      }
+    } catch (e) {
+    }
+    cb(status, headers, bodyB64 || '');
+  }
+
+  // ---------- 实例重命名（挂载用临时名，挂载后改用插件声明的 platform 名） ----------
+  function mfRename(oldKey, newKey) {
+    if (pluginInstances[oldKey] !== undefined && pluginInstances[newKey] === undefined) {
+      pluginInstances[newKey] = pluginInstances[oldKey];
+      pluginNameHolders[newKey] = pluginNameHolders[oldKey];
+      delete pluginInstances[oldKey];
+      delete pluginNameHolders[oldKey];
+    }
+  }
+
+  // ---------- 沙箱环境自检：回传各依赖库加载状态 ----------
+  function mfProbe(callId) {
+    var missing = [];
+    var check = [
+      ['axios', window.axios],
+      ['cheerio', window.__mfCheerio],
+      ['crypto-js', window.CryptoJS],
+      ['qs', window.qs],
+      ['dayjs', window.dayjs],
+      ['he', window.he],
+      ['big-integer', window.bigInt],
+      ['webdav', window.__mfWebdav]
+    ];
+    for (var i = 0; i < check.length; ++i) {
+      if (!check[i][1]) {
+        missing.push(check[i][0]);
+      }
+    }
+    mfRespond(callId, true, JSON.stringify({
+      native: !!mfNative,
+      libs: check.length - missing.length,
+      total: check.length,
+      missing: missing
+    }));
+  }
+
+  window.__mf = {
+    load: mfLoad,
+    call: mfCall,
+    onHttpResult: mfOnHttpResult,
+    rename: mfRename,
+    probe: mfProbe
+  };
+
+  // 库已通过 <script> 同步加载，直接就绪
+  try {
+    mfNative.markReady();
+  } catch (e) {
+  }
+})();
+</script>
+</body>
+</html>

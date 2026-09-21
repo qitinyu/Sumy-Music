@@ -2,14 +2,23 @@
  * MiniBarPlayer - 底部迷你栏播放器
  * 独立 @Component 直接订阅 AppStorage，切歌/播放状态变化时自身重新渲染，
  * 不受 HdsTabs miniBarBuilder 缓存影响。
- * V2.1.4：封面/歌词全部用组件自身 @State 渲染（不嵌套 CoverImage 子组件），
+ * V2.1.5：迷你栏不再显示歌词。
+ * - 第一行：歌曲名 + 音源徽章（徽章缩小）
+ * - 第二行：歌手 + 专辑（有专辑才显示），多余文本省略
+ * - 右侧：上一首/播放暂停/下一首 整体左移，最右侧新增「播放列表」图标，
+ *   点击从底部弹出当前播放列表（样式参考播放页右上角播放列表）。
+ * 封面/歌词仍由组件自身 @State 渲染（不嵌套 CoverImage 子组件），
  * 修复 HdsTabs 迷你栏内子组件 @Prop/@State 更新不生效导致封面不刷新的问题。
  */
-import { SongInfo, LyricLine, SourceInfo } from '../model/MusicModel'
-import { PlayerStore } from '../utils/PlayerStore'
+import { SongInfo, SourceInfo } from '../model/MusicModel'
+import { PlayerStore, PlayerKeys } from '../utils/PlayerStore'
 import { AudioPlayer } from '../utils/AudioPlayer'
 import { MusicApi } from '../utils/MusicApi'
 import { CoverFetcher } from '../utils/CoverFetcher'
+import { promptAction } from '@kit.ArkUI'
+import { CoverImage } from './CoverImage'
+import { CompatUtils } from '../utils/CompatUtils'
+import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
 
 @Component
 export struct MiniBarPlayer {
@@ -18,41 +27,31 @@ export struct MiniBarPlayer {
   @StorageProp('isPlaying') isPlaying: boolean = false
   @StorageProp('currentTime') @Watch('onTrackOrTimeChange') currentTime: number = 0
   @StorageProp('miniBarStyle') miniBarStyle: number = 1
+  @StorageProp('miniBarShowSource') miniBarShowSource: boolean = true
+  @StorageProp('queue') queue: SongInfo[] = []
+  @StorageProp('queueIndex') queueIndex: number = 0
+  @StorageProp('playMode') playMode: number = 0
   @StorageProp('theme_primary') themePrimary: string = '#007DFF'
+  @StorageProp('theme_primaryLight') themePrimaryLight: string = '#E0F0FF'
+  @StorageProp('theme_cardBg') themeCardBg: string = '#FFFFFF'
   @StorageProp('theme_textPrimary') themeTextPrimary: string = '#1A1A1A'
   @StorageProp('theme_textSecondary') themeTextSecondary: string = '#999999'
+  @StorageProp('theme_divider') themeDivider: string = '#E8E8E8'
 
-  @State currentLyric: string = ''
   @State coverDisplay: string = ''
+  @State showQueueSheet: boolean = false
   private lastCoverUrl: string = ''
+  private supportImmersive: boolean = CompatUtils.isImmersiveSupported()
 
   aboutToAppear(): void {
-    this.updateCurrentLyric()
     this.resolveCover()
   }
 
   onTrackOrTimeChange(): void {
-    this.updateCurrentLyric()
     this.resolveCover()
   }
 
-  private updateCurrentLyric(): void {
-    const lyrics = AppStorage.get('lyrics') as LyricLine[] | undefined
-    if (!lyrics || lyrics.length === 0) {
-      this.currentLyric = ''
-      return
-    }
-    let text: string = ''
-    for (let i = lyrics.length - 1; i >= 0; i--) {
-      if (lyrics[i].time <= this.currentTime) {
-        text = lyrics[i].text
-        break
-      }
-    }
-    this.currentLyric = text
-  }
-
-  // 切歌时解析封面（与歌词同一 @State 更新管线，确保迷你栏内生效）
+  // 切歌时解析封面（与播放状态同一 @State 更新管线，确保迷你栏内生效）
   private resolveCover(): void {
     const track: SongInfo | null = this.currentTrack
     const url: string = track ? track.coverUrl : ''
@@ -80,26 +79,75 @@ export struct MiniBarPlayer {
       playUrl = await MusicApi.getPlayUrl(track.songId, track.source, track)
     }
     if (!playUrl) {
-      PlayerStore.pause()
+      // 真正停掉 AVPlayer（PlayerStore.pause 只改 AppStorage 标记，旧歌会继续响）
+      await AudioPlayer.getInstance().pause()
+      promptAction.showToast({ message: '无法获取播放链接', duration: 1500 })
       return
     }
     track.playUrl = playUrl
     PlayerStore.play(track)
+    AudioPlayer.getInstance().setCurrentSong(track)
     await AudioPlayer.getInstance().play(playUrl)
   }
 
   private async handlePrevious(): Promise<void> {
-    const track = PlayerStore.previous()
-    if (track) {
-      await this.playTrack(track)
-    }
+    // 统一走 AudioPlayer 切歌：带取链失败自动跳下一首、防抖（代际）与真实暂停
+    await AudioPlayer.getInstance().playPrevious()
   }
 
   private async handleNext(): Promise<void> {
-    const track = PlayerStore.next()
-    if (track) {
-      await this.playTrack(track)
+    await AudioPlayer.getInstance().playNext()
+  }
+
+  // 点击播放列表内的歌曲：切到该队列位置并播放
+  private async playTrackAt(index: number): Promise<void> {
+    const queue = PlayerStore.getQueue()
+    const track = queue[index]
+    if (!track) {
+      return
     }
+    AppStorage.setOrCreate(PlayerKeys.QUEUE_INDEX, index)
+    this.showQueueSheet = false
+    await this.playTrack(track)
+  }
+
+  // 从播放列表移除（参考播放页右上角播放列表的移除逻辑）
+  private removeFromQueue(index: number): void {
+    const queue = PlayerStore.getQueue()
+    const currentIndex = PlayerStore.getQueueIndex()
+    if (index < 0 || index >= queue.length) {
+      return
+    }
+
+    const newQueue = queue.slice()
+    newQueue.splice(index, 1)
+
+    if (newQueue.length === 0) {
+      PlayerStore.setQueue([])
+      PlayerStore.pause()
+      AppStorage.setOrCreate(PlayerKeys.CURRENT_TRACK, null)
+      this.showQueueSheet = false
+      return
+    }
+
+    let newIndex = currentIndex
+    if (index < currentIndex) {
+      newIndex = currentIndex - 1
+    } else if (index === currentIndex) {
+      if (newIndex >= newQueue.length) {
+        newIndex = newQueue.length - 1
+      }
+      AppStorage.setOrCreate(PlayerKeys.QUEUE, newQueue)
+      AppStorage.setOrCreate(PlayerKeys.QUEUE_INDEX, newIndex)
+      const track = newQueue[newIndex]
+      if (track) {
+        this.playTrack(track)
+      }
+      return
+    }
+
+    AppStorage.setOrCreate(PlayerKeys.QUEUE, newQueue)
+    AppStorage.setOrCreate(PlayerKeys.QUEUE_INDEX, newIndex)
   }
 
   private async togglePlay(): Promise<void> {
@@ -121,6 +169,20 @@ export struct MiniBarPlayer {
     }
   }
 
+  // 第二行：歌手 + 专辑（有专辑才拼接）
+  private getArtistAlbum(): string {
+    const track = this.currentTrack
+    if (!track) {
+      return '轻触开始播放'
+    }
+    const artist: string = track.artist ?? ''
+    const album: string = track.album ?? ''
+    if (album.length > 0) {
+      return artist.length > 0 ? `${artist} - ${album}` : album
+    }
+    return artist.length > 0 ? artist : '轻触开始播放'
+  }
+
   private getCoverSource(): ResourceStr {
     if (this.coverDisplay.length > 0) {
       return this.coverDisplay
@@ -131,9 +193,31 @@ export struct MiniBarPlayer {
     return $r('app.media.logo')
   }
 
-  /** 将音源来源码转为中文标签（与搜索卡片一致：SourceInfo 映射） */
-  private getSourceLabel(source: string): string {
-    return SourceInfo.getName(source)
+  private resolveDisplaySource(track: SongInfo): string {
+    if (track.rawData) {
+      try {
+        const obj: Record<string, Object> = JSON.parse(track.rawData) as Record<string, Object>
+        const platform = obj['__platform']
+        if (typeof platform === 'string' && platform.length > 0) {
+          return platform
+        }
+      } catch (_e) {}
+    }
+    return track.source
+  }
+
+  private getPlayModeLabel(): string {
+    switch (this.playMode) {
+      case 0: return '顺序播放'
+      case 1: return '随机播放'
+      case 2: return '单曲循环'
+      default: return '列表循环'
+    }
+  }
+
+  private togglePlayMode(): void {
+    PlayerStore.togglePlayMode()
+    promptAction.showToast({ message: PlayerStore.getPlayModeLabel(), duration: 1500 })
   }
 
   build() {
@@ -146,6 +230,13 @@ export struct MiniBarPlayer {
     }
     .height(40)
     .padding({ left: 8, right: 8 })
+    .bindSheet($$this.showQueueSheet, this.QueueSheetContent(), {
+      height: SheetSize.MEDIUM,
+      dragBar: true,
+      showClose: false,
+      backgroundColor: Color.Transparent,
+      systemMaterial: this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THICK) : undefined,
+    })
   }
 
   @Builder
@@ -160,7 +251,7 @@ export struct MiniBarPlayer {
         .backgroundColor('#E0E0E0')
         .alt($r('app.media.logo'))
 
-      // 中间：歌曲名 + 单行歌词预览（音源标签在歌词行最前面）
+      // 中间：第一行 歌曲名；第二行 歌手+专辑 + 音源徽章（徽章在歌手右侧）
       Column({ space: 2 }) {
         Text(this.currentTrack ? this.currentTrack.songName : '暂无播放')
           .fontSize(14)
@@ -168,23 +259,27 @@ export struct MiniBarPlayer {
           .fontWeight(FontWeight.Bold)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
 
-        Row({ space: 6 }) {
-          if (this.currentTrack && this.currentTrack.source && this.currentTrack.source.length > 0) {
-            Text(SourceInfo.getAbbr(this.currentTrack.source))
-              .fontSize(10)
-              .fontColor(Color.White)
-              .backgroundColor(SourceInfo.getColor(this.currentTrack.source))
-              .borderRadius(4)
-              .padding({ left: 4, right: 4, top: 1, bottom: 1 })
-              .maxLines(1)
-              .flexShrink(0)
-          }
-          Text(this.currentTrack ? this.currentLyric : '轻触开始播放')
+        Row({ space: 5 }) {
+          Text(this.getArtistAlbum())
             .fontSize(12)
             .fontColor(this.themeTextSecondary)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+
+          if (this.miniBarShowSource && this.currentTrack && this.currentTrack.source &&
+            this.currentTrack.source.length > 0) {
+            Text(SourceInfo.getAbbr(this.resolveDisplaySource(this.currentTrack)))
+              .fontSize(9)
+              .fontColor(Color.White)
+              .backgroundColor(SourceInfo.getColor(this.resolveDisplaySource(this.currentTrack)))
+              .borderRadius(3)
+              .padding({ left: 3, right: 3, top: 1, bottom: 1 })
+              .maxLines(1)
+              .flexShrink(0)
+          }
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
@@ -192,7 +287,7 @@ export struct MiniBarPlayer {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
 
-      // 右侧：上一首 / 播放暂停 / 下一首
+      // 右侧：上一首 / 播放暂停 / 下一首（整体左移，为最右侧播放列表图标腾出位置）
       Row({ space: 10 }) {
         SymbolGlyph($r('sys.symbol.backward_end_fill'))
           .fontSize(16)
@@ -215,6 +310,16 @@ export struct MiniBarPlayer {
             this.handleNext()
           })
       }
+      .alignItems(VerticalAlign.Center)
+
+      // 最右侧：播放列表图标（与下一首图标同等大小）
+      Image($rawfile('yylb.svg'))
+        .width(16)
+        .height(16)
+        .objectFit(ImageFit.Contain)
+        .onClick(() => {
+          this.showQueueSheet = true
+        })
     }
     .width('100%')
     .height('100%')
@@ -243,5 +348,110 @@ export struct MiniBarPlayer {
         this.onExpandRequest()
       }
     })
+  }
+
+  // 底部播放列表弹窗（样式参考播放页右上角播放列表）
+  @Builder
+  QueueSheetContent() {
+    Column() {
+      // 头部：标题 + 播放模式 + 关闭
+      Row() {
+        Text(`播放列表(${this.queue.length})`)
+          .fontSize(16)
+          .fontColor(this.themeTextPrimary)
+          .fontWeight(FontWeight.Bold)
+
+        Blank().layoutWeight(1)
+
+        Text(this.getPlayModeLabel())
+          .fontSize(12)
+          .fontColor(this.themePrimary)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .backgroundColor(this.themePrimaryLight)
+          .borderRadius(10)
+          .onClick(() => {
+            this.togglePlayMode()
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 8, top: 12, bottom: 8 })
+
+      Divider().width('100%').color(this.themeDivider)
+
+      if (this.queue.length === 0) {
+        Column() {
+          Text('暂无歌曲')
+            .fontSize(14)
+            .fontColor(this.themeTextSecondary)
+        }
+        .width('100%')
+        .height(120)
+        .justifyContent(FlexAlign.Center)
+      } else {
+        List() {
+          ForEach(this.queue, (track: SongInfo, index?: number) => {
+            ListItem() {
+              Row({ space: 10 }) {
+                if ((index ?? 0) === this.queueIndex) {
+                  SymbolGlyph($r('sys.symbol.waveform'))
+                    .fontSize(16)
+                    .fontColor([this.themePrimary])
+                    .width(20)
+                } else {
+                  Text(`${(index ?? 0) + 1}`)
+                    .fontSize(13)
+                    .fontColor(this.themeTextSecondary)
+                    .width(20)
+                    .textAlign(TextAlign.Center)
+                }
+                CoverImage({
+                  url: track.coverUrl,
+                  coverWidth: 40,
+                  coverHeight: 40,
+                  radius: 6
+                })
+                Column({ space: 2 }) {
+                  Text(track.songName)
+                    .fontSize(14)
+                    .fontColor((index ?? 0) === this.queueIndex ? this.themePrimary : this.themeTextPrimary)
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  Text(track.artist)
+                    .fontSize(11)
+                    .fontColor(this.themeTextSecondary)
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+
+                Row() {
+                  SymbolGlyph($r('sys.symbol.xmark'))
+                    .fontSize(14)
+                    .fontColor([this.themeTextSecondary])
+                }
+                .width(28)
+                .height(28)
+                .justifyContent(FlexAlign.Center)
+                .onClick(() => {
+                  this.removeFromQueue(index ?? 0)
+                })
+              }
+              .width('100%')
+              .padding({ left: 16, right: 4, top: 8, bottom: 8 })
+            }
+            .onClick(() => {
+              this.playTrackAt(index ?? 0)
+            })
+          }, (track: SongInfo) => `${track.songId}_${track.source}_${track.playUrl}`)
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .scrollBar(BarState.Auto)
+        .edgeEffect(EdgeEffect.Spring)
+      }
+    }
+    .width('100%')
+    .height('100%')
   }
 }

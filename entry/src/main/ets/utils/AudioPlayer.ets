@@ -3,13 +3,14 @@ import { fileIo } from '@kit.CoreFileKit'
 import { util } from '@kit.ArkTS'
 import image from '@ohos.multimedia.image'
 import type { SongInfo } from '../model/MusicModel'
-import { NotificationHelper } from './NotificationHelper'
+import { SourceStatus } from '../model/MusicModel'
 import { BackgroundHelper } from './BackgroundHelper'
 import { PlayerStore } from './PlayerStore'
 import { MusicApi } from './MusicApi'
 import { ListeningLevelManager } from './ListeningLevelManager'
 import { CompatUtils } from './CompatUtils'
 import { TagReader, EmbeddedTags } from './TagReader'
+import { playLog } from './PlayLog'
 
 export interface AudioMetadata {
   title: string
@@ -22,21 +23,174 @@ export class AudioPlayer {
   private static instance: AudioPlayer | null = null
   private avPlayer: media.AVPlayer | null = null
   private currentUrl: string = ''
+  // 播放器内实际已加载音频的歌曲标识（source|songId）。与 currentSong（意图播放的歌曲）区分：
+  // 同 URL 快捷恢复仅在“加载的确实是同一首歌”时才允许，否则切歌必须完整重载并从 0 开始，
+  // 避免不同歌曲取到相同 URL 时出现“封面已切换但音频没变、进度继承上一首”。
+  private loadedSongKey: string = ''
   private currentFd: number = -1
   private _isPlaying: boolean = false
   private _isPrepared: boolean = false
   private currentSong: SongInfo | null = null
-  private notificationHelper: NotificationHelper = NotificationHelper.getInstance()
   private bgHelper: BackgroundHelper = BackgroundHelper.getInstance()
   private _duration: number = 0
   private _currentTime: number = 0
   private _positionUpdateTimer: number = -1
+  private timeUpdateListeners: ((time: number) => void)[] = []
+  private durationUpdateListeners: ((duration: number) => void)[] = []
+  private playEndListeners: (() => void)[] = []
+  private errorListeners: ((error: string) => void)[] = []
+  private seekDoneListeners: ((time: number) => void)[] = []
+
+  // 并发防护：每次播放/切歌递增；旧异步流程在 await 之后发现代数不匹配立即中止
+  private playGeneration: number = 0
+  // 播放串行队列：play() 依次排队执行，杜绝并发 release/init 踩踏 AVPlayer
+  private playChain: Promise<void> = Promise.resolve()
+  // 错误自动切歌定时器（全局单例，防止一次错误触发多条重试链形成风暴）
+  private errorRetryTimer: number = -1
+  // seek 进行中标记：挂起期间 timeUpdate 不回写进度，避免进度条跳回
+  private _seekPending: boolean = false
+  private seekWatchdog: number = -1
+
   onTimeUpdate?: (time: number) => void
   onDurationUpdate?: (duration: number) => void
   onPlayEnd?: () => void
   onError?: (error: string) => void
-  // 🆕 seek 完成回调
   onSeekDone?: (time: number) => void
+
+  addTimeUpdateListener(listener: (time: number) => void): void {
+    if (this.timeUpdateListeners.indexOf(listener) < 0) {
+      this.timeUpdateListeners.push(listener)
+    }
+    this.onTimeUpdate = (time: number) => {
+      for (let i = 0; i < this.timeUpdateListeners.length; i++) {
+        this.timeUpdateListeners[i](time)
+      }
+    }
+  }
+
+  removeTimeUpdateListener(listener: (time: number) => void): void {
+    const idx = this.timeUpdateListeners.indexOf(listener)
+    if (idx >= 0) {
+      this.timeUpdateListeners.splice(idx, 1)
+    }
+    if (this.timeUpdateListeners.length > 0) {
+      this.onTimeUpdate = (time: number) => {
+        for (let i = 0; i < this.timeUpdateListeners.length; i++) {
+          this.timeUpdateListeners[i](time)
+        }
+      }
+    } else {
+      this.onTimeUpdate = undefined
+    }
+  }
+
+  addDurationUpdateListener(listener: (duration: number) => void): void {
+    if (this.durationUpdateListeners.indexOf(listener) < 0) {
+      this.durationUpdateListeners.push(listener)
+    }
+    this.onDurationUpdate = (duration: number) => {
+      for (let i = 0; i < this.durationUpdateListeners.length; i++) {
+        this.durationUpdateListeners[i](duration)
+      }
+    }
+  }
+
+  removeDurationUpdateListener(listener: (duration: number) => void): void {
+    const idx = this.durationUpdateListeners.indexOf(listener)
+    if (idx >= 0) {
+      this.durationUpdateListeners.splice(idx, 1)
+    }
+    if (this.durationUpdateListeners.length > 0) {
+      this.onDurationUpdate = (duration: number) => {
+        for (let i = 0; i < this.durationUpdateListeners.length; i++) {
+          this.durationUpdateListeners[i](duration)
+        }
+      }
+    } else {
+      this.onDurationUpdate = undefined
+    }
+  }
+
+  addPlayEndListener(listener: () => void): void {
+    if (this.playEndListeners.indexOf(listener) < 0) {
+      this.playEndListeners.push(listener)
+    }
+    this.onPlayEnd = () => {
+      for (let i = 0; i < this.playEndListeners.length; i++) {
+        this.playEndListeners[i]()
+      }
+    }
+  }
+
+  removePlayEndListener(listener: () => void): void {
+    const idx = this.playEndListeners.indexOf(listener)
+    if (idx >= 0) {
+      this.playEndListeners.splice(idx, 1)
+    }
+    if (this.playEndListeners.length > 0) {
+      this.onPlayEnd = () => {
+        for (let i = 0; i < this.playEndListeners.length; i++) {
+          this.playEndListeners[i]()
+        }
+      }
+    } else {
+      this.onPlayEnd = undefined
+    }
+  }
+
+  addErrorListener(listener: (error: string) => void): void {
+    if (this.errorListeners.indexOf(listener) < 0) {
+      this.errorListeners.push(listener)
+    }
+    this.onError = (error: string) => {
+      for (let i = 0; i < this.errorListeners.length; i++) {
+        this.errorListeners[i](error)
+      }
+    }
+  }
+
+  removeErrorListener(listener: (error: string) => void): void {
+    const idx = this.errorListeners.indexOf(listener)
+    if (idx >= 0) {
+      this.errorListeners.splice(idx, 1)
+    }
+    if (this.errorListeners.length > 0) {
+      this.onError = (error: string) => {
+        for (let i = 0; i < this.errorListeners.length; i++) {
+          this.errorListeners[i](error)
+        }
+      }
+    } else {
+      this.onError = undefined
+    }
+  }
+
+  addSeekDoneListener(listener: (time: number) => void): void {
+    if (this.seekDoneListeners.indexOf(listener) < 0) {
+      this.seekDoneListeners.push(listener)
+    }
+    this.onSeekDone = (time: number) => {
+      for (let i = 0; i < this.seekDoneListeners.length; i++) {
+        this.seekDoneListeners[i](time)
+      }
+    }
+  }
+
+  removeSeekDoneListener(listener: (time: number) => void): void {
+    const idx = this.seekDoneListeners.indexOf(listener)
+    if (idx >= 0) {
+      this.seekDoneListeners.splice(idx, 1)
+    }
+    if (this.seekDoneListeners.length > 0) {
+      this.onSeekDone = (time: number) => {
+        for (let i = 0; i < this.seekDoneListeners.length; i++) {
+          this.seekDoneListeners[i](time)
+        }
+      }
+    } else {
+      this.onSeekDone = undefined
+    }
+  }
 
   static getInstance(): AudioPlayer {
     if (!AudioPlayer.instance) {
@@ -117,6 +271,50 @@ export class AudioPlayer {
     return false
   }
 
+  // 清除 seek 挂起状态（seekDone 回调或超时兜底时调用）
+  private clearSeekPending(): void {
+    this._seekPending = false
+    if (this.seekWatchdog >= 0) {
+      clearTimeout(this.seekWatchdog)
+      this.seekWatchdog = -1
+    }
+  }
+
+  // 取消尚未执行的错误自动切歌（用户主动暂停/切歌/停止时接管控制权）
+  private cancelErrorRetry(): void {
+    if (this.errorRetryTimer >= 0) {
+      clearTimeout(this.errorRetryTimer)
+      this.errorRetryTimer = -1
+    }
+  }
+
+  // 播放失败统一处理：通知 UI 一次，并安排唯一一次自动切歌
+  private handlePlaybackError(message: string): void {
+    console.error('[AudioPlayer] playback error:', message)
+    playLog('播放', `播放出错: ${message}`)
+    if (this.currentSong) {
+      playLog('播放', `出错曲目: ${this.currentSong.songName} - ${this.currentSong.artist} source=${this.currentSong.source}`)
+      SourceStatus.markUnplayable(this.currentSong.source)
+    }
+    AppStorage.setOrCreate('playerErrorNotice', message + '|' + Date.now().toString())
+    if (this.errorRetryTimer >= 0) {
+      return
+    }
+    this.errorRetryTimer = setTimeout(() => {
+      this.errorRetryTimer = -1
+      playLog('播放', '播放出错，2秒后自动切下一首')
+      this.skipTo(PlayerStore.next()).catch(() => {
+      })
+    }, 2000)
+  }
+
+  // 播放结束自动推进：由 AudioPlayer 统一处理，组件不再各自注册 playEnd 回调
+  private handleTrackEnd(): void {
+    this.clearSeekPending()
+    this.skipTo(PlayerStore.onTrackEnd()).catch(() => {
+    })
+  }
+
   // 设置事件监听
   private setupListeners(): void {
     if (!this.avPlayer) {
@@ -125,11 +323,16 @@ export class AudioPlayer {
 
     this.avPlayer.on('timeUpdate', (time: number) => {
       this._currentTime = time / 1000
+      // seek 挂起期间不回写，避免 seekDone 前旧位置把进度条拽回去
+      if (!this._seekPending) {
+        PlayerStore.updateTime(this._currentTime)
+      }
       this.onTimeUpdate?.(this._currentTime)
     })
 
     this.avPlayer.on('durationUpdate', (duration: number) => {
       this._duration = duration / 1000
+      PlayerStore.updateDuration(this._duration)
       this.onDurationUpdate?.(this._duration)
     })
 
@@ -138,17 +341,19 @@ export class AudioPlayer {
       this._isPlaying = false
       this._isPrepared = false
       this.stopPositionUpdateTimer()
+      this.clearSeekPending()
       AppStorage.setOrCreate('isPlaying', false)
       this.bgHelper.setPlaybackState(false, this._currentTime * 1000, 1.0, this._duration * 1000).catch(() => {
       })
       ListeningLevelManager.getInstance().endSession().catch(() => {
       })
-      this.onError?.('播放出错')
+      this.handlePlaybackError('播放出错，即将播放下一首')
     })
 
     // 监听播放器状态变化 —— 播放结束时触发 onPlayEnd，由上层决定是否继续播放下一首
     this.avPlayer.on('stateChange', (state: string, reason: media.StateChangeReason) => {
       console.info('[AudioPlayer] stateChange: ' + state + ', reason: ' + reason)
+      playLog('播放', '状态变化: ' + state + ' reason=' + reason)
       if (state === 'playing') {
         this._isPlaying = true
         this._isPrepared = true
@@ -164,7 +369,7 @@ export class AudioPlayer {
         })
         ListeningLevelManager.getInstance().endSession().catch(() => {
         })
-        this.onPlayEnd?.()
+        this.handleTrackEnd()
       } else if (state === 'paused') {
         // 系统暂停（如音频焦点丢失）或主动暂停，同步状态标记与控制中心图标
         this._isPlaying = false
@@ -185,11 +390,13 @@ export class AudioPlayer {
       }
     })
 
-    // 🆕 监听 seekDone，seek 完成后通知 UI 解锁进度条
+    // 🆕 监听 seekDone，seek 完成后清除挂起并通知 UI 解锁进度条
     this.avPlayer.on('seekDone', (seekDoneTime: number) => {
       const seekTimeSec = seekDoneTime / 1000
       console.info(`[AudioPlayer] seekDone: ${seekDoneTime}ms → ${seekTimeSec}s`)
       this._currentTime = seekTimeSec
+      this.clearSeekPending()
+      PlayerStore.updateTime(seekTimeSec)
       this.onSeekDone?.(seekTimeSec)
     })
   }
@@ -578,7 +785,9 @@ export class AudioPlayer {
     // V2.1.2：优先手动解析内嵌歌词标签
     try {
       const tags: EmbeddedTags | null = TagReader.readTags(filePath)
-      if (tags && tags.lyric && tags.lyric.length > 0) {
+      // 系统组件可能把 GBK/BIG5 歌词按单字节编码误解码返回乱码（无 U+FFFD 的"合法"乱码），
+      // 必须先校验：乱码则放弃，落回下面按原始字节重新解码的手动解析。
+      if (tags && tags.lyric && tags.lyric.length > 0 && !AudioPlayer.looksLikeMojibake(tags.lyric)) {
         return tags.lyric
       }
     } catch (_e) {
@@ -683,12 +892,9 @@ export class AudioPlayer {
         if (frameId === 'USLT') {
           const frameData = data.subarray(offset + 10, offset + 10 + frameSize)
           const encoding = frameData[0]
-          // 跳过编码(1) + 语言(3) + 内容描述符(null结尾)
-          let textStart = 4
-          while (textStart < frameData.length && frameData[textStart] !== 0) {
-            textStart++
-          }
-          textStart++
+          // 跳过编码(1) + 语言(3) + 内容描述符（按编码跳过 null 终止符：
+          // UTF-16 的终止符是 2 字节 00 00，按单字节扫描会少跳一字节，导致歌词乱码）
+          const textStart = AudioPlayer.skipId3String(frameData, 4, encoding)
 
           if (textStart < frameData.length) {
             const textBytes = frameData.subarray(textStart)
@@ -758,21 +964,24 @@ export class AudioPlayer {
   private static decodeAsChineseEncoding(textBytes: Uint8Array): string {
     // V2.1.0：UTF-8 干净则直接用，否则按 GB18030/GBK 中文编码解码（严格无替换字符判定）
     const primary: string = CompatUtils.decodeResponse(textBytes)
-    if (primary.length > 0 && primary.indexOf('\uFFFD') < 0) {
+    if (primary.length > 0 && primary.indexOf('\uFFFD') < 0 && !AudioPlayer.looksLikeMojibake(primary)) {
       return primary
     }
-    // 兜底：繁体（BIG5）与 UTF-16LE
-    const fallbacks: string[] = ['big5', 'utf-16le']
+    // 中文编码兜底：GB18030 覆盖 GBK/GB2312，再试 BIG5（繁体）与 UTF-16LE
+    const fallbacks: string[] = ['gb18030', 'gbk', 'big5', 'utf-16le']
     for (let i = 0; i < fallbacks.length; i++) {
       const s: string = AudioPlayer.tryDecodeLabel(fallbacks[i], textBytes)
-      if (s.length > 0 && s.indexOf('\uFFFD') < 0) {
+      if (s.length > 0 && s.indexOf('\uFFFD') < 0 && !AudioPlayer.looksLikeMojibake(s)) {
         return s
       }
     }
-    // 最后兜底：ISO-8859-1（纯英文歌词场景）
+    // 仍无理想结果：返回无替换字符的 UTF-8 结果（若有），否则 ISO-8859-1（纯英文歌词场景）
+    if (primary.length > 0 && primary.indexOf('\uFFFD') < 0) {
+      return primary
+    }
     try {
       const latin1Decoder: util.TextDecoder = util.TextDecoder.create('iso-8859-1')
-      const latin1Result = latin1Decoder.decodeWithStream(textBytes)
+      const latin1Result: string = latin1Decoder.decodeWithStream(textBytes)
       return latin1Result
     } catch (_e) {
       // 所有编码都失败
@@ -789,12 +998,70 @@ export class AudioPlayer {
     }
   }
 
+  // 跳过 ID3 文本串（描述符）：按编码处理 null 终止符
+  private static skipId3String(data: Uint8Array, start: number, encoding: number): number {
+    let p: number = start
+    if (encoding === 1 || encoding === 2) {
+      // UTF-16：先跳 BOM，再找 00 00
+      if (p + 1 < data.length && data[p] === 0xFF && data[p + 1] === 0xFE) {
+        p += 2
+      } else if (p + 1 < data.length && data[p] === 0xFE && data[p + 1] === 0xFF) {
+        p += 2
+      }
+      while (p + 1 < data.length && !(data[p] === 0 && data[p + 1] === 0)) {
+        p += 2
+      }
+      return p + 2
+    }
+    while (p < data.length && data[p] !== 0) {
+      p++
+    }
+    return p + 1
+  }
+
   // 检查解码后的歌词文本是否有效（严格：无替换字符即视为有效）
   private static isValidLyricText(text: string): boolean {
     if (!text || text.length === 0) {
       return false
     }
     return text.indexOf('\uFFFD') < 0
+  }
+
+  // 检测歌词文本是否为乱码：
+  // 1) 含替换字符 U+FFFD（明确解码失败）；
+  // 2) 含连续 2 个以上 Latin-1 补充区字符（U+0080~U+00FF）——GBK/BIG5 等被误当
+  //    ISO-8859-1 解码时的典型特征（每个中文字节都落在该区间，成对出现）。
+  // 3) 含 3 个以上 CJK 扩展区生僻字（扩展A U+3400~U+4DBF、扩展B+ 代理对）——
+  //    GBK 字节恰好拼成合法 UTF-8 三字节序列时的特征：解出的全是罕见字。
+  // 正常 UTF-8 歌词的中文在 U+4E00~U+9FFF、emoji 在 U+10000+，不会误伤。
+  private static looksLikeMojibake(text: string): boolean {
+    if (!text || text.length === 0) {
+      return false
+    }
+    if (text.indexOf('\uFFFD') >= 0) {
+      return true
+    }
+    let run: number = 0
+    let rareCjk: number = 0
+    for (let i = 0; i < text.length; i++) {
+      const code: number = text.charCodeAt(i)
+      if (code >= 0x80 && code <= 0xFF) {
+        run++
+        if (run >= 2) {
+          return true
+        }
+      } else {
+        run = 0
+      }
+      if (code >= 0x3400 && code <= 0x4DBF) {
+        rareCjk++
+      } else if (code >= 0xD840 && code <= 0xD87F) {
+        // UTF-16 高代理（扩展B及以后），成对出现，按一个字计
+        rareCjk++
+        i++
+      }
+    }
+    return rareCjk >= 3
   }
 
   // 解析 FLAC 文件中的 Vorbis Comment 歌词（LYRICS 字段）
@@ -939,13 +1206,13 @@ export class AudioPlayer {
   private static decodeLrcText(bytes: Uint8Array): string {
     // V2.1.0：UTF-8 干净则直接用，否则按 GB18030/GBK 解码（修复本地 .lrc 中文乱码）
     const primary: string = CompatUtils.decodeResponse(bytes)
-    if (primary.length > 0 && primary.indexOf('\uFFFD') < 0) {
+    if (primary.length > 0 && primary.indexOf('\uFFFD') < 0 && !AudioPlayer.looksLikeMojibake(primary)) {
       return primary
     }
-    const fallbacks: string[] = ['big5', 'utf-16le', 'gbk', 'gb2312']
+    const fallbacks: string[] = ['gb18030', 'gbk', 'big5', 'utf-16le']
     for (let i = 0; i < fallbacks.length; i++) {
       const s: string = AudioPlayer.tryDecodeLabel(fallbacks[i], bytes)
-      if (s.length > 0 && s.indexOf('\uFFFD') < 0) {
+      if (s.length > 0 && s.indexOf('\uFFFD') < 0 && !AudioPlayer.looksLikeMojibake(s)) {
         return s
       }
     }
@@ -965,15 +1232,28 @@ export class AudioPlayer {
   // 统一切歌：更新 AudioPlayer 状态、补齐播放链接后调用 play()
   // 目标歌曲无法获取播放链接（错误歌曲）时自动跳到下一首，避免控制中心上下首"点了没反应"
   private async skipTo(track: SongInfo | undefined, depth: number = 0): Promise<void> {
+    const gen: number = ++this.playGeneration
+    this.cancelErrorRetry()
+    this.clearSeekPending()
     if (!track) {
+      playLog('播放', 'skipTo: 无下一首，暂停')
       this.pause()
       return
     }
     if (depth >= 5) {
       // 连续多首都无法获取链接，停止并暂停，防止无限循环
       console.warn('[AudioPlayer] skipTo: too many skips, pausing')
+      playLog('播放', '连续多首无法取链(depth>=5)，停止播放')
       this.pause()
+      AppStorage.setOrCreate('playerErrorNotice', '连续多首无法播放，已停止|' + Date.now().toString())
       return
+    }
+    // 同一首重播（单曲循环）不重置歌词与播放状态
+    const sameSong: boolean = this.currentSong !== null &&
+      this.currentSong.songId === track.songId && this.currentSong.source === track.source
+    playLog('播放', `切歌: ${track.songName} - ${track.artist} source=${track.source} 重播=${sameSong} depth=${depth}`)
+    if (!sameSong) {
+      PlayerStore.play(track)
     }
     this.setCurrentSong(track)
     let url = track.playUrl
@@ -984,12 +1264,18 @@ export class AudioPlayer {
         url = ''
       }
     }
+    if (gen !== this.playGeneration) {
+      console.info('[AudioPlayer] skipTo superseded, abort')
+      return
+    }
     if (!url) {
       console.warn('[AudioPlayer] skipTo: no playUrl for', track.songName, ', skipping to next')
+      playLog('播放', `取链失败: ${track.songName} source=${track.source} lastError=${MusicApi.lastError}`)
       await this.skipTo(PlayerStore.next(), depth + 1)
       return
     }
     track.playUrl = url
+    playLog('播放', `取链成功: ${track.songName} len=${url.length}`)
     await this.play(url)
   }
 
@@ -998,25 +1284,47 @@ export class AudioPlayer {
   // play() 前 PlayerStore.play() 已更新 AppStorage 中的 currentTrack，这里统一同步。
   private syncCurrentSongFromStore(): void {
     const storeTrack = PlayerStore.getCurrentTrack()
-    if (storeTrack && (!this.currentSong || storeTrack.songId !== this.currentSong.songId)) {
+    // 同时比较 songId 与 source：同一首歌可能来自不同音源，仅比 songId 会漏同步，
+    // 导致目标歌曲标识（loadedSongKey 判定依据）停留在上一首
+    if (storeTrack && (!this.currentSong || storeTrack.songId !== this.currentSong.songId ||
+      storeTrack.source !== this.currentSong.source)) {
       this.currentSong = storeTrack
     }
   }
 
   // 播放 —— 设置 url 后由状态机自动完成 prepare → play
+  // 串行排队执行：快速连续切歌时逐个处理，旧请求因代数被淘汰而立即空转退出
   async play(url: string): Promise<void> {
     if (!url) {
       console.error('[AudioPlayer] play failed: URL is empty')
-      this.onError?.('播放链接为空')
+      this.handlePlaybackError('播放链接为空')
       return
     }
+    const gen: number = ++this.playGeneration
+    const task: Promise<void> = this.playChain.then((): Promise<void> => this.playInternal(url, gen))
+    this.playChain = task.catch((): void => {
+    })
+    await task
+  }
+
+  private async playInternal(url: string, gen: number): Promise<void> {
+    if (gen !== this.playGeneration) {
+      console.info('[AudioPlayer] play superseded before start, skip')
+      return
+    }
+    this.cancelErrorRetry()
+    this.clearSeekPending()
 
     // 进入 play() 时立即锁定本次要上报的歌曲，后续 metadata 不再中途读取 store。
     this.syncCurrentSongFromStore()
     const targetSong: SongInfo | null = this.currentSong
+    const targetSongKey: string = targetSong ? targetSong.source + '|' + targetSong.songId : ''
 
-    // 同 URL 恢复播放：无需重新 resolveUrl，直接复用当前播放器
-    if (url === this.currentUrl && this.avPlayer) {
+    // 同 URL 快捷恢复：仅当目标歌曲与播放器内已加载的是同一首歌时才复用当前播放器；
+    // 不同歌曲即使取到相同 URL（缓存 playUrl、跨源兜底命中同一文件）也走完整重载，
+    // 否则会静默 return：封面已切换但音频没变、无任何反馈、且继承上一首进度。
+    if (url === this.currentUrl && this.avPlayer && targetSongKey.length > 0 &&
+      targetSongKey === this.loadedSongKey) {
       if (this._isPlaying) {
         console.info('[AudioPlayer] same URL, already playing')
         return
@@ -1024,8 +1332,14 @@ export class AudioPlayer {
       if (this._isPrepared) {
         try {
           await this.avPlayer.play()
+          if (gen !== this.playGeneration) {
+            return
+          }
           if (!await this.waitForState('playing', 2000)) {
             throw new Error('play did not take effect, state=' + this.avPlayer.state)
+          }
+          if (gen !== this.playGeneration) {
+            return
           }
           this._isPlaying = true
           AppStorage.setOrCreate('isPlaying', true)
@@ -1033,7 +1347,9 @@ export class AudioPlayer {
           console.info('[AudioPlayer] resumed successfully')
           this.startPositionUpdateTimer()
           await this.bgHelper.startBackgroundRunning()
-          await this.notificationHelper.updatePlaybackState(true)
+          if (gen !== this.playGeneration) {
+            return
+          }
           if (targetSong) {
             await this.bgHelper.setSongMetadata(targetSong, this._duration * 1000)
           }
@@ -1041,11 +1357,18 @@ export class AudioPlayer {
           return
         } catch (e) {
           console.error('[AudioPlayer] resume failed:', e)
+          if (gen !== this.playGeneration) {
+            return
+          }
         }
       }
     }
 
     try {
+      if (gen !== this.playGeneration) {
+        console.info('[AudioPlayer] play superseded before switch, skip')
+        return
+      }
       // 先释放旧播放器并关闭旧 fd，再打开新文件，避免 fd 被提前关闭
       if (this.avPlayer) {
         if (this._isPlaying) {
@@ -1058,23 +1381,33 @@ export class AudioPlayer {
           console.warn('[AudioPlayer] release warning:', e)
         }
         this.avPlayer = null
+        if (gen !== this.playGeneration) {
+          console.info('[AudioPlayer] play superseded after release, skip')
+          return
+        }
       }
       this.closeCurrentFd()
 
       // 关闭旧 fd 后再打开新文件，确保 fd 在 avPlayer 使用期间保持有效
       const resolved = this.resolveUrl(url)
       if (!resolved) {
-        this.onError?.('无法打开本地文件')
+        this.handlePlaybackError('无法打开本地文件')
         return
       }
       console.info('[AudioPlayer] play requested, URL:', resolved.substring(0, 100))
 
       if (!await this.initPlayer()) {
         console.error('[AudioPlayer] initPlayer failed')
+        this.handlePlaybackError('播放器初始化失败')
+        return
+      }
+      if (gen !== this.playGeneration) {
+        console.info('[AudioPlayer] play superseded after init, skip')
         return
       }
 
       this.currentUrl = resolved
+      this.loadedSongKey = targetSongKey
       this._isPlaying = false
       this._isPrepared = false
       this._currentTime = 0
@@ -1082,27 +1415,47 @@ export class AudioPlayer {
 
       this.avPlayer!.url = resolved
       console.info('[AudioPlayer] URL set, waiting for initialization...')
+      playLog('播放', '设置URL，等待初始化: ' + resolved.substring(0, 90))
       if (!await this.waitForState('initialized')) {
-        this.onError?.('播放器初始化超时')
+        playLog('播放', '播放器初始化超时 state=' + this.avPlayer!.state)
+        this.handlePlaybackError('播放器初始化超时')
+        return
+      }
+      if (gen !== this.playGeneration) {
+        console.info('[AudioPlayer] play superseded after initialized, skip')
         return
       }
       console.info('[AudioPlayer] player initialized, preparing...')
+      playLog('播放', '初始化完成，开始prepare')
       try {
         await this.avPlayer!.prepare()
       } catch (e) {
         console.error('[AudioPlayer] prepare error:', e)
         this._isPrepared = false
-        this.onError?.('播放准备失败')
+        playLog('播放', 'prepare 抛异常: ' + String(e))
+        this.handlePlaybackError('播放准备失败')
+        return
+      }
+      if (gen !== this.playGeneration) {
         return
       }
       console.info('[AudioPlayer] waiting for prepared state...')
+      playLog('播放', '等待 prepared 状态...')
       if (!await this.waitForState('prepared')) {
-        this.onError?.('播放准备超时')
+        playLog('播放', 'prepared 超时 state=' + this.avPlayer!.state)
+        this.handlePlaybackError('播放准备超时')
+        return
+      }
+      if (gen !== this.playGeneration) {
         return
       }
       this._isPrepared = true
+      playLog('播放', 'prepared 就绪，开始播放')
       try {
         await this.avPlayer!.play()
+        if (gen !== this.playGeneration) {
+          return
+        }
         this._isPlaying = true
         AppStorage.setOrCreate('isPlaying', true)
         await ListeningLevelManager.getInstance().startSession()
@@ -1111,9 +1464,11 @@ export class AudioPlayer {
         console.info('[AudioPlayer] calling bgHelper.startBackgroundRunning')
         await this.bgHelper.startBackgroundRunning()
         console.info('[AudioPlayer] bgHelper.startBackgroundRunning done')
+        if (gen !== this.playGeneration) {
+          return
+        }
         if (targetSong) {
           console.info('[AudioPlayer] setting metadata for:', targetSong.songName)
-          await this.notificationHelper.updateMusicNotification(targetSong, true)
           await this.bgHelper.setSongMetadata(targetSong, this._duration * 1000)
           await this.bgHelper.setPlaybackState(true, this._currentTime * 1000, 1.0, this._duration * 1000)
           console.info('[AudioPlayer] metadata and playback state set')
@@ -1122,19 +1477,25 @@ export class AudioPlayer {
         console.error('[AudioPlayer] play error:', e)
         this._isPlaying = false
         await ListeningLevelManager.getInstance().endSession()
-        this.onError?.('播放失败')
+        if (gen === this.playGeneration) {
+          this.handlePlaybackError('播放失败')
+        }
       }
     } catch (e) {
       console.error('[AudioPlayer] play failed:', e)
       this._isPlaying = false
       this._isPrepared = false
       await ListeningLevelManager.getInstance().endSession()
-      this.onError?.('播放失败: ' + (e instanceof Error ? e.message : String(e)))
+      if (gen === this.playGeneration) {
+        this.handlePlaybackError('播放失败: ' + (e instanceof Error ? e.message : String(e)))
+      }
     }
   }
 
   // 暂停
   async pause(): Promise<void> {
+    // 用户主动暂停：接管控制权，取消尚未执行的错误自动切歌
+    this.cancelErrorRetry()
     if (!this.avPlayer) {
       AppStorage.setOrCreate('isPlaying', false)
       return
@@ -1155,10 +1516,11 @@ export class AudioPlayer {
       this.stopPositionUpdateTimer()
       AppStorage.setOrCreate('isPlaying', false)
       await ListeningLevelManager.getInstance().endSession()
-      await this.notificationHelper.updatePlaybackState(false)
       await this.bgHelper.setPlaybackState(false, this._currentTime * 1000, 1.0, this._duration * 1000)
+      playLog('播放', 'pause 成功')
     } catch (e) {
       console.error('[AudioPlayer] pause failed:', e)
+      playLog('播放', 'pause 失败: ' + String(e))
       this._isPlaying = false
       AppStorage.setOrCreate('isPlaying', false)
       await this.bgHelper.setPlaybackState(false, this._currentTime * 1000, 1.0, this._duration * 1000)
@@ -1178,6 +1540,7 @@ export class AudioPlayer {
     // 直接根据 AVPlayer 实际状态判断，避免 _isPlaying 标记不同步
     const state = this.avPlayer.state
     console.info('[AudioPlayer] resume: current state=', state)
+    playLog('播放', 'resume 当前状态=' + state)
     if (state === 'playing') {
       // 已经在播放中，只需同步状态（含控制中心图标）
       this._isPlaying = true
@@ -1199,9 +1562,9 @@ export class AudioPlayer {
         AppStorage.setOrCreate('isPlaying', true)
         await ListeningLevelManager.getInstance().startSession()
         console.info('[AudioPlayer] resumed successfully')
+        playLog('播放', 'resume 恢复成功')
         this.startPositionUpdateTimer()
         await this.bgHelper.startBackgroundRunning()
-        await this.notificationHelper.updatePlaybackState(true)
         await this.bgHelper.setPlaybackState(true, this._currentTime * 1000, 1.0, this._duration * 1000)
       } catch (e) {
         console.error('[AudioPlayer] resume failed, reinitializing:', e)
@@ -1226,12 +1589,43 @@ export class AudioPlayer {
 
   // 跳转
   async seekTo(timeSeconds: number): Promise<void> {
-    if (this.avPlayer && this._isPrepared) {
+    if (!this.avPlayer) {
+      console.warn('[AudioPlayer] seek skipped: avPlayer is null')
+      return
+    }
+    // 修复进度条拖动失效：不能只依赖 _isPrepared 标记（它可能在标记与真实状态脱节时为 false），
+    // 改为用播放器实时 state 复核。playing/paused/prepared/completed 均可 seek。
+    if (!this._isPrepared) {
       try {
-        await this.avPlayer.seek(timeSeconds * 1000)
+        const st: string = this.avPlayer.state
+        if (st === 'playing' || st === 'paused' || st === 'prepared' || st === 'completed') {
+          console.info('[AudioPlayer] seek: _isPrepared was false but state=' + st + '，沿用真实状态 seek')
+          this._isPrepared = true
+        } else {
+          console.warn('[AudioPlayer] seek skipped: not seekable, state=' + st)
+          return
+        }
       } catch (e) {
-        console.error('[AudioPlayer] seek failed:', e)
+        console.warn('[AudioPlayer] seek skipped: failed to read state', e)
+        return
       }
+    }
+    try {
+      // seek 在途期间挂起进度回写，防止旧位置的 timeUpdate 把进度条拽回去
+      this._seekPending = true
+      playLog('播放', 'seek 到 ' + timeSeconds.toFixed(2) + 's')
+      await this.avPlayer.seek(timeSeconds * 1000)
+      // 看门狗兜底：个别场景 seekDone 不回调，2s 后自动解除挂起
+      this.seekWatchdog = setTimeout((): void => {
+        console.warn('[AudioPlayer] seek watchdog fired, clear pending')
+        playLog('播放', 'seek 看门狗触发，解除挂起')
+        this.clearSeekPending()
+      }, 2000)
+      console.info('[AudioPlayer] seekTo ok: ' + timeSeconds + 's')
+    } catch (e) {
+      this.clearSeekPending()
+      console.error('[AudioPlayer] seek failed:' + timeSeconds + 's', e)
+      playLog('播放', 'seek 失败: ' + timeSeconds + 's err=' + String(e))
     }
   }
 
@@ -1279,6 +1673,8 @@ export class AudioPlayer {
 
   // 停止
   async stop(): Promise<void> {
+    this.cancelErrorRetry()
+    this.clearSeekPending()
     if (this.avPlayer) {
       try {
         await this.avPlayer.stop()
@@ -1292,12 +1688,13 @@ export class AudioPlayer {
       }
     }
     await this.bgHelper.stopBackgroundRunning()
-    await this.notificationHelper.cancelMusicNotification()
     await this.bgHelper.setPlaybackState(false, 0, 1.0, this._duration * 1000)
   }
 
   // 释放资源
   async release(): Promise<void> {
+    this.cancelErrorRetry()
+    this.clearSeekPending()
     if (this._isPlaying) {
       await ListeningLevelManager.getInstance().endSession()
     }
@@ -1316,10 +1713,10 @@ export class AudioPlayer {
     this._currentTime = 0
     this._duration = 0
     this.currentUrl = ''
+    this.loadedSongKey = ''
     this.currentSong = null
     AppStorage.setOrCreate('isPlaying', false)
     await this.bgHelper.stopBackgroundRunning()
-    await this.notificationHelper.cancelMusicNotification()
     await this.bgHelper.setPlaybackState(false, 0, 1.0, 0)
   }
 

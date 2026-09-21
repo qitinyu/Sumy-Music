@@ -32,6 +32,8 @@ replay_pid*.log
 
 # 临时脚本和截图
 write_musicapi.ps1
+*.ps1
+*.bat
 img*.png
 
 # 本地参考项目 / 缓存 / 用户数据（不入库）
@@ -39,6 +41,7 @@ img*.png
 /lx/
 /material/
 /音源/
+/ziyuan/
 
 # 开发辅助脚本与内部文档
 /check_plugins.js
@@ -49,3 +52,7 @@ img*.png
 
 # AI 工具生成文件
 .codegenie/
+/.cache/
+
+# JiuwenSwarm runtime file operation logs
+.agent_history/

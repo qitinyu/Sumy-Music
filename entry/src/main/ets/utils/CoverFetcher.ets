@@ -32,6 +32,21 @@ export class CoverFetcher {
     return await CoverFetcher.getInstance().resolveInternal(url)
   }
 
+  /**
+   * 下载任意 http(s) 封面到本地缓存并返回 file:// 路径。
+   * 音源插件返回的封面直链常带防盗链/UA 校验，系统 Image 组件直接加载可能 403；
+   * 统一下载到本地既保证显示成功，离线时也能复用。
+   */
+  static async downloadToCache(url: string): Promise<string> {
+    if (!url || url.length === 0) {
+      return ''
+    }
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return url
+    }
+    return await CoverFetcher.getInstance().download(url)
+  }
+
   /** 将内存中的封面字节写入缓存目录（云端歌曲内嵌封面解析后使用），返回 file:// 路径 */
   static async saveBytes(key: string, bytes: Uint8Array, ext: string): Promise<string> {
     const ctx: common.UIAbilityContext | null = CoverFetcher.getInstance().context
@@ -58,6 +73,11 @@ export class CoverFetcher {
     } catch (_e) {
       return ''
     }
+  }
+
+  clearMemoryCache(): void {
+    this.memCache.clear()
+    this.failedCache.clear()
   }
 
   private async resolveInternal(url: string): Promise<string> {

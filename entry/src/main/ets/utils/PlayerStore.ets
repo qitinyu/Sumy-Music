@@ -2,6 +2,7 @@
 // 使用 AppStorage 实现跨组件状态共享
 import type { SongInfo, LyricLine } from '../model/MusicModel'
 import { MusicApi } from './MusicApi'
+import { LocalTagEnricher } from './LocalTagEnricher'
 
 // 播放器状态 Key 常量
 export class PlayerKeys {
@@ -60,8 +61,14 @@ export class PlayerStore {
       return
     }
     let raw: string = ''
-    // 本地/内嵌歌词优先
-    if (track.lyric && track.lyric.length > 0) {
+    // 本地音乐：内嵌歌词优先，缺失时按歌名+歌手联网补全（迷你栏/桌面歌词同样受益）
+    if (track.source === 'local') {
+      try {
+        raw = await LocalTagEnricher.ensureLyric(track)
+      } catch (_e) {
+        raw = ''
+      }
+    } else if (track.lyric && track.lyric.length > 0) {
       raw = track.lyric
     } else {
       try {

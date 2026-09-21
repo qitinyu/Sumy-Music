@@ -183,12 +183,10 @@ export class TagReader {
     } else if (id === 'USLT' || id === 'ULT') {
       if (tags.lyric.length === 0 && frameData.length > 4) {
         const enc: number = frameData[0]
-        // 编码(1) + 语言(3) + 内容描述符(null 结尾)
-        let textStart: number = 4
-        while (textStart < frameData.length && frameData[textStart] !== 0) {
-          textStart++
-        }
-        textStart++
+        // 编码(1) + 语言(3) + 内容描述符(按编码跳过 null 终止符)。
+        // UTF-16(1/2) 的终止符是 2 字节 00 00，按单字节扫描会在第一个 0x00 处停半对，
+        // 导致歌词从 UTF-16 字符的中间字节开始解码 → 整段乱码。
+        const textStart: number = TagReader.skipId3String(frameData, 4, enc)
         if (textStart < frameData.length) {
           tags.lyric = TagReader.decodeTextBytes(frameData.subarray(textStart), enc)
         }

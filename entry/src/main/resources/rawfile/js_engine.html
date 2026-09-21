@@ -916,9 +916,18 @@ function __v3On(name, cb) {
 function __v3Send(name, payload) {
   if (name !== LX_EVENT_NAMES.inited) return;
   var key = __v3State.currentPlugin;
-  if (!key) return;
-  if (!__v3State.plugins[key]) __v3State.plugins[key] = { handlers: [], sources: null };
-  __v3State.plugins[key].sources = payload ? payload.sources : null;
+  if (key && __v3State.plugins[key]) {
+    __v3State.plugins[key].sources = payload ? payload.sources : null;
+    return;
+  }
+  var keys = Object.keys(__v3State.plugins);
+  for (var i = keys.length - 1; i >= 0; i--) {
+    var p = __v3State.plugins[keys[i]];
+    if (p.handlers.length > 0 && p.sources === null) {
+      p.sources = payload ? payload.sources : null;
+      return;
+    }
+  }
 }
 
 var __lx = {
@@ -926,6 +935,9 @@ var __lx = {
   request: __v3Request,
   on: __v3On,
   send: __v3Send,
+  env: 'mobile',
+  version: '2.0.0',
+  currentScriptInfo: { name: '', description: '', version: '', author: '', homepage: '', rawScript: '' },
   utils: {
     crypto: crypto,
     log: log,
@@ -943,7 +955,9 @@ globalThis.lx = __lx;
 window.__lx = __lx;
 
 function __loadPluginV3(name, src) {
-  var prev = __v3State.currentPlugin;
+  if (__v3State.plugins[name] && __v3State.plugins[name].handlers.length > 0) {
+    return true;
+  }
   __v3State.currentPlugin = name;
   __v3State.plugins[name] = { handlers: [], sources: null };
   try {
@@ -953,11 +967,10 @@ function __loadPluginV3(name, src) {
     log('v3 插件执行异常: ' + String(e && e.message ? e.message : e));
   }
   var st = __v3State.plugins[name];
-  __v3State.currentPlugin = prev;
+  __v3State.currentPlugin = '';
   return st.handlers.length > 0 || st.sources !== null;
 }
 
-/** 确保 v3 插件已加载并返回其上报的音源列表 JSON（未上报返回 '{}'） */
 function __v3Sources(name, src) {
   if (!__v3State.plugins[name] || (__v3State.plugins[name].sources === null && __v3State.plugins[name].handlers.length === 0)) {
     __loadPluginV3(name, src);
@@ -965,6 +978,38 @@ function __v3Sources(name, src) {
   var st = __v3State.plugins[name];
   if (!st || !st.sources) return '{}';
   try { return JSON.stringify(st.sources); } catch (e) { return '{}'; }
+}
+
+function __v3SourcesAsync(name, src) {
+  var id = 't' + (++window.__taskSeq);
+  window.__results[id] = { done: false, ok: false, data: null, error: '' };
+  (function() {
+    if (!__v3State.plugins[name] || (__v3State.plugins[name].sources === null && __v3State.plugins[name].handlers.length === 0)) {
+      __loadPluginV3(name, src);
+    }
+    var waited = 0;
+    var iv = setInterval(function() {
+      var s = __v3State.plugins[name];
+      if (s && s.sources !== null) {
+        clearInterval(iv);
+        try { window.__results[id] = { done: true, ok: true, data: JSON.stringify(s.sources), error: '' }; }
+        catch (e) { window.__results[id] = { done: true, ok: false, data: null, error: String(e) }; }
+      } else if (waited > 15000) {
+        clearInterval(iv);
+        window.__results[id] = { done: true, ok: false, data: null, error: 'v3 sources timeout' };
+      }
+      waited += 200;
+    }, 200);
+  })();
+  return id;
+}
+
+function __v3HasHandlers(name, src) {
+  if (!__v3State.plugins[name] || __v3State.plugins[name].handlers.length === 0) {
+    __loadPluginV3(name, src);
+  }
+  var st = __v3State.plugins[name];
+  return st && st.handlers.length > 0 ? 'true' : 'false';
 }
 
 /** 启动 v3 动作任务（返回任务 id，结果经 __getTaskResult 轮询） */
@@ -1398,7 +1443,11 @@ function __startTask(name, src, func, argsJson) {
 function __getTaskResult(id) {
   var r = window.__results[id];
   if (!r) return JSON.stringify({ done: true, ok: false, data: null, error: '任务不存在' });
-  return __safeJson(r);
+  var json = __safeJson(r);
+  // 任务完成后清理结果槽：原生侧拿到 done 结果即结束轮询、不会再查询，
+  // 不删会让 __results 随任务数单调增长，长会话（如持续播放/搜索）下缓慢吃内存。
+  if (r.done) delete window.__results[id];
+  return json;
 }
 </script>
 </body>

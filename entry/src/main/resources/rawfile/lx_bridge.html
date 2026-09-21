@@ -23,13 +23,14 @@
   var eventNames = Object.values(EVENT_NAMES);
   var events = { request: null };
 
-  var allSources = ['kw', 'kg', 'tx', 'wy', 'mg', 'local'];
+  var allSources = ['kw', 'kg', 'tx', 'wy', 'mg', 'qsvip', 'local'];
   var supportQualitys = {
     kw: ['128k', '320k', 'flac', 'flac24bit'],
     kg: ['128k', '320k', 'flac', 'flac24bit'],
     tx: ['128k', '320k', 'flac', 'flac24bit'],
     wy: ['128k', '320k', 'flac', 'flac24bit'],
     mg: ['128k', '320k', 'flac', 'flac24bit'],
+    qsvip: ['128k', '320k', 'flac', 'flac24bit'],
     local: []
   };
   var supportActions = {
@@ -38,6 +39,7 @@
     tx: ['musicSearch', 'musicUrl', 'lyric', 'pic'],
     wy: ['musicSearch', 'musicUrl', 'lyric', 'pic'],
     mg: ['musicSearch', 'musicUrl', 'lyric', 'pic'],
+    qsvip: ['musicSearch', 'musicUrl', 'lyric'],
     xm: ['musicSearch', 'musicUrl', 'lyric', 'pic'],
     local: ['musicUrl', 'lyric', 'pic']
   };
@@ -76,8 +78,21 @@
       sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: 'Request event is not defined' } });
       return;
     }
+    var result;
     try {
-      events.request.call(context, { source: data.source, action: data.action, info: data.info }).then(function(response) {
+      result = events.request.call(context, { source: data.source, action: data.action, info: data.info });
+    } catch (err) {
+      sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: (err && err.message) || String(err) } });
+      return;
+    }
+    // 插件处理函数未返回 Promise（如按 source 分发时未命中任何分支、或插件不支持该 action）：
+    // 明确回吐"未处理"，而不是让 undefined.then 抛 'Cannot read properties of undefined'。
+    if (!result || typeof result.then !== 'function') {
+      sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: 'Unsupported source/action: ' + data.source + '/' + data.action } });
+      return;
+    }
+    try {
+      result.then(function(response) {
         var sendData = { requestKey: requestKey };
         try {
           switch (data.action) {
@@ -118,10 +133,10 @@
           sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: e.message } });
         }
       }).catch(function(err) {
-        sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: err.message || 'unknown error' } });
+        sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: (err && err.message) || 'unknown error' } });
       });
     } catch(err) {
-      sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: err.message } });
+      sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: (err && err.message) || String(err) } });
     }
   }
 
@@ -135,16 +150,24 @@
     }
     var sourceInfo = { sources: {} };
     try {
-      for (var i = 0; i < allSources.length; i++) {
-        var source = allSources[i];
-        var userSource = info.sources ? info.sources[source] : null;
+      // 遍历插件实际声明的源（含聚合插件的自定义源 id），而非仅内置五源，
+      // 否则自定义源会被丢弃，搜索/取链请求发到插件不认识的源上导致空结果。
+      var declaredKeys = info.sources ? Object.keys(info.sources) : [];
+      for (var i = 0; i < declaredKeys.length; i++) {
+        var source = declaredKeys[i];
+        var userSource = info.sources[source];
         if (!userSource || userSource.type !== 'music') continue;
-        var qualitys = supportQualitys[source];
-        var actions = supportActions[source];
+        var knownActions = supportActions[source];
+        var knownQualitys = supportQualitys[source];
+        var actions = (userSource.actions instanceof Array) ? userSource.actions.slice() : [];
+        var qualitys = (userSource.qualitys instanceof Array) ? userSource.qualitys.slice() : [];
+        if (knownActions) actions = actions.filter(function(a) { return knownActions.indexOf(a) !== -1; });
+        if (knownQualitys) qualitys = qualitys.filter(function(q) { return knownQualitys.indexOf(q) !== -1; });
+        if (actions.length === 0) continue;
         sourceInfo.sources[source] = {
           type: 'music',
-          actions: actions.filter(function(a) { return userSource.actions.indexOf(a) !== -1; }),
-          qualitys: qualitys.filter(function(q) { return userSource.qualitys.indexOf(q) !== -1; })
+          actions: actions,
+          qualitys: qualitys
         };
       }
     } catch(error) {
@@ -454,7 +477,9 @@
     delete nativeFetchRequests[requestId];
 
     if (errorStr) {
-      entry.callback(new Error(errorStr), null, null);
+      var err = new Error(errorStr);
+      if (entry.callback) entry.callback(err, null, null);
+      else if (entry.reject) entry.reject(err);
       return;
     }
 
@@ -464,35 +489,101 @@
     var bodyParsed = bodyText;
     try { bodyParsed = JSON.parse(bodyText); } catch(_e) {}
 
-    entry.callback(null, {
+    var resp = {
       statusCode: statusCode,
       statusMessage: 'OK',
       headers: respHeaders,
       body: bodyParsed,
       raw: bodyText || ''
-    }, bodyParsed);
+    };
+    if (entry.callback) entry.callback(null, resp, bodyParsed);
+    else if (entry.resolve) entry.resolve(resp);
   };
 
     window.lx = {
       EVENT_NAMES: EVENT_NAMES,
       request: function(url, options, callback) {
+        // 兼容 lx.request(url) / lx.request(url, cb) 两种简写
+        if (typeof options === 'function') { callback = options; options = {}; }
+        options = options || {};
         var method = (options.method || 'GET').toUpperCase();
         var timeout = (typeof options.timeout === 'number' && options.timeout > 0) ? Math.min(options.timeout, 60000) : 60000;
-        var headers = options.headers || {};
+        var headers = {};
+        var hkeys = Object.keys(options.headers || {});
+        for (var hi = 0; hi < hkeys.length; hi++) headers[hkeys[hi]] = options.headers[hkeys[hi]];
+
+        // 查询串 qs：拼到 URL 上（缺失会使搜索接口丢参数而 404）
+        var qs = options.qs;
+        if (qs && typeof qs === 'object') {
+          var qsParts = [];
+          var qkeys = Object.keys(qs);
+          for (var qi = 0; qi < qkeys.length; qi++) {
+            qsParts.push(encodeURIComponent(qkeys[qi]) + '=' + encodeURIComponent(String(qs[qkeys[qi]])));
+          }
+          if (qsParts.length > 0) url += (url.indexOf('?') >= 0 ? '&' : '?') + qsParts.join('&');
+        }
+
         var body = null;
+        var binary = false;
         if (options.body) {
-          if (typeof options.body === 'object') {
+          if (options.body instanceof Uint8Array || options.body instanceof ArrayBuffer) {
+            // 二进制体走 base64 透传，避免 JSON 序列化破坏字节
+            body = uint8ArrayToBase64(new Uint8Array(options.body));
+            binary = true;
+          } else if (typeof options.body === 'object') {
             body = JSON.stringify(options.body);
             if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json';
-          } else body = options.body;
-        } else if (options.form) body = options.form;
-        else if (options.formData) {
+          } else {
+            body = String(options.body);
+          }
+        } else if (options.form) {
+          // form 对象按 urlencoded 展开（直接当对象传会导致请求体丢失）
+          if (typeof options.form === 'object') {
+            var fParts = [];
+            var fkeys = Object.keys(options.form);
+            for (var fi = 0; fi < fkeys.length; fi++) {
+              fParts.push(encodeURIComponent(fkeys[fi]) + '=' + encodeURIComponent(String(options.form[fkeys[fi]])));
+            }
+            body = fParts.join('&');
+          } else {
+            body = String(options.form);
+          }
+          if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+        } else if (options.formData) {
           body = JSON.stringify(options.formData);
           if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json';
         }
-        var requestId = ++nativeFetchIdCounter;
-        nativeFetchRequests[requestId] = { callback: callback, timeoutId: null };
 
+        var usePromise = (typeof callback !== 'function');
+        var requestId = ++nativeFetchIdCounter;
+        var entry = { callback: usePromise ? null : callback, resolve: null, reject: null, timeoutId: null };
+
+        if (usePromise) {
+          // 无 callback：返回 Promise（现代插件常用 const { body } = await lx.request(url, options)）
+          return new Promise(function(resolve, reject) {
+            entry.resolve = resolve;
+            entry.reject = reject;
+            entry.timeoutId = setTimeout(function() {
+              delete nativeFetchRequests[requestId];
+              reject(new Error('Request timeout'));
+            }, timeout);
+            nativeFetchRequests[requestId] = entry;
+            sendToNative({
+              event: 'nativeFetch',
+              data: {
+                requestId: requestId,
+                url: url,
+                method: method,
+                headers: headers,
+                body: body,
+                binary: binary,
+                timeout: timeout
+              }
+            });
+          });
+        }
+
+        nativeFetchRequests[requestId] = entry;
         sendToNative({
           event: 'nativeFetch',
           data: {
@@ -501,23 +592,24 @@
             method: method,
             headers: headers,
             body: body,
+            binary: binary,
             timeout: timeout
           }
         });
 
         var timeoutId = setTimeout(function() {
-          var entry = nativeFetchRequests[requestId];
-          if (entry) {
+          var e = nativeFetchRequests[requestId];
+          if (e) {
             delete nativeFetchRequests[requestId];
-            entry.callback(new Error('Request timeout'), null, null);
+            e.callback(new Error('Request timeout'), null, null);
           }
         }, timeout);
         nativeFetchRequests[requestId].timeoutId = timeoutId;
 
         return function abort() {
-          var entry = nativeFetchRequests[requestId];
-          if (entry) {
-            clearTimeout(entry.timeoutId);
+          var e = nativeFetchRequests[requestId];
+          if (e) {
+            clearTimeout(e.timeoutId);
             delete nativeFetchRequests[requestId];
           }
         };
@@ -596,13 +688,59 @@
       env: 'mobile'
     };
 
+    // 插件脚本内的 console 输出与未捕获异常透出到原生诊断日志，
+    // 否则插件失败时自检日志一片空白，无法定位（如请求 404、参数解析失败）。
+    function sendLog(level, msg) {
+      try {
+        if (typeof msg !== 'string') msg = String(msg);
+        if (msg.length > 500) msg = msg.substring(0, 500) + '...';
+        sendToNative({ event: 'log', data: { level: level, message: msg } });
+      } catch (_e) {
+      }
+    }
+    var origConsoleError = console.error;
+    var origConsoleWarn = console.warn;
+    console.error = function() {
+      sendLog('error', Array.prototype.join.call(arguments, ' '));
+      if (origConsoleError) origConsoleError.apply(console, arguments);
+    };
+    console.warn = function() {
+      sendLog('warn', Array.prototype.join.call(arguments, ' '));
+      if (origConsoleWarn) origConsoleWarn.apply(console, arguments);
+    };
+
+    // 提取错误消息 + 定位信息：插件脚本经 eval 执行，error.stack 的 <anonymous> 行号、
+    // 或 ErrorEvent 的 filename/lineno 指向脚本内具体行。否则「Cannot read properties of
+    // undefined (reading 'then')」这类报错无法定位到哪个插件的哪一行，排障只能靠猜。
+    function describeError(event) {
+      var msg = event.message ? String(event.message) : String(event);
+      msg = msg.replace(/^Uncaught\sError:\s/, '');
+      var err = event.error;
+      if (err && err.stack) {
+        return msg + ' @ ' + String(err.stack).split(/\r?\n/).slice(0, 3).join(' <- ');
+      }
+      var where = [];
+      if (event.filename) where.push(String(event.filename));
+      if (event.lineno) where.push('line ' + event.lineno);
+      if (event.colno) where.push('col ' + event.colno);
+      return where.length > 0 ? msg + ' @ ' + where.join(' ') : msg;
+    }
+
     window.addEventListener('error', function(event) {
-      if (event.isTrusted) onError(event.message.replace(/^Uncaught\sError:\s/, ''));
+      var msg = describeError(event);
+      if (isInitedApi) { sendLog('error', 'uncaught: ' + msg); return; }
+      if (event.isTrusted) onError(msg);
     });
     window.addEventListener('unhandledrejection', function(event) {
       if (!event.isTrusted) return;
-      var message = typeof event.reason === 'string' ? event.reason : (event.reason && event.reason.message) ? event.reason.message : String(event.reason);
-      onError(message.replace(/^Error:\s/, ''));
+      var reason = event.reason;
+      var message = typeof reason === 'string' ? reason : (reason && reason.message) ? reason.message : String(reason);
+      message = message.replace(/^Error:\s/, '');
+      if (reason && reason.stack) {
+        message = message + ' @ ' + String(reason.stack).split(/\r?\n/).slice(0, 3).join(' <- ');
+      }
+      if (isInitedApi) { sendLog('error', 'unhandledrejection: ' + message); return; }
+      onError(message);
     });
 
     try {
@@ -619,6 +757,11 @@
     } catch(e) {
       sendToNative({ event: 'response', data: { requestKey: reqKey, status: false, message: e.message } });
     }
+  };
+
+  // UTF-8 安全的 base64 解码，供原生侧 runJavaScript 注入调用（atob 返回 Latin-1 会破坏中文）。
+  window._lx_decodeB64 = function(b64) {
+    return uint8ArrayToString(base64ToUint8Array(b64));
   };
 
 })();

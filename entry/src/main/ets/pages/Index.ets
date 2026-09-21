@@ -14,16 +14,21 @@ import {
 
 import { XuanchuangTab } from './XuanchuangTab'
 import { QinseTab } from './QinseTab'
+import { TuijianTab } from './TuijianTab'
+import { YinjiTab } from './YinjiTab'
 import { LoushiTab } from './LoushiTab'
 import { JsEngineHost } from '../components/JsEngineHost'
+import { MFEngineHost } from '../components/MFEngineHost'
 import { LXSourceHost } from '../source/LXSourceHost'
 import { MiniBarPlayer } from '../components/MiniBarPlayer'
 import { MaterialCompat } from '../utils/MaterialCompat'
+import { promptAction } from '@kit.ArkUI'
 
 @Entry
 @Component
 struct Index {
-  @State activeTab: number = 0
+  @State activeTab: number = 3
+  @StorageProp('showSettingsSidebar') @Watch('onSettingsSidebarChange') showSettingsSidebar: boolean = false
   @StorageProp('showFullPlayer') @Watch('onShowFullPlayerChange') showFullPlayer: boolean = false
   @StorageProp('fullPlayerPage') fullPlayerPage: string = 'cover'
   @StorageProp('autoJumpDetail') autoJumpDetail: boolean = false
@@ -32,6 +37,10 @@ struct Index {
   @StorageProp('theme_textPrimary') themeTextPrimary: string = '#1A1A1A'
   @StorageProp('theme_textSecondary') themeTextSecondary: string = '#999999'
   @StorageProp('theme_bgImageName') @Watch('onThemeBgChange') themeBgImageName: string = ''
+  // 播放失败全局提示（由 AudioPlayer 统一写入：消息|时间戳）
+  @StorageProp('playerErrorNotice') @Watch('onPlayerErrorNotice') playerErrorNotice: string = ''
+  // 推荐页搜索栏点击信号（时间戳）：跳转到搜索 Tab
+  @StorageProp('jumpToSearchTab') @Watch('onJumpToSearchTab') jumpToSearchTab: number = 0
   @State showPlayerOverlay: boolean = false
 
   private db: DatabaseHelper = DatabaseHelper.getInstance()
@@ -49,6 +58,12 @@ struct Index {
     AppStorage.setOrCreate('playMode', 0)
     // 迷你栏默认展开（1 = EXPAND）
     AppStorage.setOrCreate('miniBarStyle', 1)
+    // 封面/歌词自动补全默认关闭（设置-播放器内开启；LocalTagEnricher 读取此开关）
+    AppStorage.setOrCreate('autoEnrichTags', false)
+    // 迷你栏歌曲来源徽章默认开启（设置-播放器-Minibar 设置内开关）
+    AppStorage.setOrCreate('miniBarShowSource', true)
+    // 设置页以全屏侧边栏形式展开，默认关闭
+    AppStorage.setOrCreate('showSettingsSidebar', false)
     // 初始化各 Tab 的子页面状态，用于侧滑返回统一处理
     AppStorage.setOrCreate('xuanchuang_subPage', 'main')
     AppStorage.setOrCreate('loushi_subPage', 'main')
@@ -63,14 +78,35 @@ struct Index {
     }, 100)
   }
 
-  // 侧滑 / 返回键统一处理：优先关闭全屏播放器，其次返回当前 Tab 子页，最后退出应用
+  // 播放失败提示：AudioPlayer 写入 "消息|时间戳"，时间戳保证每次都触发 @Watch
+  private onPlayerErrorNotice(): void {
+    const sep: number = this.playerErrorNotice.indexOf('|')
+    const msg: string = sep > 0 ? this.playerErrorNotice.substring(0, sep) : this.playerErrorNotice
+    if (msg.length > 0) {
+      promptAction.showToast({ message: msg, duration: 2000, bottom: '120vp' })
+    }
+  }
+
+  // 侧滑 / 返回键统一处理：优先关闭全屏播放器，其次关闭设置侧边栏，再返回当前 Tab 子页，最后退出应用
   onBackPress(): boolean {
     if (this.showPlayerOverlay) {
       this.closePlayerOverlay()
       return true
     }
 
+    if (this.showSettingsSidebar) {
+      this.closeSettingsSidebar()
+      return true
+    }
+
+    // 搜索页 index=0：返回键回到推荐页，避免直接退出应用
     if (this.activeTab === 0) {
+      this.controller.changeIndex(1)
+      return true
+    }
+
+    // 我的页 index=3
+    if (this.activeTab === 3) {
       const xuanchuangSubPage: string = AppStorage.get<string>('xuanchuang_subPage') ?? 'main'
       if (xuanchuangSubPage !== 'main') {
         AppStorage.setOrCreate('xuanchuang_subPage', 'main')
@@ -78,15 +114,22 @@ struct Index {
       }
     }
 
-    if (this.activeTab === 2) {
-      const loushiSubPage: string = AppStorage.get<string>('loushi_subPage') ?? 'main'
-      if (loushiSubPage !== 'main') {
-        AppStorage.setOrCreate('loushi_subPage', 'main')
-        return true
-      }
-    }
-
     return false
+  }
+
+  private onJumpToSearchTab(): void {
+    // 推荐页搜索栏被点击，切换到搜索 Tab
+    this.controller.changeIndex(0)
+  }
+
+  private onSettingsSidebarChange(): void {
+    // 侧边栏状态变化时无需额外处理；展开/关闭由 AppStorage 标志驱动
+  }
+
+  private closeSettingsSidebar(): void {
+    AppStorage.setOrCreate('showSettingsSidebar', false)
+    // 关闭侧边栏时复位设置子页为首页，下次展开回到设置主界面
+    AppStorage.setOrCreate('loushi_subPage', 'main')
   }
 
   private async checkAnnouncementDate(): Promise<void> {
@@ -113,6 +156,10 @@ struct Index {
 
   private onTabChange(index: number): void {
     this.activeTab = index
+    if (index === 0) {
+      // 搜索 Tab 可见：通知 QinseTab 恢复上次搜索状态
+      AppStorage.setOrCreate('qinseTabVisible', Date.now())
+    }
   }
 
   private async handleStartupDismiss(dontShowToday: boolean): Promise<void> {
@@ -170,21 +217,32 @@ struct Index {
 
       // 顶部留出 44px 状态栏高度，HdsTabs 内容从此处开始
       Column() {
-        HdsTabs({ controller: this.controller }) {
+        // index=3：启动默认展示「我的」页；index=0：搜索页（常驻）
+        HdsTabs({ controller: this.controller, index: this.activeTab }) {
+          TabContent() {
+            QinseTab({
+              onBack: () => {
+                // 搜索页返回：回到推荐页
+                this.controller.changeIndex(1)
+              }
+            })
+          }
+          .tabBar(this.buildTabBarBuilder(0, '搜索', $r('sys.symbol.magnifyingglass'), 'serch.svg'))
+
+          TabContent() {
+            TuijianTab()
+          }
+          .tabBar(this.buildTabBarBuilder(1, '推荐', $r('sys.symbol.star'), 'tj.svg'))
+
+          TabContent() {
+            YinjiTab()
+          }
+          .tabBar(this.buildTabBarBuilder(2, '音迹', $r('sys.symbol.waveform'), 'xj.svg'))
+
           TabContent() {
             XuanchuangTab()
           }
-          .tabBar(this.buildTabBarBuilder(0, '主页', $r('sys.symbol.heart_fill')))
-
-          TabContent() {
-            QinseTab()
-          }
-          .tabBar(this.buildTabBarBuilder(1, '搜索', $r('sys.symbol.magnifyingglass')))
-
-          TabContent() {
-            LoushiTab()
-          }
-          .tabBar(this.buildTabBarBuilder(2, '设置', $r('sys.symbol.gearshape')))
+          .tabBar(this.buildTabBarBuilder(3, '我的', $r('sys.symbol.person_fill'), 'my.svg'))
         }
         .vertical(false)
         .barPosition(BarPosition.End)
@@ -211,6 +269,9 @@ struct Index {
       // V1 引擎宿主（js_engine.html，兼容 module.exports 格式插件）
       JsEngineHost()
 
+      // MusicFree 插件沙箱宿主（mf_host.html，CommonJS + axios/crypto-js/cheerio 等库环境）
+      MFEngineHost()
+
       // V3 引擎宿主（lx_bridge.html，兼容 globalThis.lx 事件驱动插件）
       LXSourceHost()
 
@@ -224,6 +285,30 @@ struct Index {
         .width('100%')
         .height('100%')
         .transition(TransitionEffect.translate({ y: '100%' }).animation({ duration: 400, curve: Curve.EaseOut }))
+      }
+
+      // 设置页：全屏侧边栏（从右侧滑入，点击遮蔽背景关闭）
+      if (this.showSettingsSidebar) {
+        Stack({ alignContent: Alignment.Start }) {
+          // 遮蔽背景：点击关闭侧边栏
+          Column()
+            .width('100%')
+            .height('100%')
+            .backgroundColor('#66000000')
+            .onClick(() => {
+              this.closeSettingsSidebar()
+            })
+
+          // 右侧面板：容纳设置页（顶边距交由 LoushiTab 根处理，使背景延伸到状态栏）
+          Column() {
+            LoushiTab()
+          }
+          .width('100%')
+          .height('100%')
+        }
+        .width('100%')
+        .height('100%')
+        .transition(TransitionEffect.translate({ x: '100%' }).animation({ duration: 320, curve: Curve.EaseOut }))
       }
     }
     .width('100%')
@@ -272,11 +357,17 @@ struct Index {
   }
 
   @Builder
-  buildTabBarBuilder(index: number, label: string, icon: Resource) {
+  buildTabBarBuilder(index: number, label: string, icon: Resource, iconRaw?: string) {
     Column({ space: 2 }) {
-      SymbolGlyph(icon)
-        .fontSize(22)
-        .fontColor(['#000000'])
+      if (iconRaw !== undefined && iconRaw.length > 0) {
+        Image($rawfile(iconRaw))
+          .width(22)
+          .height(22)
+      } else {
+        SymbolGlyph(icon)
+          .fontSize(22)
+          .fontColor(['#000000'])
+      }
       Text(label)
         .fontSize(10)
         .fontWeight(FontWeight.Bold)

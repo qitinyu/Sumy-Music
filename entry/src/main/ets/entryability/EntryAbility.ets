@@ -4,7 +4,6 @@ import { backgroundTaskManager } from '@kit.BackgroundTasksKit'
 import wantAgent, { WantAgent } from '@ohos.app.ability.wantAgent'
 import { DatabaseHelper } from '../database/DatabaseHelper'
 import { AudioPlayer } from '../utils/AudioPlayer'
-import { NotificationHelper } from '../utils/NotificationHelper'
 import { BackgroundHelper } from '../utils/BackgroundHelper'
 import { ThemeManager } from '../utils/ThemeManager'
 import { PlayerStore } from '../utils/PlayerStore'
@@ -13,10 +12,10 @@ import { SongInfo } from '../model/MusicModel'
 import { SelfHostedApi } from '../utils/SelfHostedApi'
 import { StatusBarManager } from '../utils/StatusBarManager'
 import { CoverFetcher } from '../utils/CoverFetcher'
+import { CacheManager } from '../utils/CacheManager'
 
 export default class EntryAbility extends UIAbility {
   private db: DatabaseHelper = DatabaseHelper.getInstance()
-  private notificationHelper: NotificationHelper = NotificationHelper.getInstance()
   private backgroundHelper: BackgroundHelper = BackgroundHelper.getInstance()
   private wantAgentObj: WantAgent | null = null
   private launchTime: number = Date.now()
@@ -39,12 +38,6 @@ export default class EntryAbility extends UIAbility {
       console.error('[EntryAbility] Theme init failed:', e)
     }
     try {
-      await this.notificationHelper.init(this.context)
-      console.info('[EntryAbility] NotificationHelper initialized')
-    } catch (e) {
-      console.error('[EntryAbility] NotificationHelper init failed:', e)
-    }
-    try {
       console.info('[EntryAbility] initializing BackgroundHelper')
       await this.backgroundHelper.init(this.context)
       console.info('[EntryAbility] BackgroundHelper initialized')
@@ -56,6 +49,12 @@ export default class EntryAbility extends UIAbility {
       console.info('[EntryAbility] CoverFetcher initialized')
     } catch (e) {
       console.error('[EntryAbility] CoverFetcher init failed:', e)
+    }
+    try {
+      CacheManager.init(this.context as common.UIAbilityContext)
+      console.info('[EntryAbility] CacheManager initialized')
+    } catch (e) {
+      console.error('[EntryAbility] CacheManager init failed:', e)
     }
     await this.requestBackgroundRunningPermission()
     // 初始化自建API模式（确保应用启动后立即可用，无需先进入设置页）
@@ -183,19 +182,7 @@ export default class EntryAbility extends UIAbility {
       const player = AudioPlayer.getInstance()
       player.setCurrentSong(track)
 
-      // 设置播放器回调（与 Tab 内 playSong 一致，确保进度条/播放结束正常工作）
-      player.onTimeUpdate = (time: number) => {
-        PlayerStore.updateTime(time)
-      }
-      player.onDurationUpdate = (duration: number) => {
-        PlayerStore.updateDuration(duration)
-      }
-      player.onPlayEnd = () => {
-        PlayerStore.pause()
-      }
-      player.onError = (_error: string) => {
-        PlayerStore.pause()
-      }
+      // 进度/时长/播完/出错回调由 AudioPlayer 中央化处理
 
       // 获取播放链接：优先用保存的，失效则重新获取
       let url = track.playUrl

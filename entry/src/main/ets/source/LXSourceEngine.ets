@@ -13,8 +13,10 @@ import { CompatUtils } from '../utils/CompatUtils';
 
 export let lxEngineSendRequest: ((key: string, data: LXSourceRequestData) => void) | null = null;
 export let lxEngineRegisterPromise: ((key: string,
-  resolve: (result: object) => void, reject: (reason: Error) => void) => void) | null = null;
+  resolve: (result: object) => void, reject: (reason: Error) => void, timeoutMs?: number) => void) | null = null;
 export let lxEngineIsReady: boolean = false;
+
+const UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 interface LXProxyInfo {
   host: string;
@@ -63,8 +65,13 @@ export struct LXSourceEngine {
   onActiveSourceChanged(): void {
     LXSourceEngine.appendLog('引擎 active 变化 → ' + this.lxActiveSource);
     if (this.lxActiveSource.length > 0) {
-      // 切换插件：桥的 inited 事件单次注册，必须强制刷新 WebView 重置插件环境，
-      // 否则旧插件（如全豆要）残留，新插件请求被旧插件拦截（"无效的平台参数"）
+      const v3Raw: string = AppStorage.get<string>('v3PluginNames') || '[]';
+      let isV3: boolean = false;
+      try { isV3 = (JSON.parse(v3Raw) as string[]).indexOf(this.lxActiveSource) >= 0; } catch (_e) {}
+      if (isV3) {
+        LXSourceEngine.appendLog('引擎 跳过 V3 插件（由 JsPluginEngine 处理）: ' + this.lxActiveSource);
+        return;
+      }
       this.webviewReady = false;
       this.isReady = false;
       this.reloaded = false;
@@ -98,8 +105,8 @@ export struct LXSourceEngine {
       this.sendRequest(key, data);
     };
     lxEngineRegisterPromise = (key: string,
-      resolve: (result: object) => void, reject: (reason: Error) => void): void => {
-      this.registerRequestPromise(key, resolve, reject);
+      resolve: (result: object) => void, reject: (reason: Error) => void, timeoutMs?: number): void => {
+      this.registerRequestPromise(key, resolve, reject, timeoutMs);
     };
     this.bridgeProxy.onMessageCallback = (message: string): void => {
       this.handleJsMessage(message);
@@ -147,7 +154,7 @@ export struct LXSourceEngine {
   sendRequest(requestKey: string, data: LXSourceRequestData): void {
     let reqJson: string = JSON.stringify(data) || '';
     let b64: string = this.toBase64(reqJson);
-    this.runJs(`window._lx_handleRequest('${requestKey}', atob('${b64}'))`);
+    this.runJs(`window._lx_handleRequest('${requestKey}', window._lx_decodeB64('${b64}'))`);
   }
 
   private toBase64(str: string): string {
@@ -157,7 +164,8 @@ export struct LXSourceEngine {
     return base64Helper.encodeToStringSync(data);
   }
 
-  registerRequestPromise(requestKey: string, resolve: (result: object) => void, reject: (reason: Error) => void): void {
+  registerRequestPromise(requestKey: string, resolve: (result: object) => void, reject: (reason: Error) => void,
+    timeoutMs: number = 12000): void {
     let existing: PendingRequest | undefined = this.pendingRequests.get(requestKey);
     if (existing !== undefined) {
       clearTimeout(existing.timeoutId);
@@ -165,7 +173,7 @@ export struct LXSourceEngine {
     let timeoutId: number = setTimeout((): void => {
       this.pendingRequests.delete(requestKey);
       reject(new Error('Request timeout'));
-    }, 12000);
+    }, timeoutMs);
     this.pendingRequests.set(requestKey, {
       resolve: resolve,
       reject: reject,
@@ -221,15 +229,22 @@ export struct LXSourceEngine {
       log = log.substring(log.length - 20000);
     }
     AppStorage.setOrCreate('lxPlayLog', log);
+    console.info('[LXEngine] ' + msg);
   }
 
   private injectScript(initDataJson: string): void {
     LXSourceEngine.appendLog('引擎 注入脚本（webviewReady=' + this.webviewReady + '）');
     let b64: string = this.toBase64(initDataJson);
-    this.runJs(`window._lx_init(JSON.parse(atob('${b64}')))`);
+    this.runJs(`window._lx_init(JSON.parse(window._lx_decodeB64('${b64}')))`);
+    const retryInfo: LXUserApiInfoFull | null = this.currentApiInfo;
     const retryJson: string = initDataJson;
     const engineRef: LXSourceEngine = this;
     setTimeout((): void => {
+      // 期间已切到别的插件（currentApiInfo 变了）：本轮重试作废，
+      // 否则旧定时器会把上一个插件重新注入，覆盖新插件环境。
+      if (engineRef.currentApiInfo !== retryInfo) {
+        return;
+      }
       if (engineRef.isReady) {
         return;
       }
@@ -256,16 +271,24 @@ export struct LXSourceEngine {
     let method: string = (data.method as string) || 'GET';
     let headers: Record<string, string> = data.headers as Record<string, string>;
     let body: string = data.body as string;
+    let isBinary: boolean = (data.binary as boolean) || false;
     let timeout: number = (data.timeout as number) || 15000;
     console.info('[TRACE:nativeFetch] req start id=' + requestId + ' url=' + url.substring(0, 100));
 
     let httpRequest = http.createHttp();
     let reqHeaders: Record<string, string> = {};
+    let hasUa: boolean = false;
     if (headers !== undefined && headers !== null) {
       let keys: string[] = Object.keys(headers);
       for (let i: number = 0; i < keys.length; i++) {
-        reqHeaders[keys[i]] = headers[keys[i]] as string;
+        const k: string = keys[i];
+        reqHeaders[k] = headers[k] as string;
+        if (k.toLowerCase() === 'user-agent') hasUa = true;
       }
+    }
+    // 插件未指定 UA 时补浏览器 UA：部分 CDN 对空 UA 直接返回 403/404
+    if (!hasUa) {
+      reqHeaders['User-Agent'] = UA;
     }
 
     let reqMethod: http.RequestMethod = http.RequestMethod.GET;
@@ -282,9 +305,21 @@ export struct LXSourceEngine {
       reqMethod = http.RequestMethod.HEAD;
     }
 
+    // GET/HEAD 不带请求体，避免 http 模块把 extraData 当成 body 改变请求语义
     let extraData: string | ArrayBuffer | Object = '';
-    if (body !== undefined && body !== null && body.length > 0) {
-      extraData = body;
+    const hasBodyMethod: boolean = m === 'POST' || m === 'PUT' || m === 'DELETE';
+    if (hasBodyMethod && body !== undefined && body !== null && body.length > 0) {
+      if (isBinary) {
+        // base64 二进制体还原为字节
+        try {
+          const helper: util.Base64Helper = new util.Base64Helper();
+          extraData = helper.decodeSync(body).buffer as ArrayBuffer;
+        } catch (_e) {
+          extraData = body;
+        }
+      } else {
+        extraData = body;
+      }
     }
 
     httpRequest.request(url, {
@@ -305,6 +340,11 @@ export struct LXSourceEngine {
         respBody = CompatUtils.decodeResponse(bytes, contentType);
       }
       console.info('[TRACE:nativeFetch] req ok id=' + requestId + ' code=' + resp.responseCode + ' bodyLen=' + respBody.length);
+      // 非 2xx 响应记入引擎日志：插件层通常只会回吐"HTTP 404"之类的笼统错误，
+      // 这里带上 URL，导出自检日志即可定位是哪个接口挂了。
+      if (resp.responseCode < 200 || resp.responseCode >= 400) {
+        LXSourceEngine.appendLog('请求失败 code=' + resp.responseCode + ' url=' + url.substring(0, 120));
+      }
       let headersJson: string = JSON.stringify(resp.header) || '{}';
       let escHeaders: string = this.escapeJsString(headersJson);
       let escBody: string = this.escapeJsString(respBody);
@@ -313,6 +353,7 @@ export struct LXSourceEngine {
     }).catch((err: Object): void => {
       let errMsg: string = JSON.stringify(err);
       console.error('[TRACE:nativeFetch] req fail id=' + requestId + ' err=' + errMsg);
+      LXSourceEngine.appendLog('网络请求失败 url=' + url.substring(0, 120) + ' err=' + errMsg.substring(0, 80));
       let escErr: string = this.escapeJsString(errMsg);
       this.runJs(`window._lx_handleFetchResponse(${requestId}, '${escErr}', 0, '{}', '')`);
     });
@@ -378,13 +419,19 @@ export struct LXSourceEngine {
         }
         case 'log': {
           let dataObj: Record<string, Object> = data as Record<string, Object>;
+          let level: string = (dataObj.level as string) || '';
           let msg: string = (dataObj.message as string) || '';
           let prev: string = AppStorage.get<string>('lxPlayLog') || '';
           let now: Date = new Date();
           let time: string = now.getHours().toString().padStart(2, '0') + ':' +
             now.getMinutes().toString().padStart(2, '0') + ':' +
             now.getSeconds().toString().padStart(2, '0');
-          AppStorage.setOrCreate('lxPlayLog', prev + '[' + time + '] ' + msg + '\n');
+          let prefix: string = level.length > 0 ? '[' + level + '] ' : '';
+          let log: string = prev + '[' + time + '] 插件 ' + prefix + msg + '\n';
+          if (log.length > 20000) {
+            log = log.substring(log.length - 20000);
+          }
+          AppStorage.setOrCreate('lxPlayLog', log);
           break;
         }
       }

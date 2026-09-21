@@ -7,6 +7,7 @@
   "license": "",
   "dependencies": {
     "@ohos/axios": "^2.2.6",
-    "@ohos/crypto-js": "^2.0.5"
+    "@ohos/crypto-js": "^2.0.5",
+    "@devzeng/quickjs": "file:../quickjs"
   }
 }

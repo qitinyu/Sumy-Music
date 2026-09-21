@@ -1,4 +1,4 @@
-// SHMY 陋室 Tab - 设置
+// Sumy - 设置
 // LoushiTab.ets - V1.0.3 分区卡片式布局
 import { DEFAULT_SETTINGS } from '../model/MusicModel'
 import { DatabaseHelper } from '../database/DatabaseHelper'
@@ -13,6 +13,10 @@ import { MusicApi } from '../utils/MusicApi'
 import { SelfHostedApi } from '../utils/SelfHostedApi'
 import { AccountManager } from '../utils/AccountManager'
 import { SourceManager } from '../utils/SourceManager'
+import { CacheManager, CacheInfo } from '../utils/CacheManager'
+import { ListeningLevelManager, LevelInfo } from '../utils/ListeningLevelManager'
+import { getLevelColor } from '../utils/LevelConfig'
+import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
 
 // 自建 API 访问密码（仅开发者本人可启用）
 const SELF_HOSTED_API_PASSWORD: string = '0723'
@@ -65,18 +69,18 @@ const aboutItems: AboutItem[] = [
     type: 'text',
     content: '本软件采用 MIT 开源协议：\n\n' +
       '1. MIT License\n' +
-      '2. Copyright (c) 2025 Sumy Music\n' +
+      '2. Copyright (c) 2026 Sumy Music\n' +
       '3. Permission is hereby granted, free of charge, to any person obtaining a copy ' +
       'of this software and associated documentation files...',
   },
   {
     label: '版本日志',
     type: 'text',
-    content: 'v2.0.5.7\n' +
-      '1. 补充未适配组件的深色模式\n' +
-      '2. 自建API与导入源隔离\n' +
-      '3. 修复控制中心对歌曲的控制\n' +
-      '4. 修复音源相关问题\n' +
+    content: 'v2.0.7.7\n' +
+      '1. 重点：修复切歌后封面已切换但歌曲没变、无反馈、进度继承的问题\n' +
+      '2. 修复单击歌曲长时间无法播放：取链提速，失败提示并自动切下一首\n' +
+      '3. 修复播放页进度条无法拖动、本地音乐歌词乱码\n' +
+      '4. 播放结束自动接续下一首，控制中心切歌与封面显示修复\n' +
       '5. 完整更新日志(----------https://github.com/qitinyu/Sumy-Music/wiki/)',
   },
 
@@ -99,6 +103,12 @@ const aboutItems: AboutItem[] = [
       { label: 'GitCode Release', url: 'https://gitcode.com/YQAMM/Sumy-Music/releases/' },
     ],
   },
+
+  {
+    label: '帮助鸣谢',
+    type: 'link',
+    url: 'https://github.com/qitinyu/Sumy-Music/blob/main/%E5%B8%AE%E5%8A%A9%E9%B8%A3%E8%B0%A2.md',
+  },
 ]
 
 type SubPage = 'main'
@@ -110,6 +120,7 @@ type SubPage = 'main'
   | 'about'
   | 'xuanchuang_settings'
   | 'qinse_settings'
+  | 'cache_settings'
 
 interface SettingItem {
   icon: Resource
@@ -126,10 +137,13 @@ export struct LoushiTab {
   @State autoPlay: boolean = DEFAULT_SETTINGS.autoPlay
   @State autoJumpDetail: boolean = DEFAULT_SETTINGS.autoJumpDetail
   @State rememberProgress: boolean = DEFAULT_SETTINGS.rememberProgress
+  // 封面/歌词自动补全，默认关闭（开启后缺失封面/歌词时联网补全）
+  @State autoEnrichTags: boolean = false
+  // 迷你栏歌曲来源徽章，默认开启
+  @State miniBarShowSource: boolean = true
   @State searchMemory: boolean = true // 默认开启
   @State searchPersist: boolean = false // 搜索常驻，默认关闭
-  @State searchFloatingBall: boolean = true // 搜索页悬浮球，默认开启
-  @State searchFloatingBallLeft: boolean = false // 悬浮球靠左，默认关闭（默认右侧）
+  @State searchSuggest: boolean = true // 搜索联想词，默认开启
   @State showHomeStats: boolean = true // 默认开启
   @StorageProp('theme_primary') themePrimary: string = '#007DFF'
   @StorageProp('theme_bg') themeBg: string = '#F8F8FA'
@@ -166,11 +180,119 @@ export struct LoushiTab {
 
   // APP 图标
   @State appIcon: string = 'default'
+  @State cacheInfo: CacheInfo = { bytes: 0, files: 0 }
+  @State clearingCache: boolean = false
+
+  // 账号设置（复用我的页个人信息区）
+  @State accountUserName: string = '点击登录'
+  @State accountAvatarUrl: string = ''
+  @State accountIsLoggedIn: boolean = false
+  @State accountLoggingIn: boolean = false
+  @State accountLevelInfo: LevelInfo = { level: 1, current: 0, need: 1160, totalSeconds: 0, percent: 0 }
+  @State accountSignature: string = ''
+  @State accountShowMenu: boolean = false
 
   private db: DatabaseHelper = DatabaseHelper.getInstance()
 
   async aboutToAppear() {
     await this.loadSettings()
+    await this.refreshCacheInfo()
+    await this.loadAccountInfo()
+  }
+
+  private async loadAccountInfo(): Promise<void> {
+    const savedUser = await AccountManager.loadSavedUserInfo()
+    if (savedUser) {
+      this.accountUserName = savedUser.displayName
+      this.accountAvatarUrl = savedUser.avatarUri
+      this.accountIsLoggedIn = true
+      const manager = ListeningLevelManager.getInstance()
+      await manager.init()
+      this.accountLevelInfo = manager.getLevelInfo()
+      this.accountSignature = manager.getSignature()
+    } else {
+      this.accountUserName = '点击登录'
+      this.accountAvatarUrl = ''
+      this.accountIsLoggedIn = false
+      this.accountLevelInfo = { level: 1, current: 0, need: 1160, totalSeconds: 0, percent: 0 }
+      this.accountSignature = ''
+    }
+  }
+
+  private async accountDoLogin(): Promise<void> {
+    this.accountLoggingIn = true
+    try {
+      const context = this.getUIContext().getHostContext() as common.Context
+      const result = await AccountManager.login(context)
+      if (result.success && result.userInfo) {
+        this.accountUserName = result.userInfo.displayName
+        this.accountAvatarUrl = result.userInfo.avatarUri
+        this.accountIsLoggedIn = true
+        await this.loadAccountInfo()
+        this.showToastMsg('登录成功')
+      } else {
+        this.showToastMsg(result.error || '登录失败')
+      }
+    } finally {
+      this.accountLoggingIn = false
+    }
+  }
+
+  private async accountDoLogout(): Promise<void> {
+    await AccountManager.logout()
+    ListeningLevelManager.getInstance().reset()
+    this.accountUserName = '点击登录'
+    this.accountAvatarUrl = ''
+    this.accountIsLoggedIn = false
+    this.accountLevelInfo = { level: 1, current: 0, need: 1160, totalSeconds: 0, percent: 0 }
+    this.accountSignature = ''
+    this.accountShowMenu = false
+    this.showToastMsg('已退出登录')
+  }
+
+  // 彻底退出应用
+  private accountExitApp(): void {
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext
+      ctx.terminateSelf()
+    } catch (e) {
+      console.error('[LoushiTab] exit app failed:', e)
+      this.showToastMsg('退出失败')
+    }
+  }
+
+  // 重启应用
+  private accountRestartApp(): void {
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext
+      ctx.startAbility({
+        bundleName: ctx.abilityInfo.bundleName,
+        abilityName: ctx.abilityInfo.name
+      })
+      ctx.terminateSelf()
+    } catch (e) {
+      console.error('[LoushiTab] restart app failed:', e)
+      this.showToastMsg('重启失败')
+    }
+  }
+
+  private async refreshCacheInfo(): Promise<void> {
+    this.cacheInfo = await CacheManager.getInfo()
+  }
+
+  private async clearAppCache(): Promise<void> {
+    if (this.clearingCache) return
+    this.clearingCache = true
+    try {
+      await CacheManager.clear()
+      await this.refreshCacheInfo()
+      this.showToastMsg('缓存清理完成')
+    } catch (e) {
+      console.error('[LoushiTab] clear cache failed:', e)
+      this.showToastMsg('缓存清理失败')
+    } finally {
+      this.clearingCache = false
+    }
   }
 
   private async loadSettings() {
@@ -178,14 +300,19 @@ export struct LoushiTab {
     this.autoPlay = (await this.db.getSetting('autoPlay')) === 'true'
     this.autoJumpDetail = (await this.db.getSetting('autoJumpDetail')) === 'true'
     this.rememberProgress = (await this.db.getSetting('rememberProgress')) !== 'false' // 默认开启
+    // 封面/歌词自动补全：默认关闭，仅在用户开启时联网补全
+    this.autoEnrichTags = (await this.db.getSetting('autoEnrichTags')) === 'true'
+    AppStorage.setOrCreate('autoEnrichTags', this.autoEnrichTags)
+    // 迷你栏来源徽章：默认开启
+    const showSource = await this.db.getSetting('miniBarShowSource')
+    this.miniBarShowSource = showSource !== 'false'
+    AppStorage.setOrCreate('miniBarShowSource', this.miniBarShowSource)
     const searchMem = await this.db.getSetting('searchMemory')
     this.searchMemory = searchMem !== 'false' // 默认开启
     const searchPersist = await this.db.getSetting('searchPersist')
-    this.searchPersist = searchPersist === 'true' // 搜索常驻，默认关闭
-    const ball = await this.db.getSetting('searchFloatingBall')
-    this.searchFloatingBall = ball !== 'false' // 悬浮球默认开启
-    const ballLeft = await this.db.getSetting('searchFloatingBallLeft')
-    this.searchFloatingBallLeft = ballLeft === 'true' // 悬浮球左侧默认关闭
+    this.searchPersist = searchPersist === 'true'
+    const searchSuggest = await this.db.getSetting('searchSuggest')
+    this.searchSuggest = searchSuggest !== 'false' // 默认开启
     const homeStats = await this.db.getSetting('showHomeStats')
     this.showHomeStats = homeStats !== 'false' // 默认开启
 
@@ -327,9 +454,12 @@ export struct LoushiTab {
         this.XuanchuangSettingsPage()
       } else if (this.subPage === 'qinse_settings') {
         this.QinseSettingsPage()
+      } else if (this.subPage === 'cache_settings') {
+        this.CacheSettingsPage()
       }
     }
     .width('100%').height('100%')
+      .padding({ top: 44 })
       .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
       .justifyContent(FlexAlign.Start)
       .bindSheet($$this.showLockDialog, this.LockPasswordSheet(), {
@@ -664,6 +794,9 @@ export struct LoushiTab {
   MainPage() {
     Scroll() {
       Column({ space: 20 }) {
+        // 顶部：账号设置（复用我的页个人信息区，右侧保留电源图标与原弹出菜单）
+        this.AccountSettingCard()
+
         this.SettingGroup('显示与播放', [
           { icon: $r('sys.symbol.paintbrush'), label: '\u4E2A\u6027\u5316', target: 'personalization' },
           { icon: $r('sys.symbol.play_circle'), label: '\u64AD\u653E\u5668', target: 'player' }
@@ -677,7 +810,8 @@ export struct LoushiTab {
 
         this.SettingGroup('版块设置', [
           { icon: $r('sys.symbol.heart_fill'), label: '\u4E3B\u9875', target: 'xuanchuang_settings' },
-          { icon: $r('sys.symbol.magnifyingglass'), label: '\u641C\u7D22', target: 'qinse_settings' }
+          { icon: $r('sys.symbol.magnifyingglass'), label: '\u641C\u7D22', target: 'qinse_settings' },
+          { icon: $r('sys.symbol.trash'), label: '缓存清理', target: 'cache_settings' }
         ])
 
         // 关于软件 独立分组
@@ -690,6 +824,204 @@ export struct LoushiTab {
       .width('100%').padding({ top: 28, left: 16, right: 16 })
     }
     .width('100%').layoutWeight(1).scrollBar(BarState.Auto).edgeEffect(EdgeEffect.Spring).align(Alignment.Top)
+  }
+
+  // ======================== 账号设置卡片 ========================
+  @Builder
+  AccountSettingCard() {
+    Row({ space: 16 }) {
+      // 左侧：头像 + 用户信息（点击登录）
+      Row({ space: 16 }) {
+        Stack() {
+          // 头像：已登录且有头像用网络图片，否则用默认图标
+          if (this.accountIsLoggedIn && this.accountAvatarUrl.length > 0) {
+            Image(this.accountAvatarUrl)
+              .width(72).height(72).borderRadius(36)
+              .objectFit(ImageFit.Cover)
+          } else {
+            Row() {
+              SymbolGlyph($r('sys.symbol.person'))
+                .fontSize(48)
+                .fontColor([this.themeTextSecondary])
+            }
+            .width(72)
+            .height(72)
+            .borderRadius(36)
+            .backgroundColor(this.themeCardBg)
+            .justifyContent(FlexAlign.Center)
+          }
+
+          if (!this.accountIsLoggedIn) {
+            Row() {
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(14)
+                .fontColor([Color.White])
+            }
+            .width(20)
+            .height(20)
+            .borderRadius(10)
+            .backgroundColor(this.themePrimary)
+            .justifyContent(FlexAlign.Center)
+            .position({ x: 52, y: 52 })
+          }
+        }
+        .flexShrink(0)
+
+        Column({ space: 6 }) {
+          if (this.accountLoggingIn) {
+            Row({ space: 6 }) {
+              LoadingProgress().width(16).height(16).color(this.themePrimary)
+              Text('登录中...')
+                .fontSize(16)
+                .fontColor(this.themeTextSecondary)
+            }
+          } else {
+            Row({ space: 8 }) {
+              Text(this.accountUserName)
+                .fontSize(18)
+                .fontColor(this.themeTextPrimary)
+                .fontWeight(FontWeight.Bold)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .flexShrink(1)
+
+              if (this.accountIsLoggedIn) {
+                Stack() {
+                  Text(`LV${this.accountLevelInfo.level}`)
+                    .fontSize(11)
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor(this.themeCardBg)
+                }
+                .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+                .backgroundColor(getLevelColor(this.accountLevelInfo.level))
+                .borderRadius(10)
+              }
+            }
+            .width('100%')
+
+            if (this.accountIsLoggedIn) {
+              // 等级进度条
+              Row({ space: 8 }) {
+                Stack({ alignContent: Alignment.Start }) {
+                  Row()
+                    .width('100%')
+                    .height(5)
+                    .borderRadius(2.5)
+                    .backgroundColor(this.themeDivider)
+                  Row()
+                    .width(`${this.accountLevelInfo.percent}%`)
+                    .height(5)
+                    .borderRadius(2.5)
+                    .backgroundColor(this.themePrimary)
+                    .constraintSize({ minWidth: this.accountLevelInfo.percent > 0 ? 3 : 0 })
+                }
+                .layoutWeight(1)
+                .height(8)
+                .constraintSize({ maxWidth: 120 })
+
+                Text(`${this.accountLevelInfo.current}/${this.accountLevelInfo.need}`)
+                  .fontSize(11)
+                  .fontColor(this.themeTextSecondary)
+              }
+              .width('100%')
+
+              // 个性签名
+              Text(this.accountSignature.length > 0 ? this.accountSignature : '个性签名：编辑后展现更个性的你!')
+                .fontSize(13)
+                .fontColor(this.themeTextSecondary)
+                .maxLines(2)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .width('100%')
+            }
+          }
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+      }
+      .layoutWeight(1)
+      .onClick(() => {
+        if (!this.accountIsLoggedIn && !this.accountLoggingIn) {
+          this.accountDoLogin()
+        }
+      })
+
+      // 右侧：电源图标，未登录点击退出软件，登录后弹出菜单选择
+      Row() {
+        SymbolGlyph($r('sys.symbol.power'))
+          .fontSize(18)
+          .fontColor([this.themeTextPrimary])
+      }
+      .width(40)
+      .height(40)
+      .justifyContent(FlexAlign.Center)
+      .onClick(() => {
+        if (!this.accountIsLoggedIn) {
+          this.accountExitApp()
+        } else {
+          this.accountShowMenu = !this.accountShowMenu
+        }
+      })
+      .bindPopup(this.accountShowMenu, {
+        builder: this.AccountMenuBuilder,
+        placement: Placement.Bottom,
+        systemMaterial: MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN),
+        autoCancel: true,
+        onStateChange: (e: PopupStateChangeParam) => {
+          if (!e.isVisible) {
+            this.accountShowMenu = false
+          }
+        }
+      })
+    }
+    .width('100%')
+    .padding(16)
+    .backgroundColor(this.themeCardBg)
+    .borderRadius(16)
+    .shadow({ radius: 4, color: '#00000008', offsetY: 2 })
+  }
+
+  @Builder
+  AccountMenuBuilder() {
+    Column({ space: 0 }) {
+      Text('退出软件')
+        .fontSize(15)
+        .fontColor(this.themeTextPrimary)
+        .width('100%')
+        .height(44)
+        .textAlign(TextAlign.Center)
+        .onClick(() => {
+          this.accountShowMenu = false
+          this.accountExitApp()
+        })
+
+      Divider().color(this.themeDivider).strokeWidth(0.5)
+
+      Text('重启软件')
+        .fontSize(15)
+        .fontColor(this.themeTextPrimary)
+        .width('100%')
+        .height(44)
+        .textAlign(TextAlign.Center)
+        .onClick(() => {
+          this.accountShowMenu = false
+          this.accountRestartApp()
+        })
+
+      Divider().color(this.themeDivider).strokeWidth(0.5)
+
+      Text('退出登录')
+        .fontSize(15)
+        .fontColor('#FF6B6B')
+        .width('100%')
+        .height(44)
+        .textAlign(TextAlign.Center)
+        .onClick(() => {
+          this.accountDoLogout()
+        })
+    }
+    .width(120)
+    .borderRadius(10)
+    .padding({ top: 4, bottom: 4 })
   }
 
   // ======================== 个性化 ========================
@@ -780,6 +1112,9 @@ export struct LoushiTab {
           // 播放设置卡片
           this.PlayerSettingsCard()
 
+          // Minibar 设置卡片
+          this.MiniBarSettingsCard()
+
           Column().height(168)
         }
         .width('100%').padding({ top: 12, left: 16, right: 16 })
@@ -817,6 +1152,15 @@ export struct LoushiTab {
           this.saveSetting('autoJumpDetail', String(v))
           AppStorage.setOrCreate('autoJumpDetail', v)
         })
+
+      Divider().height(1).color(this.themeDivider).width('100%').margin({ left: 16, right: 16 })
+
+      this.PlayerToggleItem('封面/歌词自动补全', '开启后，在封面/歌词缺失时将尝试自动补全',
+        this.autoEnrichTags, (v) => {
+          this.autoEnrichTags = v
+          this.saveSetting('autoEnrichTags', String(v))
+          AppStorage.setOrCreate('autoEnrichTags', v)
+        })
     }
     .width('100%')
     .backgroundColor(this.themeCardBg)
@@ -836,6 +1180,29 @@ export struct LoushiTab {
         .onChange((v: boolean) => { onChange(v) })
     }
     .width('100%').padding({ left: 16, right: 16, top: 12, bottom: 12 })
+  }
+
+  // ===== Minibar 设置 =====
+  @Builder
+  MiniBarSettingsCard() {
+    Column() {
+      Text('Minibar 设置')
+        .fontSize(15)
+        .fontColor(this.themeTextPrimary)
+        .fontWeight(FontWeight.Medium)
+        .width('100%')
+        .padding({ left: 16, top: 16, bottom: 8 })
+
+      this.PlayerToggleItem('歌曲来源展示', '关闭后迷你栏不再显示歌曲来源徽章',
+        this.miniBarShowSource, (v) => {
+          this.miniBarShowSource = v
+          this.saveSetting('miniBarShowSource', String(v))
+          AppStorage.setOrCreate('miniBarShowSource', v)
+        })
+    }
+    .width('100%')
+    .backgroundColor(this.themeCardBg)
+    .borderRadius(12)
   }
 
   // ======================== WebDAV ========================
@@ -1149,7 +1516,7 @@ export struct LoushiTab {
                 .fontSize(22)
                 .fontColor(this.themeTextPrimary)
                 .fontWeight(FontWeight.Bold)
-              Text('Version 2.0.5.8')
+              Text('Version 2.0.7.7')
                 .fontSize(13)
                 .fontColor(this.themeTextSecondary)
             }
@@ -1390,7 +1757,45 @@ export struct LoushiTab {
     }
     .width('100%').height('100%')
       .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
-      .justifyContent(FlexAlign.Start)
+    .justifyContent(FlexAlign.Start)
+  }
+
+  @Builder
+  CacheSettingsPage() {
+    Column() {
+      this.SubPageHeader('缓存清理')
+      Scroll() {
+        Column({ space: 12 }) {
+          Column({ space: 8 }) {
+            Text('缓存清理')
+              .fontSize(16).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Medium).width('100%')
+            Text('点击清理应用缓存')
+              .fontSize(13).fontColor(this.themeTextSecondary).width('100%')
+            Text(`当前缓存 ${CacheManager.formatBytes(this.cacheInfo.bytes)} · ${this.cacheInfo.files} 个文件`)
+              .fontSize(13).fontColor(this.themeTextSecondary).width('100%')
+            Button(this.clearingCache ? '清理中...' : '清理缓存')
+              .width('100%')
+              .height(44)
+              .fontSize(15)
+              .backgroundColor(this.themePrimary)
+              .fontColor(Color.White)
+              .enabled(!this.clearingCache)
+              .onClick(() => { this.clearAppCache() })
+          }
+          .width('100%')
+          .padding(16)
+          .backgroundColor(this.themeCardBg)
+          .borderRadius(12)
+
+          Column().height(168)
+        }
+        .width('100%').padding({ top: 12, left: 16, right: 16 })
+      }
+      .layoutWeight(1).scrollBar(BarState.Auto).edgeEffect(EdgeEffect.Spring).align(Alignment.Top)
+    }
+    .width('100%').height('100%')
+    .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
+    .justifyContent(FlexAlign.Start)
   }
 
   // ======================== 主页设置 ========================
@@ -1496,43 +1901,25 @@ export struct LoushiTab {
           .width('100%').padding(16)
           .backgroundColor(this.themeCardBg).borderRadius(12)
 
-          // 悬浮球设置
+          // 搜索联想词开关
           Column({ space: 8 }) {
-            Text('\u60AC\u6D6E\u7403')
+            Text('\u641C\u7D22\u8054\u60F3\u8BCD')
               .fontSize(16).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Medium).width('100%')
-            Text('\u641C\u7D22\u9875\u53F3\u4E0B\u89D2\u60AC\u6D6E\u7403\uFF1A\u957F\u6309\u56DE\u9876\uFF0C\u5355\u51FB\u5C55\u5F00\u83DC\u5355\uFF08\u5237\u65B0/\u6765\u6E90\u7B5B\u9009\uFF09')
+            Text('\u8F93\u5165\u5173\u952E\u8BCD\u65F6\u5C55\u793A\u641C\u7D22\u8054\u60F3\u5F39\u7A97\uFF0C\u70B9\u51FB\u8BCD\u6761\u5FEB\u6377\u641C\u7D22')
               .fontSize(13).fontColor(this.themeTextSecondary).width('100%')
             Row({ space: 12 }) {
               Column({ space: 2 }) {
-                Text('\u5F00\u542F\u60AC\u6D6E\u7403')
+                Text('\u542F\u7528\u641C\u7D22\u8054\u60F3\u8BCD')
                   .fontSize(15).fontColor(this.themeTextPrimary).width('100%')
-                Text('\u9ED8\u8BA4\u5F00\u542F')
+                Text('\u5173\u95ED\u540E\u641C\u7D22\u4E0D\u518D\u5C55\u793A\u8054\u60F3\u5F39\u7A97')
                   .fontSize(12).fontColor(this.themeTextSecondary).width('100%')
               }
               .layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.searchFloatingBall })
+              Toggle({ type: ToggleType.Switch, isOn: this.searchSuggest })
                 .selectedColor(this.themePrimary)
                 .onChange((v: boolean) => {
-                  this.searchFloatingBall = v
-                  this.saveSetting('searchFloatingBall', String(v))
-                  AppStorage.setOrCreate('searchFloatingBall', v)
-                })
-            }
-            .width('100%').padding({ top: 8 })
-            Row({ space: 12 }) {
-              Column({ space: 2 }) {
-                Text('\u60AC\u6D6E\u7403\u5DE6\u4FA7')
-                  .fontSize(15).fontColor(this.themeTextPrimary).width('100%')
-                Text('\u9ED8\u8BA4\u663E\u793A\u5728\u53F3\u4FA7\uFF0C\u5F00\u542F\u540E\u955C\u50CF\u5230\u5DE6\u4FA7\u5BF9\u79F0\u4F4D\u7F6E')
-                  .fontSize(12).fontColor(this.themeTextSecondary).width('100%')
-              }
-              .layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.searchFloatingBallLeft })
-                .selectedColor(this.themePrimary)
-                .onChange((v: boolean) => {
-                  this.searchFloatingBallLeft = v
-                  this.saveSetting('searchFloatingBallLeft', String(v))
-                  AppStorage.setOrCreate('searchFloatingBallLeft', v)
+                  this.searchSuggest = v
+                  this.saveSetting('searchSuggest', String(v))
                 })
             }
             .width('100%').padding({ top: 8 })

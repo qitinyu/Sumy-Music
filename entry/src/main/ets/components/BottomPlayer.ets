@@ -5,7 +5,6 @@ import { PlayerStore } from '../utils/PlayerStore'
 import { AudioPlayer } from '../utils/AudioPlayer'
 import { MusicApi } from '../utils/MusicApi'
 import { DatabaseHelper } from '../database/DatabaseHelper'
-import { promptAction } from '@kit.ArkUI'
 import { CompatUtils } from '../utils/CompatUtils'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
 
@@ -75,60 +74,16 @@ export struct BottomPlayer {
 
   // 上一首（实际播放）
   private async handlePrevious(): Promise<void> {
-    const track = PlayerStore.previous()
-    if (track) {
-      await this.playTrack(track)
-    }
+    // 统一走 AudioPlayer 切歌：带取链失败自动跳下一首、防抖（代际）与真实暂停
+    await AudioPlayer.getInstance().playPrevious()
   }
 
   // 下一首（实际播放）
   private async handleNext(): Promise<void> {
-    const track = PlayerStore.next()
-    if (track) {
-      await this.playTrack(track)
-    }
+    await AudioPlayer.getInstance().playNext()
   }
 
   // 播放指定曲目
-  private async playTrack(track: SongInfo): Promise<void> {
-    let playUrl = track.playUrl
-    if (!playUrl && track.source !== 'local') {
-      playUrl = await MusicApi.getPlayUrl(track.songId, track.source, track)
-    }
-    if (!playUrl) {
-      PlayerStore.pause()
-      promptAction.showToast({ message: '无法获取播放链接', duration: 1500 })
-      return
-    }
-    track.playUrl = playUrl
-    PlayerStore.play(track)
-
-    // 配置播放器回调
-    const player = AudioPlayer.getInstance()
-    player.setCurrentSong(track)
-    player.onTimeUpdate = (time: number) => { PlayerStore.updateTime(time) }
-    player.onDurationUpdate = (dur: number) => { PlayerStore.updateDuration(dur) }
-    player.onPlayEnd = () => {
-      const nextTrack = PlayerStore.onTrackEnd()
-      if (nextTrack) {
-        this.playTrack(nextTrack)
-      } else {
-        PlayerStore.pause()
-      }
-    }
-    player.onError = (_error: string) => {
-      PlayerStore.pause()
-      setTimeout(() => {
-        const nextTrack = PlayerStore.next()
-        if (nextTrack) {
-          this.playTrack(nextTrack)
-        }
-      }, 3000)
-    }
-
-    await player.play(playUrl)
-  }
-
   // 统一跳转到完整播放器
   private goToFullPlayer(): void {
     PlayerStore.showFullPlayer()

@@ -4,7 +4,8 @@
  */
 
 export type OnlineSource = 'kw' | 'kg' | 'tx' | 'wy' | 'mg'
-export type LXSource = OnlineSource | 'local'
+// 自定义源（如全豆要的 qsvip）允许任意字符串，由引擎侧插件自行解释
+export type LXSource = OnlineSource | 'local' | string
 export type LXQuality = '128k' | '320k' | 'flac' | 'flac24bit' | '192k' | 'ape' | 'wav'
 
 /** 音源信息（来自 JS 插件的 sources 声明） */

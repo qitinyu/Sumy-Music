@@ -9,9 +9,6 @@ export struct SongCard {
   onPlay?: (song: SongInfo) => void
   onMore?: (song: SongInfo) => void
 
-  // 模式：true = 双击播放（搜索结果），false = 单击播放（轩窗收藏/歌单）
-  doubleTapToPlay: boolean = false
-
   @State private isPressed: boolean = false
   @StorageProp('unplayable_sources') unplayableSources: string = ''
   @StorageProp('theme_placeholder') themePlaceholder: string = '#E0E0E0'
@@ -31,6 +28,20 @@ export struct SongCard {
       return false
     }
     return false
+  }
+
+  private getDisplaySource(): string {
+    const raw = this.song.rawData
+    if (raw) {
+      try {
+        const obj: Record<string, Object> = JSON.parse(raw) as Record<string, Object>
+        const platform = obj['__platform']
+        if (typeof platform === 'string' && platform.length > 0) {
+          return platform
+        }
+      } catch (_e) {}
+    }
+    return this.song.source
   }
 
   build() {
@@ -57,10 +68,10 @@ export struct SongCard {
         // 右侧下方：音源标签 + 演唱者 + 更多按钮
         Row({ space: 6 }) {
           // 音源小标签（缩写：KW/KG/QQ/WY/MG；可播放=彩色背景白色文字；不可用=灰度）
-          Text(SourceInfo.getAbbr(this.song.source))
+          Text(SourceInfo.getAbbr(this.getDisplaySource()))
             .fontSize(10)
             .fontColor(Color.White)
-            .backgroundColor(this.isSourceUnplayable() ? '#B0B0B0' : SourceInfo.getColor(this.song.source))
+            .backgroundColor(this.isSourceUnplayable() ? '#B0B0B0' : SourceInfo.getColor(this.getDisplaySource()))
             .padding({ left: 5, right: 5, top: 1, bottom: 1 })
             .borderRadius(3)
             .flexShrink(0)
@@ -99,29 +110,28 @@ export struct SongCard {
     .borderRadius(12)
     .scale({ x: this.isPressed ? 0.97 : 1, y: this.isPressed ? 0.97 : 1 })
     .animation({ duration: 150 })
+    .onTouch((event: TouchEvent) => {
+      if (event.type === TouchType.Down) {
+        this.isPressed = true
+      } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+        this.isPressed = false
+      }
+    })
     .gesture(
       GestureGroup(GestureMode.Exclusive,
         // 长按 → 打开操作菜单
         LongPressGesture({ repeat: false, duration: 500 })
           .onAction(() => {
+            this.isPressed = false
             if (this.onMore) {
               this.onMore(this.song)
             }
           }),
-        // 双击 → 播放（搜索模式）
-        TapGesture({ count: 2 })
+        // 单击 → 播放
+        TapGesture({ count: 1 })
           .onAction(() => {
             if (this.onPlay) {
               this.onPlay(this.song)
-            }
-          }),
-        // 单击 → 播放（轩窗收藏/歌单模式）
-        TapGesture({ count: 1 })
-          .onAction(() => {
-            if (!this.doubleTapToPlay) {
-              if (this.onPlay) {
-                this.onPlay(this.song)
-              }
             }
           }),
       )

@@ -17,7 +17,7 @@ export struct CoverImage {
 
   @State resolvedUrl: string = ''
   private resolvedSource: string = ''
-  private resolving: boolean = false
+  private resolvingUrl: string = ''
 
   aboutToAppear(): void {
     this.resolve()
@@ -33,24 +33,35 @@ export struct CoverImage {
     if (url.length === 0) {
       this.resolvedSource = ''
       this.resolvedUrl = ''
+      this.resolvingUrl = ''
       return
     }
     // 同一来源已解析成功：跳过，避免重复解析导致封面闪烁/消失
     if (url === this.resolvedSource) {
       return
     }
-    if (this.resolving) {
+    // 同一 URL 已在解析中：跳过，避免重复请求
+    if (url === this.resolvingUrl) {
       return
     }
-    this.resolving = true
+    // 记录正在解析的 URL（而非布尔锁）：
+    // 切歌时旧封面的异步解析尚未返回，新 URL 会立即开始解析；
+    // 旧结果返回时 resolvingUrl 已是新 URL，被丢弃，不再污染当前封面。
+    this.resolvingUrl = url
     CoverFetcher.resolve(url).then((resolved: string) => {
-      this.resolving = false
+      if (this.resolvingUrl !== url) {
+        // 期间已切歌：丢弃旧结果，最新 URL 的解析会另行刷新
+        return
+      }
+      this.resolvingUrl = ''
       if (this.url === url && resolved.length > 0) {
         this.resolvedSource = url
         this.resolvedUrl = resolved
       }
     }).catch((_e: Error) => {
-      this.resolving = false
+      if (this.resolvingUrl === url) {
+        this.resolvingUrl = ''
+      }
     })
   }
 

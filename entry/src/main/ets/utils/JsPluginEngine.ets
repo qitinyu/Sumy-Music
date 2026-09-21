@@ -73,6 +73,11 @@ class JsHostBridge {
   private static pending: Map<string, string> = new Map();
   private static seq: number = 0;
 
+  static reset(): void {
+    JsHostBridge.pending.clear();
+    JsHostBridge.seq = 0;
+  }
+
   /** 同步方法：启动一次宿主 HTTP 请求并立即返回 token，结果经 httpPoll 轮询取得 */
   httpStart(url: string, method: string, data: string, headersJson: string, contentType: string, timeoutMs: number): string {
     const token: string = 'r' + (++JsHostBridge.seq);
@@ -209,20 +214,29 @@ export class JsPluginEngine {
 
   /** 由 JsEngineHost 在页面首次加载完成后调用 */
   static init(controller: webview.WebviewController): void {
+    const controllerChanged: boolean = JsPluginEngine.controller !== controller;
     JsPluginEngine.controller = controller;
+    if (controllerChanged) {
+      JsPluginEngine.ready = false;
+      JsPluginEngine.proxyRegistered = false;
+      JsPluginEngine.lastError = '';
+      JsHostBridge.reset();
+    }
     if (!JsPluginEngine.proxyRegistered) {
-      JsPluginEngine.proxyRegistered = true;
       try {
         // 同步方法桥（httpStart/httpPoll/httpDone）：async 代理方法在部分设备上 Promise 无法被 JS await，
         // 改为同步启动 + 轮询，彻底规避挂起导致的 0 结果问题
         controller.registerJavaScriptProxy(JsPluginEngine.bridge, '__host', ['log', 'httpStart', 'httpPoll', 'httpDone']);
+        JsPluginEngine.proxyRegistered = true;
         controller.refresh();
         // V1.2.1：兜底定时器 — WebView refresh 后依赖二次 onPageEnd 触发 markReady，
         // 部分设备/场景下二次加载可能不触发（缓存/时序），超时后强制就绪避免永久不可用
         setTimeout(() => {
-          if (!JsPluginEngine.ready) {
+          if (!JsPluginEngine.ready && JsPluginEngine.proxyRegistered) {
             console.warn('[JsPluginEngine] refresh 后 markReady 未触发，强制就绪');
             JsPluginEngine.markReady();
+          } else if (!JsPluginEngine.proxyRegistered) {
+            console.warn('[JsPluginEngine] proxy 未注册，跳过强制就绪');
           }
         }, 5000);
       } catch (e) {
@@ -264,6 +278,10 @@ export class JsPluginEngine {
       await JsPluginEngine.sleep(50);
     }
     return true;
+  }
+
+  static isReadyPublic(): boolean {
+    return JsPluginEngine.ready;
   }
 
   private static sleep(ms: number): Promise<void> {
@@ -378,6 +396,23 @@ export class JsPluginEngine {
   /** v3 插件已解析的音源 id 缓存（key 为 "插件名|action"，值为 JSON 数组字符串） */
   private static v3SourcesCache: Map<string, string> = new Map();
 
+  static clearV3SourcesCache(pluginName?: string): void {
+    if (!pluginName || pluginName.length === 0) {
+      JsPluginEngine.v3SourcesCache.clear();
+      return;
+    }
+    const prefix: string = pluginName + '|';
+    const keys: string[] = [];
+    JsPluginEngine.v3SourcesCache.forEach((_value: string, key: string) => {
+      if (key.startsWith(prefix)) {
+        keys.push(key);
+      }
+    });
+    for (let i = 0; i < keys.length; i++) {
+      JsPluginEngine.v3SourcesCache.delete(keys[i]);
+    }
+  }
+
   /** 按 action 解析 v3 插件中支持该 action 的所有音源 id；无匹配时返回空数组 */
   private static async resolveV3SourcesForAction(config: SourceConfig, action: string): Promise<string[]> {
     const cacheKey: string = config.name + '|' + action;
@@ -389,15 +424,45 @@ export class JsPluginEngine {
       }
     }
     const controller = JsPluginEngine.controller;
-    if (!controller) return [];
-    if (!await JsPluginEngine.ensureReady()) return [];
+    if (!controller) return []
+    if (!await JsPluginEngine.ensureReady()) return []
     try {
-      const raw: string = await controller.runJavaScript(
+      let sourcesJson: string = '';
+      const rawSync: string = await controller.runJavaScript(
         `window.__v3Sources(${JSON.stringify(config.name)}, ${JSON.stringify(config.jsSource ?? '')})`);
-      const unwrapped: string = JsPluginEngine.unwrap(raw);
+      const syncResult: string = JsPluginEngine.unwrap(rawSync);
+      if (syncResult && syncResult.length > 0 && syncResult !== '{}') {
+        sourcesJson = syncResult;
+      } else {
+        const rawTaskId: string = await controller.runJavaScript(
+          `window.__v3SourcesAsync(${JSON.stringify(config.name)}, ${JSON.stringify(config.jsSource ?? '')})`);
+        const taskId: string = JsPluginEngine.unwrap(rawTaskId);
+        if (taskId && taskId.length > 0) {
+          const end: number = Date.now() + 16000;
+          while (Date.now() < end) {
+            const raw2: string = await controller.runJavaScript(`window.__getTaskResult(${JSON.stringify(taskId)})`);
+            const unwrapped2: string = JsPluginEngine.unwrap(raw2);
+            if (unwrapped2 && unwrapped2.length > 0) {
+              try {
+                const pr: Record<string, Object> = JSON.parse(unwrapped2) as Record<string, Object>;
+                if (String(pr['done'] ?? '') === 'true' && String(pr['ok'] ?? '') === 'true') {
+                  const d: Object | undefined = pr['data'];
+                  if (d && String(d).length > 0 && String(d) !== '{}') {
+                    sourcesJson = String(d);
+                  }
+                  break
+                }
+                if (String(pr['done'] ?? '') === 'true') break
+              } catch (_e2) {
+              }
+            }
+            await JsPluginEngine.sleep(200);
+          }
+        }
+      }
       const srcs: string[] = [];
-      if (unwrapped && unwrapped.length > 0 && unwrapped !== '{}') {
-        const parsed: Record<string, Object> = JSON.parse(unwrapped) as Record<string, Object>;
+      if (sourcesJson.length > 0 && sourcesJson !== '{}') {
+        const parsed: Record<string, Object> = JSON.parse(sourcesJson) as Record<string, Object>;
         const keys: string[] = Object.keys(parsed);
         for (let i = 0; i < keys.length; i++) {
           const srcConf: Record<string, Object> = parsed[keys[i]] as Record<string, Object>;
@@ -407,27 +472,51 @@ export class JsPluginEngine {
             for (let j = 0; j < acts.length; j++) {
               if (String(acts[j]) === action) {
                 srcs.push(keys[i]);
-                break;
+                break
               }
             }
           }
         }
-        if (srcs.length > 0) {
-          JsPluginEngine.v3SourcesCache.set(cacheKey, JSON.stringify(srcs));
-        } else {
-          console.warn(`[JsPluginEngine] v3(${config.name}) 无音源支持 ${action}`);
-        }
       }
-      return srcs;
+      if (srcs.length > 0) {
+        JsPluginEngine.v3SourcesCache.set(cacheKey, JSON.stringify(srcs));
+        return srcs
+      }
+      const hasHandlers: boolean = await JsPluginEngine.v3PluginHasHandlers(config)
+      if (hasHandlers && (action === 'musicUrl' || action === 'lyric')) {
+        const platformFallback: string[] = ['kw', 'kg', 'tx', 'wy', 'mg']
+        JsPluginEngine.v3SourcesCache.set(cacheKey, JSON.stringify(platformFallback))
+        console.info(`[JsPluginEngine] v3(${config.name}) 无声明音源但已注册处理器，回退平台码: ${platformFallback.join(',')}`)
+        return platformFallback
+      }
+      console.warn(`[JsPluginEngine] v3(${config.name}) 无音源支持 ${action}`)
+      return srcs
     } catch (e) {
       console.error('[JsPluginEngine] resolveV3SourcesForAction failed:', e);
       return [];
     }
   }
 
+  private static async v3PluginHasHandlers(config: SourceConfig): Promise<boolean> {
+    const controller = JsPluginEngine.controller
+    if (!controller) return false
+    try {
+      const raw: string = await controller.runJavaScript(
+        `window.__v3HasHandlers ? window.__v3HasHandlers(${JSON.stringify(config.name)}, ${JSON.stringify(config.jsSource ?? '')}) : 'false'`)
+      const unwrapped: string = JsPluginEngine.unwrap(raw)
+      return unwrapped === 'true'
+    } catch (_e) {
+      return false
+    }
+  }
+
   /** 解析 v3 插件中支持 musicSearch 的所有音源 id */
   private static async resolveV3SearchSources(config: SourceConfig): Promise<string[]> {
-    return await JsPluginEngine.resolveV3SourcesForAction(config, 'musicSearch');
+    return await JsPluginEngine.resolveV3SourcesForAction(config, 'musicSearch')
+  }
+
+  static async resolveV3SearchSourcesPublic(config: SourceConfig): Promise<string[]> {
+    return await JsPluginEngine.resolveV3SourcesForAction(config, 'musicSearch')
   }
 
   /** v3 插件搜索：keyword → SongInfo[]（依次尝试支持 musicSearch 的每个音源） */
@@ -467,18 +556,9 @@ export class JsPluginEngine {
   /** 插件搜索：keyword → SongInfo[] */
   static async search(config: SourceConfig, keyword: string): Promise<SongInfo[]> {
     JsPluginEngine.lastError = '';
-    // v3 事件驱动插件：走 lx 事件分发。若无 musicSearch 源则 fallback V1 搜索
+    // v3 事件驱动插件：仅走 lx 事件分发，不再回退到 V1 搜索
     if (config.jsMode === 'v3') {
-      const v3Results: SongInfo[] = await JsPluginEngine.searchV3(config, keyword);
-      if (v3Results.length > 0 || JsPluginEngine.lastError === '') {
-        return v3Results;
-      }
-      // v3 插件未声明 musicSearch（如全豆要只提供 musicUrl）→ 直接返回，避免走 V1 方法白白超时
-      if (JsPluginEngine.lastError.indexOf('musicSearch') >= 0) {
-        return [];
-      }
-      // V3 路径未声明 musicSearch —— 兜底走 V1 搜索
-      JsPluginEngine.lastError = '';
+      return await JsPluginEngine.searchV3(config, keyword);
     }
     // 兼容两种插件签名：search(keyword, page, type) 与 search(info, page, type)
     // 仅在快速返回空结果时重试对象形式，避免超时场景重复等待
@@ -558,12 +638,32 @@ export class JsPluginEngine {
     if (JsPluginEngine.isHttpUrl(song.playUrl)) {
       return song.playUrl;
     }
-    // v3 事件驱动插件：musicUrl 动作（多音源依次尝试）
     if (config.jsMode === 'v3') {
-      const sources: string[] = await JsPluginEngine.resolveV3SourcesForAction(config, 'musicUrl');
+      let sources: string[] = await JsPluginEngine.resolveV3SourcesForAction(config, 'musicUrl');
       if (sources.length === 0) {
         JsPluginEngine.lastError = `插件 ${config.name} 未声明支持播放动作(musicUrl)`;
         return '';
+      }
+      const rawSource: string = song.source ? song.source : ''
+      let preferred: string = rawSource
+      if (preferred.startsWith('custom_')) preferred = preferred.substring(7)
+      if (song.rawData && song.rawData.length > 0) {
+        try {
+          const rawObj: Record<string, Object> = JSON.parse(song.rawData) as Record<string, Object>
+          const platVal: Object | undefined = rawObj['__platform']
+          if (platVal !== undefined && platVal !== null) preferred = String(platVal)
+        } catch (_e) {}
+      }
+      const platformMap: Record<string, string> = {
+        'kuwo': 'kw', '酷我': 'kw',
+        'kugou': 'kg', '酷狗': 'kg',
+        'qq': 'tx', 'QQ': 'tx', '腾讯': 'tx',
+        'netease': 'wy', '网易': 'wy', '163': 'wy',
+        'migu': 'mg', '咪咕': 'mg',
+      }
+      if (platformMap[preferred] !== undefined) preferred = platformMap[preferred]
+      if (preferred.length > 0 && sources.indexOf(preferred) >= 0) {
+        sources = [preferred].concat(sources.filter((s: string) => s !== preferred))
       }
       const musicInfo: Object = JSON.parse(JsPluginEngine.buildSongInfoJson(song)) as Object;
       const info: V3MusicInfo = { musicInfo: musicInfo, type: DEFAULT_QUALITY };
@@ -761,18 +861,22 @@ export class JsPluginEngine {
     // 平台标记：插件可在搜索项里带 source 字段（如聚合源的 kg/kw/tx/mg/wy），
     // 用于展示真实音源徽章（酷狗/酷我等）并直接按平台路由取链；缺省回退插件名
     const itemSource: string = JsPluginEngine.strOf(item['source']);
+    const rawObj: Record<string, Object> = item;
+    if (itemSource.length > 0 && platform !== itemSource) {
+      rawObj['__platform'] = itemSource;
+    }
     const song: SongInfo = {
       songId: id,
       songName: name,
       artist: artist,
       album: JsPluginEngine.strOf(item['album']) || JsPluginEngine.strOf(item['albumName']),
       coverUrl: cover,
-      source: itemSource.length > 0 ? itemSource : 'custom_' + platform,
+      source: 'custom_' + platform,
       playUrl: JsPluginEngine.strOf(item['url']),
       quality: '128kbps/' + durText,
       hash: hash.length > 0 ? hash : undefined,
       mid: mid.length > 0 ? mid : undefined,
-      rawData: JSON.stringify(item),
+      rawData: JSON.stringify(rawObj),
     };
     return song;
   }

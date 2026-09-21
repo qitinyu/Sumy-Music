@@ -7,11 +7,14 @@ import { DatabaseHelper } from '../database/DatabaseHelper'
 import { promptAction } from '@kit.ArkUI'
 import { CompatUtils } from '../utils/CompatUtils'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
+import { hdsEffect } from '@kit.UIDesignKit'
 import { pasteboard } from '@kit.BasicServicesKit'
 import { systemShare } from '@kit.ShareKit'
 import { uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { common } from '@kit.AbilityKit'
 import { CoverImage } from '../components/CoverImage'
+import { LocalTagEnricher } from '../utils/LocalTagEnricher'
+import { playLog } from '../utils/PlayLog'
 
 @Entry
 @Component
@@ -37,6 +40,7 @@ export struct FullPlayerPage {
   @StorageProp('theme_bgImageName') themeBgImageName: string = ''
   @StorageProp('isDarkMode') isDarkMode: boolean = false
   @State progress: number = 0
+  @State sliderValue: number = 0
   @State currentLyricIndex: number = 0
   @State isSeeking: boolean = false
   @State showListSheet: boolean = false
@@ -51,7 +55,6 @@ export struct FullPlayerPage {
   @State playlists: Playlist[] = []
   @State showLyricsAlignPicker: boolean = false
   @State autoHideControls: boolean = false
-  @State showQueuePopup: boolean = false
   @State lyricPullOffset: number = 0
   @State lyricPullHint: string = ''
   @State lyricsViewHeight: number = 600
@@ -59,9 +62,9 @@ export struct FullPlayerPage {
   private progressTimer: number = -1
   private controlsTimer: number = -1
   private db: DatabaseHelper = DatabaseHelper.getInstance()
-  // 🆕 拖动中：记录预览时间，不污染全局 currentTime
   private dragTime: number = 0
   private supportImmersive: boolean = CompatUtils.isImmersiveSupported()
+  private onSeekDoneBound: (time: number) => void = (_t: number) => {}
 
   aboutToAppear(): void {
     this.playModeLocal = this.playMode
@@ -83,6 +86,7 @@ export struct FullPlayerPage {
     }
     this.loadLyrics()
     this.progress = 0
+    this.sliderValue = 0
     this.currentLyricIndex = 0
     this.lyricsScroller.scrollToIndex(0)
   }
@@ -94,6 +98,8 @@ export struct FullPlayerPage {
     if (this.controlsTimer !== -1) {
       clearTimeout(this.controlsTimer)
     }
+    const player = AudioPlayer.getInstance()
+    player.removeSeekDoneListener(this.onSeekDoneBound)
   }
 
   private async loadSettings(): Promise<void> {
@@ -132,61 +138,41 @@ export struct FullPlayerPage {
     }
   }
 
-  // ======================== 修复①：加 seekDone 回调 ========================
+  // seekDone 回调：进度/时间推进、播放结束自动切歌、错误处理均由 AudioPlayer 中央化处理，
+  // 这里仅负责拖动释放后把实际落点写回进度条并解锁 isSeeking
   private setupPlayerCallbacks(): void {
     const player = AudioPlayer.getInstance()
 
-    player.onTimeUpdate = (time: number) => {
-      if (!this.isSeeking) {
-        PlayerStore.updateTime(time)
-      }
-    }
-
-    player.onDurationUpdate = (dur: number) => {
-      PlayerStore.updateDuration(dur)
-    }
-
-    // 🆕 seekDone：seek 完成后自动解锁，更新进度
-    player.onSeekDone = (seekTime: number) => {
-      this.isSeeking = false
+    this.onSeekDoneBound = (seekTime: number) => {
+      PlayerStore.updateTime(seekTime)
       const dur = this.duration > 0 ? this.duration : player.duration
       if (dur > 0) {
         this.progress = Math.min(seekTime, dur) / dur
+        // 拖动释放后 seekDone 回写实际位置到滑块，避免与拖动值打架
+        this.sliderValue = this.progress
       }
+      this.isSeeking = false
     }
 
-    player.onPlayEnd = () => {
-      const nextTrack = PlayerStore.onTrackEnd()
-      if (nextTrack) {
-        this.playNewTrack(nextTrack)
-      } else {
-        PlayerStore.pause()
-      }
-    }
-
-    player.onError = (error: string) => {
-      PlayerStore.pause()
-      promptAction.showToast({
-        message: error || '播放失败，3秒后自动播放下一首',
-        duration: 3000,
-        bottom: '120vp'
-      })
-      setTimeout(() => {
-        const nextTrack = PlayerStore.next()
-        if (nextTrack) {
-          this.playNewTrack(nextTrack)
-        }
-      }, 3000)
-    }
+    player.addSeekDoneListener(this.onSeekDoneBound)
   }
 
   private async playNewTrack(track: SongInfo): Promise<void> {
+    playLog('播放', `开始播放: ${track.songName} - ${track.artist} source=${track.source}`)
     let playUrl = track.playUrl
     if (!playUrl && track.source !== 'local') {
+      playLog('播放', `开始在线取链 source=${track.source} songId=${track.songId}`)
+      const urlStart: number = Date.now()
       playUrl = await MusicApi.getPlayUrl(track.songId, track.source, track)
+      const urlCost: number = Date.now() - urlStart
+      playLog('播放', `取链完成 source=${track.source} 耗时=${urlCost}ms ${playUrl.length > 0 ? `url=${playUrl.substring(0, 80)}` : '链接为空'}`)
     }
     if (!playUrl) {
-      PlayerStore.pause()
+      const err: string = MusicApi.lastError.length > 0 ? MusicApi.lastError : '未获取到播放链接'
+      playLog('播放', `取链失败，无法播放: ${err}`)
+      // 真正停掉 AVPlayer（PlayerStore.pause 只改 AppStorage 标记，旧歌会继续响）
+      await AudioPlayer.getInstance().pause()
+      promptAction.showToast({ message: `无法播放: ${track.songName}`, duration: 1500 })
       return
     }
     track.playUrl = playUrl
@@ -194,45 +180,50 @@ export struct FullPlayerPage {
     AudioPlayer.getInstance().setCurrentSong(track)
     // 歌词加载与进度重置由 onTrackChanged（@Watch currentTrack）统一处理
     await AudioPlayer.getInstance().play(playUrl)
+    playLog('播放', `播放器已提交 URL，等待就绪 source=${track.source}`)
   }
 
   private async loadLyrics(): Promise<void> {
     if (!this.currentTrack) {
       return
     }
-    // 优先使用本地音乐内嵌歌词
-    if (this.currentTrack.lyric && this.currentTrack.lyric.length > 0) {
-      console.info('[FullPlayerPage] using local embedded lyric, length:', this.currentTrack.lyric.length)
-      const parsed = PlayerStore.parseLrc(this.currentTrack.lyric)
-      if (parsed.length > 0) {
-        const deduped: LyricLine[] = []
-        for (let i = 0; i < parsed.length; i++) {
-          if (i === 0 || parsed[i].text !== parsed[i - 1].text) {
-            deduped.push(parsed[i])
-          }
-        }
-        PlayerStore.setLyrics(deduped, this.currentTrack.lyric)
-        this.currentLyricIndex = 0
+    const cur: SongInfo = this.currentTrack
+    playLog('歌词', `开始获取歌词 songName=${cur.songName} source=${cur.source}`)
+    // 本地音乐：内嵌歌词优先，缺失时按歌名+歌手联网补全（LocalTagEnricher）
+    if (cur.source === 'local') {
+      const localLrc: string = await LocalTagEnricher.ensureLyric(cur)
+      if (localLrc.length > 0) {
+        playLog('歌词', `本地内嵌歌词成功 len=${localLrc.length}`)
+        this.setLyricsFromRaw(localLrc)
         return
       }
     }
-    // 否则走在线获取
+    // 非本地或联网补全仍无歌词：走插件获取
     try {
-      const raw = await MusicApi.getLyrics(this.currentTrack.songId, this.currentTrack.source, this.currentTrack)
+      const raw = await MusicApi.getLyrics(cur.songId, cur.source, cur)
       if (raw && raw.length > 0) {
-        const parsed = PlayerStore.parseLrc(raw)
-        const deduped: LyricLine[] = []
-        for (let i = 0; i < parsed.length; i++) {
-          if (i === 0 || parsed[i].text !== parsed[i - 1].text) {
-            deduped.push(parsed[i])
-          }
-        }
-        PlayerStore.setLyrics(deduped, raw)
-        this.currentLyricIndex = 0
+        playLog('歌词', `插件歌词成功 len=${raw.length}`)
+        this.setLyricsFromRaw(raw)
+      } else {
+        playLog('歌词', '歌词为空（该源可能无歌词数据）')
       }
-    } catch (_e) {
-      console.error('[FullPlayerPage] loadLyrics failed')
+    } catch (e) {
+      console.error('[FullPlayerPage] loadLyrics failed', e)
+      playLog('歌词', `歌词获取异常: ${String(e)}`)
     }
+  }
+
+  /** 解析 LRC 原文并写入播放状态（去重相邻相同行） */
+  private setLyricsFromRaw(raw: string): void {
+    const parsed = PlayerStore.parseLrc(raw)
+    const deduped: LyricLine[] = []
+    for (let i = 0; i < parsed.length; i++) {
+      if (i === 0 || parsed[i].text !== parsed[i - 1].text) {
+        deduped.push(parsed[i])
+      }
+    }
+    PlayerStore.setLyrics(deduped, raw)
+    this.currentLyricIndex = 0
   }
 
   private startProgressTimer(): void {
@@ -240,8 +231,10 @@ export struct FullPlayerPage {
       if (!this.isSeeking) {
         if (this.duration > 0) {
           this.progress = this.currentTime / this.duration
+          this.sliderValue = this.progress
         } else {
           this.progress = 0
+          this.sliderValue = 0
         }
       }
       this.updateCurrentLyricIndex()
@@ -253,8 +246,10 @@ export struct FullPlayerPage {
       this.currentLyricIndex = 0
       return
     }
+    // 拖动进度条时按预览时间（dragTime）定位歌词，释放后由 seekDone 回到真实时间
+    const t: number = this.getDisplayTime()
     for (let i = this.lyrics.length - 1; i >= 0; i--) {
-      if (this.currentTime >= this.lyrics[i].time) {
+      if (t >= this.lyrics[i].time) {
         if (i !== this.currentLyricIndex) {
           this.currentLyricIndex = i
           const midIndex = Math.max(0, i - 4)
@@ -263,6 +258,19 @@ export struct FullPlayerPage {
         break
       }
     }
+  }
+
+  private resolveDisplaySource(track: SongInfo): string {
+    if (track.rawData) {
+      try {
+        const obj: Record<string, Object> = JSON.parse(track.rawData) as Record<string, Object>
+        const platform = obj['__platform']
+        if (typeof platform === 'string' && platform.length > 0) {
+          return platform
+        }
+      } catch (_e) {}
+    }
+    return track.source
   }
 
   private formatTime(seconds: number): string {
@@ -291,36 +299,46 @@ export struct FullPlayerPage {
 
   // ======================== 修复②：doSeek 去掉 setTimeout ========================
   private doSeek(position: number): void {
-    if (position <= 0.001) {
-      return
-    }
+    // 允许拖到开头（position 接近 0 也要能 seek），并钳制到 [0,1]
+    const pos = Math.max(0, Math.min(1, position))
     const player = AudioPlayer.getInstance()
     const dur = this.duration > 0 ? this.duration : player.duration
     if (dur <= 0) {
+      // 无时长信息：仍把界面进度同步到拖动位置并解锁，避免「拖了没反应」；
+      // 播放器侧无时长时 seek 也无法定位，属预期，但要让进度条跟手。
+      console.warn('[doSeek] duration<=0，仅同步进度不 seek, dur=' + dur)
+      this.progress = pos
+      this.isSeeking = false
       return
     }
 
-    const time = position * dur
+    const time = pos * dur
     this.isSeeking = true
-    this.progress = position
+    this.progress = pos
+    this.sliderValue = pos
     this.dragTime = time
-    // ✅ seekDone 回调会自动解锁 isSeeking，不需要 setTimeout
-    player.seekTo(time)
+    // seekDone 回调会自动解锁 isSeeking；但播放器未 prepared 时 seekDone 不会触发，
+    // 加超时兜底防止进度条永久锁定
+    player.seekTo(time).catch(() => {
+    })
     this.updateCurrentLyricIndex()
+    setTimeout(() => {
+      if (this.isSeeking) {
+        PlayerStore.updateTime(time)
+        this.sliderValue = pos
+        this.progress = pos
+        this.isSeeking = false
+      }
+    }, 1500)
   }
 
   private async handlePrevious(): Promise<void> {
-    const track = PlayerStore.previous()
-    if (track) {
-      await this.playNewTrack(track)
-    }
+    // 统一走 AudioPlayer 切歌：带取链失败自动跳下一首、防抖（代际）与真实暂停
+    await AudioPlayer.getInstance().playPrevious()
   }
 
   private async handleNext(): Promise<void> {
-    const track = PlayerStore.next()
-    if (track) {
-      await this.playNewTrack(track)
-    }
+    await AudioPlayer.getInstance().playNext()
   }
 
   private async saveProgress(): Promise<void> {
@@ -364,6 +382,7 @@ export struct FullPlayerPage {
     PlayerStore.updateTime(line.time)
     this.currentLyricIndex = this.lyrics.indexOf(line)
     this.progress = this.duration > 0 ? line.time / this.duration : 0
+    this.sliderValue = this.progress
     if (!this.isPlaying) {
       await player.resume()
       PlayerStore.resume()
@@ -513,7 +532,7 @@ export struct FullPlayerPage {
       PlayerStore.setQueue([])
       PlayerStore.pause()
       AppStorage.setOrCreate(PlayerKeys.CURRENT_TRACK, null)
-      this.showQueuePopup = false
+      this.showListSheet = false
       return
     }
 
@@ -537,12 +556,59 @@ export struct FullPlayerPage {
     AppStorage.setOrCreate(PlayerKeys.QUEUE_INDEX, newIndex)
   }
 
+  // 播放列表弹窗内点击歌曲：切到该队列位置并播放
+  private playTrackInQueue(index: number): void {
+    if (index < 0 || index >= this.queue.length) {
+      return
+    }
+    AppStorage.setOrCreate(PlayerKeys.QUEUE_INDEX, index)
+    const track = this.queue[index]
+    if (track) {
+      this.playNewTrack(track)
+    }
+  }
+
   // 🆕 获取显示时间：拖动时显示预览时间，释放后显示实际时间
   private getDisplayTime(): number {
     if (this.isSeeking) {
       return this.dragTime
     }
     return this.currentTime
+  }
+
+  /**
+   * 播放页圆形图标按钮（统一沉浸光感）：
+   * 去掉原 1px themeTextPrimary 黑色描边与不透明卡片底（沉浸材质被不透明底盖住等于白涂），
+   * 改为透明底 + 系统沉浸材质（API 26+），低版本用 backgroundEffect 模拟沉浸光感。
+   */
+  @Builder
+  PlayerIconButton(icon: Resource, iconSize: number, btnSize: number, click: () => void) {
+    Row() {
+      SymbolGlyph(icon).fontSize(iconSize).fontColor([this.themeTextPrimary])
+    }
+    .width(btnSize)
+    .height(btnSize)
+    .borderRadius(btnSize / 2)
+    .backgroundColor(Color.Transparent)
+    .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN) : undefined)
+    .backgroundEffect(this.supportImmersive ? undefined : MaterialCompat.effect(this.isDarkMode, this.themeCardBg, MaterialCompatStyle.THIN))
+    .visualEffect(new hdsEffect.HdsEffectBuilder()
+      .pressShadow(hdsEffect.PressShadowType.BLEND_WHITE)
+      .pointLight({
+        sourceType: hdsEffect.PointLightSourceType.SOFT,
+        illuminatedType: hdsEffect.PointLightIlluminatedType.BORDER_CONTENT,
+        options: {
+          color: this.themePrimary,
+          intensity: 0.6,
+          height: 60,
+          bloom: 0.3
+        }
+      })
+      .buildEffect())
+    .justifyContent(FlexAlign.Center)
+    .onClick(() => {
+      click()
+    })
   }
 
   @Builder
@@ -599,95 +665,16 @@ export struct FullPlayerPage {
 
       Column() {
         Row() {
-          if (this.supportImmersive) {
-            Row() {
-              SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(18)
-                .fontColor([this.themeTextPrimary])
-            }
-            .width(32).height(32)
-            .borderRadius(16)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => {
-              this.doBack()
-            })
-          } else {
-            Row() {
-              SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(18)
-                .fontColor([this.themeTextPrimary])
-            }
-            .width(32).height(32)
-            .borderRadius(16)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .blur(8)
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => {
-              this.doBack()
-            })
-          }
+          this.PlayerIconButton($r('sys.symbol.chevron_down'), 18, 32, () => {
+            this.doBack()
+          })
 
           Blank().layoutWeight(1)
 
-          if (this.supportImmersive) {
-            Row() {
-              SymbolGlyph($r('sys.symbol.list_bullet'))
-                .fontSize(18)
-                .fontColor([this.themeTextPrimary])
-            }
-            .width(32)
-            .height(32)
-            .borderRadius(16)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => {
-              this.showQueuePopup = true
-            })
-            .bindPopup(this.showQueuePopup, {
-              builder: this.QueuePopupBuilder(),
-              placement: Placement.Bottom,
-              width: '85%',
-              systemMaterial: MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN),
-              onStateChange: (e: PopupStateChangeParam) => {
-                if (!e.isVisible) {
-                  this.showQueuePopup = false
-                }
-              }
-            })
-          } else {
-            Row() {
-              SymbolGlyph($r('sys.symbol.list_bullet'))
-                .fontSize(18)
-                .fontColor([this.themeTextPrimary])
-            }
-            .width(32)
-            .height(32)
-            .borderRadius(16)
-            .border({ width: 1, color: this.themeTextPrimary })
-            .backgroundColor(this.themeCardBg)
-            .blur(8)
-            .justifyContent(FlexAlign.Center)
-            .onClick(() => {
-              this.showQueuePopup = true
-            })
-            .bindPopup(this.showQueuePopup, {
-              builder: this.QueuePopupBuilder(),
-              placement: Placement.Bottom,
-              width: '85%',
-              systemMaterial: MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN),
-              onStateChange: (e: PopupStateChangeParam) => {
-                if (!e.isVisible) {
-                  this.showQueuePopup = false
-                }
-              }
-            })
-          }
+          // 右上角：更多（从底部弹窗，复用统一沉浸光感图标按钮）
+          this.PlayerIconButton($r('sys.symbol.ellipsis_circle'), 18, 32, () => {
+            this.showMoreSheet = true
+          })
         }
         .width('100%')
         .padding({
@@ -752,7 +739,7 @@ export struct FullPlayerPage {
         Column() {
           Column({ space: 4 }) {
             Slider({
-              value: this.progress,
+              value: this.sliderValue,
               min: 0,
               max: 1,
               step: 0.001,
@@ -767,14 +754,18 @@ export struct FullPlayerPage {
                 switch (mode) {
                   case SliderChangeMode.Begin:
                     this.isSeeking = true
-                    this.dragTime = this.currentTime // 锁定当前时间
+                    this.dragTime = this.currentTime
                     break
-                  case SliderChangeMode.Moving:
-                    // ✅ 只更新 UI，不写全局状态
-                    this.progress = value
+                  case SliderChangeMode.Moving: {
+                    this.isSeeking = true
                     const dur = this.duration > 0 ? this.duration : AudioPlayer.getInstance().duration
+                    // 拖动时只更新滑块位置，不写 progress，避免与 playback 定时器互相覆盖
+                    this.sliderValue = value
+                    this.progress = value
                     this.dragTime = value * dur
+                    this.updateCurrentLyricIndex()
                     break
+                  }
                   case SliderChangeMode.Click:
                   case SliderChangeMode.End:
                     this.doSeek(value)
@@ -813,14 +804,14 @@ export struct FullPlayerPage {
         .bindSheet($$this.showListSheet, this.PlaylistSheetContent(), {
           height: SheetSize.MEDIUM,
           dragBar: true,
-          showClose: true,
+          showClose: false,
           systemMaterial: MaterialCompat.immersiveMaterial(MaterialCompatStyle.THICK)
         })
       Row().width(1).height(1)
         .bindSheet($$this.showMoreSheet, this.MoreSheetContent(), {
           height: SheetSize.FIT_CONTENT,
           dragBar: true,
-          showClose: true,
+          showClose: false,
           systemMaterial: MaterialCompat.immersiveMaterial(MaterialCompatStyle.THICK)
         })
       Row().width(1).height(1)
@@ -862,10 +853,10 @@ export struct FullPlayerPage {
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
           if (this.currentTrack && this.currentTrack.source && this.currentTrack.source.length > 0) {
-            Text(SourceInfo.getAbbr(this.currentTrack.source))
+            Text(SourceInfo.getAbbr(this.resolveDisplaySource(this.currentTrack)))
               .fontSize(11)
               .fontColor(Color.White)
-              .backgroundColor(SourceInfo.getColor(this.currentTrack.source))
+              .backgroundColor(SourceInfo.getColor(this.resolveDisplaySource(this.currentTrack)))
               .borderRadius(4)
               .padding({ left: 5, right: 5, top: 2, bottom: 2 })
               .maxLines(1)
@@ -1060,159 +1051,25 @@ export struct FullPlayerPage {
   @Builder
   ControlBar() {
     Column() {
-      Divider().width('90%').height(0.5).color(this.themeDivider).margin({ bottom: 12 })
-
       Row() {
-        // 播放模式
-        if (this.supportImmersive) {
-          Row() {
-            SymbolGlyph(this.getPlayModeIconLocal()).fontSize(16).fontColor([this.themeTextPrimary])
-          }
-          .width(36).height(36)
-          .borderRadius(18)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            this.togglePlayMode()
-            promptAction.showToast({ message: this.getPlayModeLabelLocal(), duration: 1500 })
-          })
-        } else {
-          Row() {
-            SymbolGlyph(this.getPlayModeIconLocal()).fontSize(16).fontColor([this.themeTextPrimary])
-          }
-          .width(36).height(36)
-          .borderRadius(18)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .blur(8)
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            this.togglePlayMode()
-            promptAction.showToast({ message: this.getPlayModeLabelLocal(), duration: 1500 })
-          })
-        }
+        // 播放模式（直接内联构建：@Builder 参数不响应 @State 变化，会导致图标不更新）
+        this.PlayModeButton()
 
         // 上一首
-        if (this.supportImmersive) {
-          Row() {
-            SymbolGlyph($r('sys.symbol.backward_end_fill')).fontSize(18).fontColor([this.themeTextPrimary])
-          }
-          .width(36).height(36)
-          .borderRadius(18)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            this.handlePrevious()
-          })
-        } else {
-          Row() {
-            SymbolGlyph($r('sys.symbol.backward_end_fill')).fontSize(18).fontColor([this.themeTextPrimary])
-          }
-          .width(36).height(36)
-          .borderRadius(18)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .blur(8)
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            this.handlePrevious()
-          })
-        }
+        this.PlayerIconButton($r('sys.symbol.backward_end_fill'), 18, 36, () => {
+          this.handlePrevious()
+        })
 
-        // 播放/暂停（中间，更大）
-        if (this.supportImmersive) {
-          Row() {
-            SymbolGlyph(this.isPlaying ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'))
-              .fontSize(24).fontColor([this.themeTextPrimary])
-          }
-          .width(52)
-          .height(52)
-          .borderRadius(26)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            this.togglePlayPause()
-          })
-        } else {
-          Row() {
-            SymbolGlyph(this.isPlaying ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'))
-              .fontSize(24).fontColor([this.themeTextPrimary])
-          }
-          .width(52)
-          .height(52)
-          .borderRadius(26)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .blur(8)
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            this.togglePlayPause()
-          })
-        }
+        // 播放/暂停（中间，更大，图标在 @Builder 内部读取 isPlaying）
+        this.PlayPauseButton()
 
         // 下一首
-        if (this.supportImmersive) {
-          Row() {
-            SymbolGlyph($r('sys.symbol.forward_end_fill')).fontSize(18).fontColor([this.themeTextPrimary])
-          }
-          .width(36).height(36)
-          .borderRadius(18)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            this.handleNext()
-          })
-        } else {
-          Row() {
-            SymbolGlyph($r('sys.symbol.forward_end_fill')).fontSize(18).fontColor([this.themeTextPrimary])
-          }
-          .width(36).height(36)
-          .borderRadius(18)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .blur(8)
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            this.handleNext()
-          })
-        }
+        this.PlayerIconButton($r('sys.symbol.forward_end_fill'), 18, 36, () => {
+          this.handleNext()
+        })
 
-        // 更多
-        if (this.supportImmersive) {
-          Row() {
-            SymbolGlyph($r('sys.symbol.ellipsis_circle')).fontSize(16).fontColor([this.themeTextPrimary])
-          }
-          .width(36).height(36)
-          .borderRadius(18)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            this.showMoreSheet = true
-          })
-        } else {
-          Row() {
-            SymbolGlyph($r('sys.symbol.ellipsis_circle')).fontSize(16).fontColor([this.themeTextPrimary])
-          }
-          .width(36).height(36)
-          .borderRadius(18)
-          .border({ width: 1, color: this.themeTextPrimary })
-          .backgroundColor(this.themeCardBg)
-          .blur(8)
-          .justifyContent(FlexAlign.Center)
-          .onClick(() => {
-            this.showMoreSheet = true
-          })
-        }
+        // 播放列表（右下角，yylb 图标，从底部弹窗弹出，沉浸光感）
+        this.QueueIconButton()
       }
       .width('100%')
       .justifyContent(FlexAlign.SpaceEvenly)
@@ -1224,10 +1081,115 @@ export struct FullPlayerPage {
   }
 
   @Builder
+  PlayPauseButton() {
+    Row() {
+      // 图标选择写在 @Builder 内部，确保 isPlaying 变化时重新渲染（参数传入不响应 @State）
+      SymbolGlyph(this.isPlaying ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'))
+        .fontSize(24)
+        .fontColor([this.themeTextPrimary])
+    }
+    .width(52)
+    .height(52)
+    .borderRadius(26)
+    .backgroundColor(Color.Transparent)
+    .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN) : undefined)
+    .backgroundEffect(this.supportImmersive ? undefined : MaterialCompat.effect(this.isDarkMode, this.themeCardBg, MaterialCompatStyle.THIN))
+    .visualEffect(new hdsEffect.HdsEffectBuilder()
+      .pressShadow(hdsEffect.PressShadowType.BLEND_WHITE)
+      .pointLight({
+        sourceType: hdsEffect.PointLightSourceType.SOFT,
+        illuminatedType: hdsEffect.PointLightIlluminatedType.BORDER_CONTENT,
+        options: {
+          color: this.themePrimary,
+          intensity: 0.6,
+          height: 60,
+          bloom: 0.3
+        }
+      })
+      .buildEffect())
+    .justifyContent(FlexAlign.Center)
+    .onClick(() => {
+      this.togglePlayPause()
+    })
+  }
+
+  // 播放模式按钮：图标/状态读取写在 @Builder 内部，确保 @State 变化时重新渲染
+  @Builder
+  PlayModeButton() {
+    Row() {
+      SymbolGlyph(this.getPlayModeIconLocal())
+        .fontSize(16)
+        .fontColor([this.themeTextPrimary])
+    }
+    .width(36)
+    .height(36)
+    .borderRadius(18)
+    .backgroundColor(Color.Transparent)
+    .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN) : undefined)
+    .backgroundEffect(this.supportImmersive ? undefined : MaterialCompat.effect(this.isDarkMode, this.themeCardBg, MaterialCompatStyle.THIN))
+    .visualEffect(new hdsEffect.HdsEffectBuilder()
+      .pressShadow(hdsEffect.PressShadowType.BLEND_WHITE)
+      .pointLight({
+        sourceType: hdsEffect.PointLightSourceType.SOFT,
+        illuminatedType: hdsEffect.PointLightIlluminatedType.BORDER_CONTENT,
+        options: {
+          color: this.themePrimary,
+          intensity: 0.6,
+          height: 60,
+          bloom: 0.3
+        }
+      })
+      .buildEffect())
+    .justifyContent(FlexAlign.Center)
+    .onClick(() => {
+      this.togglePlayMode()
+      promptAction.showToast({ message: this.getPlayModeLabelLocal(), duration: 1500 })
+    })
+  }
+
+  // 播放列表按钮（yylb 图标，与其它控制按钮统一沉浸光感）
+  @Builder
+  QueueIconButton() {
+    Row() {
+      Image($rawfile('yylb.svg'))
+        .width(18)
+        .height(18)
+        .objectFit(ImageFit.Contain)
+        .fillColor(this.themeTextPrimary)
+    }
+    .width(36)
+    .height(36)
+    .borderRadius(18)
+    .backgroundColor(Color.Transparent)
+    .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN) : undefined)
+    .backgroundEffect(this.supportImmersive ? undefined : MaterialCompat.effect(this.isDarkMode, this.themeCardBg, MaterialCompatStyle.THIN))
+    .visualEffect(new hdsEffect.HdsEffectBuilder()
+      .pressShadow(hdsEffect.PressShadowType.BLEND_WHITE)
+      .pointLight({
+        sourceType: hdsEffect.PointLightSourceType.SOFT,
+        illuminatedType: hdsEffect.PointLightIlluminatedType.BORDER_CONTENT,
+        options: {
+          color: this.themePrimary,
+          intensity: 0.6,
+          height: 60,
+          bloom: 0.3
+        }
+      })
+      .buildEffect())
+    .justifyContent(FlexAlign.Center)
+    .onClick(() => {
+      this.showListSheet = true
+    })
+  }
+
+  @Builder
   PlaylistSheetContent() {
     Column() {
       Row() {
-        Text('播放列表').fontSize(18).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Bold)
+        Text(`播放列表(${this.queue.length})`)
+          .fontSize(18)
+          .fontColor(this.themeTextPrimary)
+          .fontWeight(FontWeight.Bold)
         Blank().layoutWeight(1)
         Text(this.getPlayModeLabelLocal())
           .fontSize(12)
@@ -1255,13 +1217,20 @@ export struct FullPlayerPage {
 
       Scroll() {
         Column({ space: 0 }) {
-          ForEach(PlayerStore.getQueue(), (track: SongInfo, index?: number) => {
+          ForEach(this.queue, (track: SongInfo, index?: number) => {
             Row({ space: 10 }) {
-              Text(`${(index ?? 0) + 1}`)
-                .fontSize(13)
-                .fontColor(this.themeTextSecondary)
-                .width(24)
-                .textAlign(TextAlign.Center)
+              if ((index ?? 0) === this.queueIndex) {
+                SymbolGlyph($r('sys.symbol.waveform'))
+                  .fontSize(16)
+                  .fontColor([this.themePrimary])
+                  .width(24)
+              } else {
+                Text(`${(index ?? 0) + 1}`)
+                  .fontSize(13)
+                  .fontColor(this.themeTextSecondary)
+                  .width(24)
+                  .textAlign(TextAlign.Center)
+              }
               CoverImage({
                 url: track.coverUrl,
                 coverWidth: 40,
@@ -1271,7 +1240,7 @@ export struct FullPlayerPage {
               Column({ space: 2 }) {
                 Text(track.songName)
                   .fontSize(14)
-                  .fontColor(this.themeTextPrimary)
+                  .fontColor((index ?? 0) === this.queueIndex ? this.themePrimary : this.themeTextPrimary)
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
                 Text(track.artist)
@@ -1280,15 +1249,33 @@ export struct FullPlayerPage {
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
               }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+
+              Row() {
+                SymbolGlyph($r('sys.symbol.xmark'))
+                  .fontSize(14)
+                  .fontColor([this.themeTextSecondary])
+              }
+              .width(28)
+              .height(28)
+              .justifyContent(FlexAlign.Center)
+              .onClick(() => {
+                this.removeFromQueue(index ?? 0)
+              })
             }
             .width('100%')
             .padding({
               left: 24,
-              right: 24,
+              right: 12,
               top: 8,
               bottom: 8
             })
-          })
+            .onClick(() => {
+              const idx = index ?? 0
+              if (idx !== this.queueIndex) {
+                this.playTrackInQueue(idx)
+              }
+            })
+          }, (track: SongInfo, index?: number) => `${track.songId}_${track.source}_${index ?? 0}`)
         }
         .width('100%')
       }.layoutWeight(1).scrollBar(BarState.Auto).edgeEffect(EdgeEffect.Spring)
@@ -1298,28 +1285,28 @@ export struct FullPlayerPage {
   @Builder
   MoreSheetContent() {
     Column({ space: 0 }) {
-      MoreSheetRow($r('sys.symbol.plus'), '添至歌单', () => {
+      this.MoreSheetRow($r('sys.symbol.plus'), '添至歌单', () => {
         this.showPlaylistSheet()
       })
       Divider().width('100%').color(this.themeDivider).margin({ left: 24, right: 24 })
-      MoreSheetRow($r('sys.symbol.text_alignleft'), '歌词排列', () => {
+      this.MoreSheetRow($r('sys.symbol.text_alignleft'), '歌词排列', () => {
         this.showMoreSheet = false;
         this.showLyricsAlignPicker = true
       })
       Divider().width('100%').color(this.themeDivider).margin({ left: 24, right: 24 })
-      MoreSheetToggleRow('组件隐藏', this.autoHideControls, (v) => {
+      this.MoreSheetToggleRow('组件隐藏', this.autoHideControls, (v: boolean) => {
         if (v !== this.autoHideControls) {
           this.toggleAutoHideControls()
         }
       })
       Divider().width('100%').color(this.themeDivider).margin({ left: 24, right: 24 })
-      MoreSheetToggleRow('背景取色', this.bgColorEnabled, (v) => {
+      this.MoreSheetToggleRow('背景取色', this.bgColorEnabled, (v: boolean) => {
         if (v !== this.bgColorEnabled) {
           this.toggleBgColor()
         }
       })
       Divider().width('100%').color(this.themeDivider).margin({ left: 24, right: 24 })
-      MoreSheetRow($r('sys.symbol.share'), '分享歌曲', () => {
+      this.MoreSheetRow($r('sys.symbol.share'), '分享歌曲', () => {
         this.shareSong()
       }, true)
     }.width('100%')
@@ -1390,115 +1377,25 @@ export struct FullPlayerPage {
           top: 16,
           bottom: 12
         })
-      AlignRow('左对齐', $r('sys.symbol.text_alignleft'), this.lyricsAlign === 'left', () => {
+      this.AlignRow('左对齐', $r('sys.symbol.text_alignleft'), this.lyricsAlign === 'left', () => {
         this.setLyricsAlign('left')
       })
       Divider().width('100%').color(this.themeDivider).margin({ left: 24, right: 24 })
-      AlignRow('居中（默认）', $r('sys.symbol.text_aligncenter'), this.lyricsAlign === 'center', () => {
+      this.AlignRow('居中（默认）', $r('sys.symbol.text_aligncenter'), this.lyricsAlign === 'center', () => {
         this.setLyricsAlign('center')
       })
       Divider().width('100%').color(this.themeDivider).margin({ left: 24, right: 24 })
-      AlignRow('右对齐', $r('sys.symbol.text_alignright'), this.lyricsAlign === 'right', () => {
+      this.AlignRow('右对齐', $r('sys.symbol.text_alignright'), this.lyricsAlign === 'right', () => {
         this.setLyricsAlign('right')
       })
       Column().height(16)
     }
   }
 
-  @Builder
-  QueuePopupBuilder() {
-    Column() {
-      Row() {
-        Text('播放列表').fontSize(16).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Bold)
-        Blank().layoutWeight(1)
-        Row() {
-          SymbolGlyph($r('sys.symbol.xmark')).fontSize(18).fontColor([this.themeTextSecondary])
-        }.width(32).height(32).justifyContent(FlexAlign.Center).onClick(() => {
-          this.showQueuePopup = false
-        })
-      }
-      .width('100%')
-      .padding({
-        left: 16,
-        right: 16,
-        top: 12,
-        bottom: 12
-      })
-
-      Divider().width('100%').color(this.themeDivider)
-
-      if (this.queue.length === 0) {
-        Column() {
-          Text('暂无歌曲').fontSize(14).fontColor(this.themeTextSecondary)
-        }
-        .width('100%').height(120).justifyContent(FlexAlign.Center)
-      } else {
-        List() {
-          ForEach(this.queue, (track: SongInfo, index?: number) => {
-            ListItem() {
-              Row({ space: 10 }) {
-                if ((index ?? 0) === this.queueIndex) {
-                  SymbolGlyph($r('sys.symbol.waveform')).fontSize(18).fontColor([this.themePrimary]).width(24)
-                } else {
-                  Text(`${(index ?? 0) + 1}`)
-                    .fontSize(13)
-                    .fontColor(this.themeTextSecondary)
-                    .width(24)
-                    .textAlign(TextAlign.Center)
-                }
-                CoverImage({
-                  url: track.coverUrl,
-                  coverWidth: 40,
-                  coverHeight: 40,
-                  radius: 6
-                })
-                Column({ space: 2 }) {
-                  Text(track.songName)
-                    .fontSize(14)
-                    .fontColor((index ?? 0) === this.queueIndex ? this.themePrimary : this.themeTextPrimary)
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  Text(track.artist)
-                    .fontSize(11)
-                    .fontColor(this.themeTextSecondary)
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-
-                Row() {
-                  SymbolGlyph($r('sys.symbol.xmark')).fontSize(16).fontColor([this.themeTextSecondary])
-                }.width(32).height(32).justifyContent(FlexAlign.Center).onClick(() => {
-                  this.removeFromQueue(index ?? 0)
-                })
-              }
-              .width('100%')
-              .padding({
-                left: 16,
-                right: 8,
-                top: 8,
-                bottom: 8
-              })
-            }.onClick(() => {
-              const idx = index ?? 0
-              if (idx !== this.queueIndex) {
-                AppStorage.setOrCreate(PlayerKeys.QUEUE_INDEX, idx)
-                const track = this.queue[idx]
-                if (track) {
-                  this.playNewTrack(track)
-                }
-              }
-            })
-          })
-        }.width('100%').height(320).scrollBar(BarState.Auto).edgeEffect(EdgeEffect.Spring)
-      }
-    }.width('100%').backgroundColor(this.themeCardBg).borderRadius(12).shadow({ radius: 16, color: '#00000020', offsetY: 4 })
-  }
-}
-
 // ================== 通用 Builder 函数（复用 MoreSheet 里的行） ==================
 
 @Builder
-function MoreSheetRow(icon: Resource, text: string, onClick: () => void, last?: boolean) {
+MoreSheetRow(icon: Resource, text: string, onClick: () => void, last?: boolean) {
   Row({ space: 12 }) {
     SymbolGlyph(icon).fontSize(20).fontColor([$r('sys.color.ohos_id_color_primary')])
     Text(text).fontSize(16).fontColor($r('sys.color.ohos_id_color_text_primary')).layoutWeight(1)
@@ -1516,7 +1413,7 @@ function MoreSheetRow(icon: Resource, text: string, onClick: () => void, last?: 
 }
 
 @Builder
-function MoreSheetToggleRow(text: string, isOn: boolean, onChange: (v: boolean) => void) {
+MoreSheetToggleRow(text: string, isOn: boolean, onChange: (v: boolean) => void) {
   Row({ space: 12 }) {
     SymbolGlyph($r('sys.symbol.eye')).fontSize(20).fontColor([$r('sys.color.ohos_id_color_primary')])
     Text(text).fontSize(16).fontColor($r('sys.color.ohos_id_color_text_primary')).layoutWeight(1)
@@ -1536,7 +1433,7 @@ function MoreSheetToggleRow(text: string, isOn: boolean, onChange: (v: boolean) 
 }
 
 @Builder
-function AlignRow(text: string, icon: Resource, selected: boolean, onClick: () => void) {
+AlignRow(text: string, icon: Resource, selected: boolean, onClick: () => void) {
   Row({ space: 12 }) {
     SymbolGlyph(icon)
       .fontSize(20)
@@ -1560,4 +1457,5 @@ function AlignRow(text: string, icon: Resource, selected: boolean, onClick: () =
   .onClick(() => {
     onClick()
   })
+}
 }

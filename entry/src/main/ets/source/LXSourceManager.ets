@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 音源脚本文件管理器
  * 负责 JS 插件脚本的导入、存储、加载和删除
  * 适配自 123 项目 LXSourceManager
@@ -205,6 +205,7 @@ class LXSourceManager {
     };
     this.saveScript(apiId, scriptRaw);
     let list: LXUserApiInfo[] = this.getApiList();
+    list = list.filter((item: LXUserApiInfo) => item.name !== apiInfo.name);
     list.push(apiInfo);
     this.apiList = list;
     this.saveApiListToFile();
@@ -287,7 +288,7 @@ class LXSourceManager {
     }
     // 兼容：按名称匹配（音源管理传入的是插件名）
     if (apiInfo === undefined) {
-      for (let i: number = 0; i < list.length; i++) {
+      for (let i: number = list.length - 1; i >= 0; i--) {
         if (list[i].name === apiId) {
           apiInfo = list[i];
           break;

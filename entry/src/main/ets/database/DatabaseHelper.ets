@@ -36,6 +36,7 @@ const SQL_CREATE_FAVORITES = `
     coverUrl TEXT DEFAULT '',
     source TEXT DEFAULT 'kg',
     playUrl TEXT DEFAULT '',
+    rawData TEXT DEFAULT '',
     createdAt INTEGER NOT NULL
   )
 `
@@ -62,6 +63,7 @@ const SQL_CREATE_PLAYLIST_SONGS = `
     coverUrl TEXT DEFAULT '',
     source TEXT DEFAULT 'kg',
     playUrl TEXT DEFAULT '',
+    rawData TEXT DEFAULT '',
     createdAt INTEGER NOT NULL,
     FOREIGN KEY (playlistId) REFERENCES playlist(id) ON DELETE CASCADE
   )
@@ -152,6 +154,14 @@ export class DatabaseHelper {
       await this.store.executeSql("ALTER TABLE playlist ADD COLUMN sortOrder INTEGER DEFAULT 0")
     } catch (_e) {
     }
+    try {
+      await this.store.executeSql("ALTER TABLE playlist_song ADD COLUMN rawData TEXT DEFAULT ''")
+    } catch (_e) {
+    }
+    try {
+      await this.store.executeSql("ALTER TABLE favorite ADD COLUMN rawData TEXT DEFAULT ''")
+    } catch (_e) {
+    }
   }
 
   // ===== 收藏 CRUD =====
@@ -178,6 +188,7 @@ export class DatabaseHelper {
         'coverUrl': song.coverUrl,
         'source': song.source,
         'playUrl': song.playUrl,
+        'rawData': song.rawData || '',
         'createdAt': Date.now(),
       }
       await this.store.insert('favorite', valueBucket)
@@ -204,6 +215,7 @@ export class DatabaseHelper {
           coverUrl: cursor.getString(cursor.getColumnIndex('coverUrl')),
           source: cursor.getString(cursor.getColumnIndex('source')),
           playUrl: cursor.getString(cursor.getColumnIndex('playUrl')),
+          rawData: cursor.getString(cursor.getColumnIndex('rawData')) || undefined,
         })
       }
       cursor.close()
@@ -348,6 +360,7 @@ export class DatabaseHelper {
         'coverUrl': song.coverUrl,
         'source': song.source,
         'playUrl': song.playUrl,
+        'rawData': song.rawData || '',
         'createdAt': Date.now(),
       }
       await this.store.insert('playlist_song', valueBucket)
@@ -379,6 +392,7 @@ export class DatabaseHelper {
           coverUrl: cursor.getString(cursor.getColumnIndex('coverUrl')),
           source: cursor.getString(cursor.getColumnIndex('source')),
           playUrl: cursor.getString(cursor.getColumnIndex('playUrl')),
+          rawData: cursor.getString(cursor.getColumnIndex('rawData')) || undefined,
           addedAt: cursor.getLong(cursor.getColumnIndex('createdAt')),
         })
       }
@@ -622,6 +636,22 @@ export class DatabaseHelper {
       await this.store.update(valueBucket, predicates)
     } catch (e) {
       console.error('[DB] updateLocalMusic failed:', e)
+    }
+  }
+
+  // 网络补全专用：只更新封面与歌词，不改歌名/歌手/播放路径等本地解析结果
+  async updateLocalMusicMeta(filePath: string, coverUrl: string, lyric: string): Promise<void> {
+    if (!this.store) return
+    try {
+      const valueBucket: relationalStore.ValuesBucket = {
+        'coverUrl': coverUrl,
+        'lyric': lyric,
+      }
+      const predicates = new relationalStore.RdbPredicates('local_music')
+      predicates.equalTo('filePath', filePath)
+      await this.store.update(valueBucket, predicates)
+    } catch (e) {
+      console.error('[DB] updateLocalMusicMeta failed:', e)
     }
   }
 

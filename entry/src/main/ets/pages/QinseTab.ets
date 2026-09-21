@@ -1,23 +1,25 @@
 // SHMY 搜索 Tab - 搜索与播放
-// QinseTab.ets - V1.0.8.4 搜索记忆+历史
+// QinseTab.ets - V1.1.1 常驻搜索 Tab：搜索栏内嵌联想面板 + 筛选下拉（自动检测音源）
 import { SongInfo, SourceStatus, SourceInfo } from '../model/MusicModel'
 import { DatabaseHelper } from '../database/DatabaseHelper'
 import { AudioPlayer } from '../utils/AudioPlayer'
 import { MusicApi } from '../utils/MusicApi'
 import { PlayerStore } from '../utils/PlayerStore'
 import { SongCard } from '../components/SongCard'
-import { SearchBar } from '../components/SearchBar'
-import { SourceManager } from '../utils/SourceManager'
-import { SelfHostedApi } from '../utils/SelfHostedApi'
 
 import { SongActionSheet } from '../components/SongActionSheet'
 import { promptAction } from '@kit.ArkUI'
 import { CompatUtils } from '../utils/CompatUtils'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
 
-interface SourceOption {
-  label: string
+interface SearchSuggestion {
+  text: string
+  fromHistory: boolean
+}
+
+interface FilterMenuItem {
   value: string
+  action: () => void
 }
 
 @Component
@@ -31,12 +33,17 @@ export struct QinseTab {
   @StorageProp('theme_bgImageName') themeBgImageName: string = ''
   @StorageProp('isDarkMode') isDarkMode: boolean = false
 
+  // 返回回调：切回推荐页（由 Index 注入）
+  onBack: () => void = () => {}
+
   @State keyword: string = ''
   @State selectedSource: string = 'all'
   @State searchResults: SongInfo[] = []
   @State isLoading: boolean = false
   @State isSearched: boolean = false
   @State searchError: string = ''
+  // 筛选：从当前结果中自动检测可用音源
+  @State sourceFilter: string = 'all'
 
   // Action sheet
   @State selectedSong: SongInfo | null = null
@@ -47,13 +54,23 @@ export struct QinseTab {
   @State searchMemoryEnabled: boolean = true
   // 搜索常驻（设置-版块设置-搜索）
   @State searchPersist: boolean = false
+  // 搜索联想词开关（设置-版块设置-搜索）
+  @State searchSuggestEnabled: boolean = true
+
+  // 搜索联想词面板（内嵌于搜索栏下方）
+  @State suggestions: SearchSuggestion[] = []
+  @State showSuggestPanel: boolean = false
+  private suggestTimer: number = -1
+  private suggestGen: number = 0
+
+  // 搜索 Tab 可见信号（Index 切换到搜索 Tab 时写入时间戳）
+  @StorageProp('qinseTabVisible') @Watch('onTabVisibleSignal') tabVisibleSignal: number = 0
 
   // 搜索防抖定时器
   private searchTimer: number = -1
 
-  // Source dropdown
-  @State showSourceDropdown: boolean = false
-  @State sourceOptions: SourceOption[] = []
+  // 结果列表滚动器
+  private scroller: Scroller = new Scroller()
 
   // 下拉刷新状态
   @State isRefreshing: boolean = false
@@ -61,7 +78,6 @@ export struct QinseTab {
   @State pullStartY: number = -1
   @State showPullIndicator: boolean = false
   private pullThreshold: number = 50
-  private scroller: Scroller = new Scroller()
   // 自检结果弹窗（底部，与“播放失败”同一位置，沉浸光感）
   @State resultPillText: string = ''
   @State resultPillVisible: boolean = false
@@ -70,104 +86,56 @@ export struct QinseTab {
   @State refreshSummary: string = ''
   @State refreshSummaryVisible: boolean = false
 
-  // 搜索页悬浮球（设置-版块设置-搜索 控制）
-  @StorageProp('searchFloatingBall') searchFloatingBall: boolean = true
-  @StorageProp('searchFloatingBallLeft') searchFloatingBallLeft: boolean = false
-  // 悬浮球菜单状态 + 来源筛选
-  @State showBallMenu: boolean = false
-  @State sourceFilter: string = 'all'
-
-  // 搜索模式标记
-  @State apiModeLabel: string = ''
-  // 监听自建 API 开关变化（插件源互斥关闭自建 API 后实时刷新标签）
-  @StorageProp('useSelfHostedApi') @Watch('onSelfHostedModeChange') useSelfHostedApi: boolean = false
-
   private db: DatabaseHelper = DatabaseHelper.getInstance()
   private supportImmersive: boolean = CompatUtils.isImmersiveSupported()
 
-  // 自建 API 开关变化（插件源互斥关闭自建 API 后）实时刷新搜索模式标签
-  onSelfHostedModeChange(): void {
-    this.apiModeLabel = this.useSelfHostedApi ? '自建API' : 'JS源'
-  }
-
   async aboutToAppear() {
-    this.apiModeLabel = MusicApi.isSelfHostedMode() ? '自建API' : 'JS源'
-    // 读取搜索常驻 / 搜索记忆开关
+    // 读取搜索常驻 / 搜索记忆 / 搜索联想词开关
     const persist = await this.db.getSetting('searchPersist')
     this.searchPersist = persist === 'true'
     const mem = await this.db.getSetting('searchMemory')
     this.searchMemoryEnabled = mem !== 'false'
-    // 悬浮球设置（默认开启/右侧）
-    const ball = await this.db.getSetting('searchFloatingBall')
-    AppStorage.setOrCreate('searchFloatingBall', ball !== 'false')
-    const ballLeft = await this.db.getSetting('searchFloatingBallLeft')
-    AppStorage.setOrCreate('searchFloatingBallLeft', ballLeft === 'true')
-    if (this.searchPersist || this.searchMemoryEnabled) {
-      // 1. 优先从 AppStorage 恢复（本会话内切换）
-      const savedKeyword = AppStorage.get('qinseKeyword') as string | undefined
-      const savedResults = AppStorage.get('qinseSearchResults') as SongInfo[] | undefined
-      const savedIsSearched = AppStorage.get('qinseIsSearched') as boolean | undefined
-      if (savedResults && savedResults.length > 0 && savedIsSearched) {
-        this.keyword = savedKeyword ?? ''
-        this.searchResults = savedResults
-        this.isSearched = true
-      } else if (this.searchPersist) {
-        // 2. 跨进程重启：AppStorage 不持久化，回退到数据库恢复上次搜索
-        const saved = await this.db.getSearchResults()
-        if (saved.results.length > 0) {
-          this.keyword = saved.keyword
-          this.searchResults = saved.results
-          this.isSearched = true
-          AppStorage.setOrCreate('qinseKeyword', saved.keyword)
-          AppStorage.setOrCreate('qinseSearchResults', saved.results)
-          AppStorage.setOrCreate('qinseIsSearched', true)
-        }
-      }
-    }
-    // 完整加载源列表（确保筛选器可用）
-    await this.loadSourceOptions()
+    const suggest = await this.db.getSetting('searchSuggest')
+    this.searchSuggestEnabled = suggest !== 'false'
+    // 恢复上次搜索（搜索常驻 / 搜索记忆开启时）
+    await this.restorePersistedSearch()
     this.loadSearchHistory()
   }
 
-  async loadSourceOptions() {
-    if (MusicApi.isSelfHostedMode()) {
-      const sources = SelfHostedApi.getAvailableSources()
-      const options: SourceOption[] = [{ label: '全部', value: 'all' }]
-      for (let i = 0; i < sources.length; i++) {
-        options.push({ label: SelfHostedApi.getDisplayName(sources[i]), value: sources[i] })
-      }
-      this.sourceOptions = options
+  // Index 切换到搜索 Tab 时触发：状态被清空后尝试恢复
+  private onTabVisibleSignal(): void {
+    this.restorePersistedSearch()
+  }
+
+  private async restorePersistedSearch(): Promise<void> {
+    if (this.isSearched || this.keyword.length > 0) {
       return
     }
-    await SourceManager.ensureLoaded()
-    const names = SourceManager.getSourceNames()
-    const options: SourceOption[] = [{ label: '全部', value: 'all' }]
-    for (let i = 0; i < names.length; i++) {
-      const enabled: boolean = await SourceManager.isSourceEnabled(names[i])
-      if (enabled) {
-        options.push({ label: names[i], value: names[i] })
+    if (!this.searchPersist && !this.searchMemoryEnabled) {
+      return
+    }
+    // 1. 优先从 AppStorage 恢复（本会话内切换）
+    const savedKeyword = AppStorage.get('qinseKeyword') as string | undefined
+    const savedResults = AppStorage.get('qinseSearchResults') as SongInfo[] | undefined
+    const savedIsSearched = AppStorage.get('qinseIsSearched') as boolean | undefined
+    if (savedResults && savedResults.length > 0 && savedIsSearched) {
+      this.keyword = savedKeyword ?? ''
+      this.searchResults = savedResults
+      this.isSearched = true
+      return
+    }
+    // 2. 跨进程重启：AppStorage 不持久化，回退到数据库恢复上次搜索
+    if (this.searchPersist) {
+      const saved = await this.db.getSearchResults()
+      if (saved.results.length > 0) {
+        this.keyword = saved.keyword
+        this.searchResults = saved.results
+        this.isSearched = true
+        AppStorage.setOrCreate('qinseKeyword', saved.keyword)
+        AppStorage.setOrCreate('qinseSearchResults', saved.results)
+        AppStorage.setOrCreate('qinseIsSearched', true)
       }
     }
-    // 始终在前：当前选中的源排在"全部"之后的第一位
-    if (this.selectedSource !== 'all' && this.selectedSource.length > 0) {
-      const idx = options.findIndex(o => o.value === this.selectedSource)
-      if (idx > 1) {
-        const item = options.splice(idx, 1)[0]
-        options.splice(1, 0, item)
-      }
-    }
-    this.sourceOptions = options
-  }
-
-  // 展开筛选下拉前重新加载音源列表，保证与设置-音源管理实时同步
-  private async refreshAndToggleDropdown(): Promise<void> {
-    await this.loadSourceOptions()
-    this.showSourceDropdown = !this.showSourceDropdown
-  }
-
-  private async loadSearchMemory(): Promise<void> {
-    const val = await this.db.getSetting('searchMemory')
-    this.searchMemoryEnabled = val !== 'false'
   }
 
   private async loadSearchHistory(): Promise<void> {
@@ -180,14 +148,13 @@ export struct QinseTab {
     AppStorage.setOrCreate('qinseIsSearched', this.isSearched)
   }
 
-  private getSourceLabel(source: string): string {
-    const option = this.sourceOptions.find(opt => opt.value === source)
-    return option ? option.label : source
-  }
-
   aboutToDisappear(): void {
     if (this.searchTimer !== -1) {
       clearTimeout(this.searchTimer)
+    }
+    if (this.suggestTimer !== -1) {
+      clearTimeout(this.suggestTimer)
+      this.suggestTimer = -1
     }
     if (this.resultPillTimer !== -1) {
       clearTimeout(this.resultPillTimer)
@@ -197,156 +164,143 @@ export struct QinseTab {
 
   build() {
     Stack() {
-      // === Main content (bottom layer, never moves) ===
       Column() {
-        // Search bar
-        Row({ space: 12 }) {
-          // Search input with icon button
-          if (this.supportImmersive) {
-            Row({ space: 8 }) {
-              Row() {
-                SymbolGlyph($r('sys.symbol.magnifyingglass'))
-                  .fontSize(18)
-                  .fontColor([this.themeTextSecondary])
-              }
-              .width(40)
-              .height(40)
-              .justifyContent(FlexAlign.Center)
-              .onClick(() => {
-                if (this.keyword.trim().length > 0) {
-                  if (this.searchTimer !== -1) {
-                    clearTimeout(this.searchTimer)
-                  }
-                  this.doSearch(this.keyword.trim())
-                }
-              })
-
-              TextInput({ placeholder: '搜索音乐', text: this.keyword })
-                .layoutWeight(1)
-                .height(40)
-                .fontSize(14)
-                .backgroundColor(Color.Transparent)
-                .borderRadius(20)
-                .padding({ left: 8 })
-                .focusOnTouch(true)
-                .onChange((value: string) => {
-                  this.keyword = value
-                  this.debouncedSearch(value)
-                })
-                .onSubmit(() => {
-                  if (this.keyword.trim().length > 0) {
-                    if (this.searchTimer !== -1) {
-                      clearTimeout(this.searchTimer)
-                    }
-                    this.doSearch(this.keyword.trim())
-                  }
-                })
-
-                if (this.keyword.length > 0) {
-                  Row() {
-                    SymbolGlyph($r('sys.symbol.xmark'))
-                      .fontSize(14)
-                      .fontColor([this.themeTextSecondary])
-                  }
-                  .width(32)
-                  .height(32)
-                  .justifyContent(FlexAlign.Center)
-                  .onClick(() => {
-                    this.keyword = ''
-                    this.isSearched = false
-                    this.searchResults = []
-                    AppStorage.setOrCreate('qinseIsSearched', false)
-                    AppStorage.setOrCreate('qinseSearchResults', [])
-                    this.db.clearSearchResults()
-                    if (this.searchTimer !== -1) {
-                      clearTimeout(this.searchTimer)
-                    }
-                  })
-                }
+        Row() {
+          Button({ type: ButtonType.Normal }) {
+            Row() {
+              SymbolGlyph($r('sys.symbol.chevron_left'))
+                .fontSize(18)
+                .fontColor([$r('sys.color.font_primary')])
             }
-            .layoutWeight(1)
-            .systemMaterial(MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN))
-            .borderRadius(20)
-            .padding({ right: 8 })
-          } else {
-            Row({ space: 8 }) {
-              Row() {
-                SymbolGlyph($r('sys.symbol.magnifyingglass'))
-                  .fontSize(18)
-                  .fontColor([this.themeTextSecondary])
-              }
-              .width(40)
-              .height(40)
-              .justifyContent(FlexAlign.Center)
-              .onClick(() => {
-                if (this.keyword.trim().length > 0) {
-                  if (this.searchTimer !== -1) {
-                    clearTimeout(this.searchTimer)
-                  }
-                  this.doSearch(this.keyword.trim())
-                }
-              })
-
-              TextInput({ placeholder: '搜索音乐', text: this.keyword })
-                .layoutWeight(1)
-                .height(40)
-                .fontSize(14)
-                .backgroundColor(Color.Transparent)
-                .borderRadius(20)
-                .padding({ left: 8 })
-                .focusOnTouch(true)
-                .onChange((value: string) => {
-                  this.keyword = value
-                  this.debouncedSearch(value)
-                })
-                .onSubmit(() => {
-                  if (this.keyword.trim().length > 0) {
-                    if (this.searchTimer !== -1) {
-                      clearTimeout(this.searchTimer)
-                    }
-                    this.doSearch(this.keyword.trim())
-                  }
-                })
-
-                if (this.keyword.length > 0) {
-                  Row() {
-                    SymbolGlyph($r('sys.symbol.xmark'))
-                      .fontSize(14)
-                      .fontColor([this.themeTextSecondary])
-                  }
-                  .width(32)
-                  .height(32)
-                  .justifyContent(FlexAlign.Center)
-                  .onClick(() => {
-                    this.keyword = ''
-                    this.isSearched = false
-                    this.searchResults = []
-                    AppStorage.setOrCreate('qinseIsSearched', false)
-                    AppStorage.setOrCreate('qinseSearchResults', [])
-                    this.db.clearSearchResults()
-                    if (this.searchTimer !== -1) {
-                      clearTimeout(this.searchTimer)
-                    }
-                  })
-                }
-            }
-            .layoutWeight(1)
-            .backgroundColor(this.themeCardBg)
-            .blur(8)
-            .borderRadius(20)
-            .padding({ right: 8 })
+            .width(32)
+            .height(32)
+            .justifyContent(FlexAlign.Center)
+            .borderRadius(16)
+            .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN) : undefined)
+            .backgroundColor(this.supportImmersive ? Color.Transparent : (this.isDarkMode ? '#2A2A2A' : '#EDEDED'))
           }
+          .width(32)
+          .height(32)
+          .padding(0)
+          .margin({ right: 8 })
+          .backgroundColor(Color.Transparent)
+          .onClick(() => {
+            this.hideSuggestPanel()
+            if (this.searchTimer !== -1) {
+              clearTimeout(this.searchTimer)
+            }
+            this.keyword = ''
+            this.isSearched = false
+            this.searchResults = []
+            AppStorage.setOrCreate('qinseKeyword', '')
+            AppStorage.setOrCreate('qinseIsSearched', false)
+            AppStorage.setOrCreate('qinseSearchResults', [])
+            this.db.clearSearchResults()
+            this.onBack()
+          })
 
-          // Source dropdown button (筛选选择器) - V2.1: 已移除，改为悬浮球筛选（后续接入）
-          // 搜索框直接占满宽度
+          Row({ space: 6 }) {
+            SymbolGlyph($r('sys.symbol.magnifyingglass'))
+              .fontSize(14)
+              .fontColor([$r('sys.color.font_primary')])
+              .margin({ left: 10 })
+
+            TextInput({ placeholder: '搜索音乐', text: this.keyword })
+              .layoutWeight(1)
+              .height(32)
+              .backgroundColor(Color.Transparent)
+              .fontSize(14)
+              .fontColor($r('sys.color.font_primary'))
+              .placeholderColor($r('sys.color.font_secondary'))
+              .placeholderFont({ size: 14 })
+              .onChange((value: string) => {
+                // 程序化设置 text（选中联想词/历史记录、清空）时也会触发 onChange：
+                // 值与当前关键词一致说明不是用户输入，跳过，避免重复触发联想/搜索
+                if (value === this.keyword) {
+                  return
+                }
+                this.keyword = value
+                if (this.searchSuggestEnabled) {
+                  // 联想模式：输入即出联想词，不再自动搜索
+                  this.handleSuggestInput(value)
+                } else {
+                  this.debouncedSearch(value)
+                }
+              })
+              .onSubmit(() => {
+                if (this.keyword.trim().length > 0) {
+                  this.hideSuggestPanel()
+                  if (this.searchTimer !== -1) {
+                    clearTimeout(this.searchTimer)
+                  }
+                  this.doSearch(this.keyword.trim())
+                }
+              })
+
+            if (this.keyword.length > 0) {
+              Row() {
+                SymbolGlyph($r('sys.symbol.xmark_circle_fill'))
+                  .fontSize(16)
+                  .fontColor([$r('sys.color.font_primary')])
+              }
+              .width(28)
+              .height(28)
+              .justifyContent(FlexAlign.Center)
+              .onClick(() => {
+                this.keyword = ''
+                this.isSearched = false
+                this.searchResults = []
+                this.hideSuggestPanel()
+                AppStorage.setOrCreate('qinseKeyword', '')
+                AppStorage.setOrCreate('qinseIsSearched', false)
+                AppStorage.setOrCreate('qinseSearchResults', [])
+                this.db.clearSearchResults()
+                if (this.searchTimer !== -1) {
+                  clearTimeout(this.searchTimer)
+                }
+              })
+            }
+          }
+          .layoutWeight(1)
+          .height(36)
+          .borderRadius(18)
+          .backgroundColor(this.themeCardBg)
+          .padding({ right: 8 })
+
+          // 筛选：点击展开当前结果中自动检测到的音源
+          Button({ type: ButtonType.Normal }) {
+            Row({ space: 3 }) {
+              Text(this.sourceFilter === 'all' ? '筛选' : SourceInfo.getAbbr(this.sourceFilter))
+                .fontSize(11)
+                .fontColor($r('sys.color.font_primary'))
+                .fontWeight(FontWeight.Medium)
+                .maxLines(1)
+              SymbolGlyph($r('sys.symbol.chevron_down'))
+                .fontSize(9)
+                .fontColor([$r('sys.color.font_primary')])
+            }
+            .justifyContent(FlexAlign.Center)
+          }
+          .height(36)
+          .padding({ left: 10, right: 10 })
+          .margin({ left: 8 })
+          .borderRadius(18)
+          .backgroundColor(this.themeCardBg)
+          .enabled(this.isSearched && this.searchResults.length > 0)
+          .opacity(this.isSearched && this.searchResults.length > 0 ? 1 : 0.4)
+          .bindMenu(this.buildFilterMenuItems())
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: 12, bottom: 8 })
+        .padding({ left: 12, right: 12, top: 10, bottom: 6 })
 
-        // 下拉自检提示（随内容流显示，占位不悬浮；触发刷新后由底部弹窗接替）
+        // === 搜索联想词面板（直接展示在搜索栏下方，把历史挤压到下面） ===
+        if (this.showSuggestPanel && this.keyword.trim().length > 0) {
+          this.SuggestPanel()
+        }
+
         if (this.showPullIndicator) {
           Column({ space: 2 }) {
-            Text(this.refreshProgress >= this.pullThreshold ? '↓ 松开自检音源' : '↓ 下拉自检音源')
+            Text(this.refreshProgress >= this.pullThreshold ? '↓ 松开刷新' : '↓ 下拉刷新')
               .fontSize(12)
               .fontColor(this.themeTextSecondary)
             Text(`${Math.min(100, Math.round(this.refreshProgress / this.pullThreshold * 100))}%`)
@@ -395,8 +349,12 @@ export struct QinseTab {
       .height('100%')
       .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
       .onTouch((event: TouchEvent) => {
-        // 搜索结果列表由 Scroll 自身的 onTouch 处理下拉（Scroll 会拦截外层触摸事件）
+        // 搜索结果列表由列表自身 Scroll 处理下拉（Scroll 会拦截外层触摸事件）
         if (this.isSearched && this.searchResults.length > 0) {
+          return
+        }
+        // 联想面板展开时不触发下拉刷新
+        if (this.showSuggestPanel) {
           return
         }
         this.handleContentPull(event)
@@ -428,63 +386,6 @@ export struct QinseTab {
         .hitTestBehavior(HitTestMode.None)
       }
 
-      // === 悬浮球菜单展开时：点击菜单外任意区域关闭（透明遮罩，置于悬浮球之下） ===
-      if (this.showBallMenu) {
-        Column()
-          .width('100%')
-          .height('100%')
-          .backgroundColor(Color.Transparent)
-          .onClick(() => {
-            this.showBallMenu = false
-          })
-      }
-
-      // === 搜索页悬浮球（迷你栏上方；单击展开菜单、长按回顶；菜单为独立圆角矩形按钮，沉浸光感） ===
-      if (this.searchFloatingBall) {
-        Column({ space: 12 }) {
-          // 展开菜单：直接内联于球体上方（非气泡弹窗，每个子功能为独立按钮）
-          if (this.showBallMenu) {
-            this.BallMenuContent()
-          }
-          Stack() {
-            Image($r('app.media.ic_gallery_photoedit_more'))
-              .width(30)
-              .height(30)
-              .objectFit(ImageFit.Contain)
-              .fillColor(this.themeTextPrimary)
-          }
-          .width(50)
-          .height(50)
-          .borderRadius(25)
-          .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THICK) : undefined)
-          .backgroundColor(this.supportImmersive ? Color.Transparent : (this.isDarkMode ? '#CC2C2C32' : '#CCFFFFFF'))
-          .shadow({ radius: 14, color: '#33000000', offsetY: 4 })
-          .gesture(
-            GestureGroup(GestureMode.Exclusive,
-              LongPressGesture({ repeat: false, duration: 500 })
-                .onAction(() => {
-                  this.showBallMenu = false
-                  this.scrollSearchToTop()
-                }),
-              TapGesture({ count: 1 })
-                .onAction(() => {
-                  this.showBallMenu = !this.showBallMenu
-                }),
-            )
-          )
-        }
-        .width('100%')
-        .height('100%')
-        .justifyContent(FlexAlign.End)
-        .alignItems(this.searchFloatingBallLeft ? HorizontalAlign.Start : HorizontalAlign.End)
-        .padding({ left: this.searchFloatingBallLeft ? 18 : 0, right: this.searchFloatingBallLeft ? 0 : 18, bottom: '84vp' })
-        .hitTestBehavior(HitTestMode.None)
-      }
-
-      // === Floating dropdown overlay (top layer, covers content below) ===
-      // V2.1: 筛选器已移除，改为悬浮球（后续接入）
-
-      // Action sheet
       if (this.selectedSong) {
         SongActionSheet({
           song: this.selectedSong!,
@@ -507,7 +408,167 @@ export struct QinseTab {
     .height('100%')
   }
 
-  // 防抖搜索
+  // ===== 搜索联想词 =====
+
+  // 内嵌联想面板：展示在搜索栏正下方
+  @Builder
+  SuggestPanel() {
+    Column() {
+      if (this.suggestions.length === 0) {
+        Row({ space: 8 }) {
+          LoadingProgress()
+            .width(18)
+            .height(18)
+            .color(this.themePrimary)
+          Text('正在获取联想词…')
+            .fontSize(13)
+            .fontColor(this.themeTextSecondary)
+        }
+        .width('100%')
+        .height(46)
+        .justifyContent(FlexAlign.Center)
+      } else {
+        ForEach(this.suggestions, (item: SearchSuggestion) => {
+          Row({ space: 10 }) {
+            SymbolGlyph(item.fromHistory ? $r('sys.symbol.clock') : $r('sys.symbol.magnifyingglass'))
+              .fontSize(15)
+              .fontColor([this.themeTextSecondary])
+            Text(item.text)
+              .fontSize(14)
+              .fontColor(this.themeTextPrimary)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+          }
+          .width('100%')
+          .height(42)
+          .alignItems(VerticalAlign.Center)
+          .onClick(() => {
+            // 点击联想词：关闭面板并搜索
+            this.applySuggestion(item.text)
+          })
+        }, (item: SearchSuggestion) => `${item.fromHistory}_${item.text}`)
+      }
+    }
+    .width('100%')
+    .margin({ left: 16, right: 16, top: 2 })
+    .padding({ left: 14, right: 14, top: 4, bottom: 4 })
+    .backgroundColor(this.themeCardBg)
+    .borderRadius(14)
+    .shadow({ radius: 10, color: '#1A000000', offsetY: 2 })
+    .transition(TransitionEffect.OPACITY.animation({ duration: 150 }))
+  }
+
+  // 输入变化：立即展示历史联想 + 防抖拉取在线联想
+  private handleSuggestInput(value: string): void {
+    if (this.searchTimer !== -1) {
+      clearTimeout(this.searchTimer)
+      this.searchTimer = -1
+    }
+    const kw: string = value.trim()
+    if (kw.length === 0) {
+      this.hideSuggestPanel()
+      this.isSearched = false
+      this.searchResults = []
+      return
+    }
+    // 代际 +1：作废在途的在线联想请求
+    this.suggestGen++
+    const gen: number = this.suggestGen
+    // 历史联想立即展示
+    const merged: SearchSuggestion[] = []
+    const hist: string[] = this.buildHistorySuggestions(kw)
+    for (let i = 0; i < hist.length; i++) {
+      merged.push({ text: hist[i], fromHistory: true })
+    }
+    this.suggestions = merged
+    this.showSuggestPanel = true
+    // 在线联想防抖拉取
+    if (this.suggestTimer !== -1) {
+      clearTimeout(this.suggestTimer)
+    }
+    this.suggestTimer = setTimeout(() => {
+      this.suggestTimer = -1
+      this.fetchOnlineSuggestions(kw, gen)
+    }, 400)
+  }
+
+  // 历史记录联想：包含输入词的历史词条
+  private buildHistorySuggestions(kw: string): string[] {
+    const k: string = kw.toLowerCase()
+    const res: string[] = []
+    for (let i = 0; i < this.searchHistory.length; i++) {
+      const h: string = this.searchHistory[i]
+      if (h.toLowerCase().indexOf(k) >= 0 && h.toLowerCase() !== k) {
+        res.push(h)
+        if (res.length >= 4) {
+          break
+        }
+      }
+    }
+    return res
+  }
+
+  // 在线联想：取搜索结果的歌名/歌手去重
+  private async fetchOnlineSuggestions(kw: string, gen: number): Promise<void> {
+    try {
+      const songs: SongInfo[] = await MusicApi.search(kw, this.selectedSource)
+      if (gen !== this.suggestGen || !this.showSuggestPanel) {
+        return
+      }
+      const seen: Set<string> = new Set()
+      for (let i = 0; i < this.suggestions.length; i++) {
+        seen.add(this.suggestions[i].text.toLowerCase())
+      }
+      const online: SearchSuggestion[] = []
+      for (let i = 0; i < songs.length; i++) {
+        const s: SongInfo = songs[i]
+        const candidates: string[] = [s.songName, s.artist]
+        for (let j = 0; j < candidates.length; j++) {
+          const t: string = candidates[j].trim()
+          const key: string = t.toLowerCase()
+          if (t.length === 0 || key === kw.toLowerCase() || seen.has(key)) {
+            continue
+          }
+          seen.add(key)
+          online.push({ text: t, fromHistory: false })
+          if (online.length >= 6) {
+            break
+          }
+        }
+        if (online.length >= 6) {
+          break
+        }
+      }
+      // 历史联想在前，在线联想在后
+      this.suggestions = this.suggestions.concat(online)
+    } catch (_e) {
+      // 忽略：仅保留历史联想
+    }
+  }
+
+  // 点击联想词：关闭面板并搜索
+  private applySuggestion(text: string): void {
+    this.hideSuggestPanel()
+    if (this.searchTimer !== -1) {
+      clearTimeout(this.searchTimer)
+      this.searchTimer = -1
+    }
+    this.keyword = text
+    this.doSearch(text)
+  }
+
+  private hideSuggestPanel(): void {
+    this.showSuggestPanel = false
+    this.suggestions = []
+    if (this.suggestTimer !== -1) {
+      clearTimeout(this.suggestTimer)
+      this.suggestTimer = -1
+    }
+    this.suggestGen++
+  }
+
+  // 防抖搜索（关闭联想后保留的输入即搜行为）
   private debouncedSearch(kw: string): void {
     if (this.searchTimer !== -1) {
       clearTimeout(this.searchTimer)
@@ -520,6 +581,60 @@ export struct QinseTab {
     this.searchTimer = setTimeout(() => {
       this.doSearch(kw.trim())
     }, 500)
+  }
+
+  // ===== 筛选（自动检测当前结果中的音源） =====
+
+  private getSourceOfSong(song: SongInfo): string {
+    if (song.rawData) {
+      try {
+        const obj: Record<string, Object> = JSON.parse(song.rawData) as Record<string, Object>
+        const p = obj['__platform']
+        if (typeof p === 'string' && p.length > 0) {
+          return p
+        }
+      } catch (_e) {}
+    }
+    return song.source
+  }
+
+  private buildFilterMenuItems(): FilterMenuItem[] {
+    const items: FilterMenuItem[] = []
+    items.push({
+      value: `全部（${this.searchResults.length}）`,
+      action: () => {
+        this.sourceFilter = 'all'
+      }
+    })
+    // 统计当前结果中各音源数量
+    const counts: Map<string, number> = new Map()
+    for (let i = 0; i < this.searchResults.length; i++) {
+      const src: string = this.getSourceOfSong(this.searchResults[i])
+      counts.set(src, (counts.get(src) ?? 0) + 1)
+    }
+    const names: string[] = []
+    counts.forEach((cnt: number, src: string) => {
+      names.push(src)
+    })
+    names.sort((a: string, b: string) => (counts.get(b) ?? 0) - (counts.get(a) ?? 0))
+    for (let i = 0; i < names.length; i++) {
+      const src: string = names[i]
+      items.push({
+        value: `${SourceInfo.getAbbr(src)}（${counts.get(src) ?? 0}）`,
+        action: () => {
+          this.sourceFilter = src
+        }
+      })
+    }
+    return items
+  }
+
+  /** 按筛选条件展示的结果列表 */
+  private getDisplayResults(): SongInfo[] {
+    if (this.sourceFilter === 'all') {
+      return this.searchResults
+    }
+    return this.searchResults.filter((s: SongInfo) => this.getSourceOfSong(s) === this.sourceFilter)
   }
 
   // ===== 下拉刷新：全部音源自检 / 链路打通 =====
@@ -578,7 +693,7 @@ export struct QinseTab {
     }
   }
 
-  // 搜索结果 Scroll 内的下拉处理：仅当列表位于顶部时才允许触发
+  // 结果列表 Scroll 的下拉处理：仅当列表位于顶部时才允许触发
   private handleScrollPull(event: TouchEvent): void {
     if (event.type === TouchType.Down) {
       if (this.scroller.currentOffset().yOffset > 0) {
@@ -618,129 +733,25 @@ export struct QinseTab {
     this.resultPillVisible = false
   }
 
-  // ===== 悬浮球 =====
-
-  /** 长按回顶：仅搜索结果列表可滚动时生效 */
-  private scrollSearchToTop(): void {
-    if (this.isSearched && this.searchResults.length > 0) {
-      this.scroller.scrollEdge(Edge.Top)
-    }
-  }
-
-  /** 菜单-刷新：回到顶部并触发全源自检（下拉刷新同款） */
-  private handleBallRefresh(): void {
-    this.showBallMenu = false
-    this.scrollSearchToTop()
-    this.startFullSourceRefresh()
-  }
-
-  /** 来源筛选后的展示列表（'all' 显示全部） */
-  private getDisplayResults(): SongInfo[] {
-    if (this.sourceFilter === 'all') {
-      return this.searchResults
-    }
-    return this.searchResults.filter((s: SongInfo) => s.source === this.sourceFilter)
-  }
-
-  /** 悬浮球菜单：无气泡容器，每个子功能为独立圆角矩形按钮（Button 示例7），上下间距 8，全部沉浸光感 */
-  @Builder
-  BallMenuContent() {
-    Column({ space: 8 }) {
-      this.BallMenuButton('刷新', 'refresh')
-      this.BallMenuButton('全部', 'all')
-      this.BallMenuButton('KG', 'kg')
-      this.BallMenuButton('KW', 'kw')
-      this.BallMenuButton('QQ', 'tx')
-      this.BallMenuButton('WY', 'wy')
-    }
-    // 容器自身不拦截触摸，按钮之间的空隙可点击关闭菜单
-    .hitTestBehavior(HitTestMode.None)
-  }
-
-  /** 独立胶囊形菜单按钮：选中/刷新 = 主题浅色底+主题色加粗；其余 = 沉浸光感磨砂底+投影 */
-  @Builder
-  BallMenuButton(label: string, value: string) {
-    Button(label)
-      .type(ButtonType.Capsule)
-      .controlSize(ControlSize.NORMAL)
-      .width(96)
-      .height(40)
-      .fontSize(14)
-      .fontColor(this.ballButtonColor(value))
-      .fontWeight(value === 'refresh' || this.sourceFilter === value ? FontWeight.Bold : FontWeight.Normal)
-      .backgroundColor(this.ballButtonBg(value))
-      .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THICK) : undefined)
-      .shadow({ radius: 12, color: '#33000000', offsetY: 3 })
-      .stateEffect(true)
-      .onClick(() => {
-        if (value === 'refresh') {
-          this.handleBallRefresh()
-        } else {
-          this.sourceFilter = value
-          this.showBallMenu = false
-        }
-      })
-  }
-
-  private ballButtonBg(value: string): ResourceColor {
-    if (value === 'refresh' || this.sourceFilter === value) {
-      return this.themePrimaryLight
-    }
-    return Color.Transparent
-  }
-
-  private ballButtonColor(value: string): ResourceColor {
-    if (value === 'refresh') {
-      return this.themePrimary
-    }
-    return this.sourceFilter === value ? this.themePrimary : this.themeTextPrimary
-  }
-
   // 全源自检：依次测试所有已启用音源，统计可用/不可用
   private async startFullSourceRefresh(): Promise<void> {
     if (this.isRefreshing) return
     this.isRefreshing = true
-    // 顶部指示器回落，改由底部沉浸光感弹窗常驻（与“播放失败”同一位置）
     this.showPullIndicator = false
     this.refreshProgress = 0
-    this.showResultPill('正在自检全部音源…', false)
-
-    let enabledSources = 0
-    let availableSources = 0
-    // 按 songId 去重统计实际歌曲数，避免多源重复虚高
-    const seenSongKeys = new Set<string>()
-    const names = SourceManager.getSourceNames()
-
-    for (let i = 0; i < names.length; i++) {
-      const name = names[i]
-      if (!(await SourceManager.isSourceEnabled(name))) continue
-      enabledSources++
-      // 尝试用该源搜索一首测试歌
+    if (this.keyword.trim().length > 0) {
+      this.showResultPill('正在刷新搜索…', false)
       try {
-        const songs = await MusicApi.search('海阔天空', name)
-        if (songs.length > 0) {
-          availableSources++
-          for (let j = 0; j < songs.length; j++) {
-            const s = songs[j]
-            const key = (s.source || '') + '|' + (s.songId || '')
-            if (!seenSongKeys.has(key)) {
-              seenSongKeys.add(key)
-            }
-          }
-        }
+        this.searchResults = await MusicApi.search(this.keyword.trim(), this.selectedSource)
+        this.saveToAppStorage()
+        this.showResultPill(`刷新完成，${this.searchResults.length} 条结果`, true)
       } catch (_e) {
-        // 忽略单个源失败
+        this.showResultPill('刷新失败', true)
       }
+    } else {
+      this.showResultPill('请先输入关键词搜索', true)
     }
-
-    // 刷新完成：内容回弹后，底部弹窗显示可用源数，左上角显示总结
     this.isRefreshing = false
-    this.refreshProgress = 0
-    console.info(`[QinseTab] refresh done: enabled=${enabledSources}, available=${availableSources}, songs=${seenSongKeys.size}`)
-    this.showResultPill(`${availableSources}/${enabledSources} 个源可用`, true)
-    // 左上角总结：徽章已显示“JS源/自建API”，这里存歌曲数，渲染时拼成“JS源 / 共找到 X 首歌曲”，常驻显示
-    this.refreshSummary = `共找到 ${seenSongKeys.size} 首歌曲`
-    this.refreshSummaryVisible = true
   }
 
   @Builder
@@ -752,14 +763,8 @@ export struct QinseTab {
             .fontSize(14)
             .fontColor(this.themeTextPrimary)
             .fontWeight(FontWeight.Medium)
-          Text(this.apiModeLabel)
-            .fontSize(10)
-            .fontColor(Color.White)
-            .backgroundColor(this.apiModeLabel === '自建API' ? '#007DFF' : '#FF9800')
-            .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-            .borderRadius(8)
 
-          // 自检完成后的总结：随内容流显示（同 JS源 徽章），常驻不消失
+          // 自检完成后的总结：常驻不消失
           if (this.refreshSummaryVisible && this.refreshSummary.length > 0) {
             Text(' / ' + this.refreshSummary)
               .fontSize(12)
@@ -797,6 +802,7 @@ export struct QinseTab {
             .margin({ right: 8, bottom: 8 })
             .onClick(() => {
               this.keyword = keyword
+              this.hideSuggestPanel()
               this.doSearch(keyword)
             })
         })
@@ -809,6 +815,7 @@ export struct QinseTab {
     .padding({ left: 16, right: 16, top: 4 })
   }
 
+  // 搜索结果列表（筛选后）
   @Builder
   SearchResultsContent() {
     if (this.getDisplayResults().length === 0) {
@@ -818,12 +825,12 @@ export struct QinseTab {
           .fontColor(['#999999'])
           .opacity(0.3)
         if (this.sourceFilter !== 'all' && this.searchResults.length > 0) {
-          // 来源筛选后无该源歌曲
+          // 该来源无结果
           Text(`\u300C${SourceInfo.getAbbr(this.sourceFilter)}\u300D\u6765\u6E90\u6682\u65E0\u6B4C\u66F2`)
             .fontSize(16)
             .fontColor(this.themeTextPrimary)
             .fontWeight(FontWeight.Medium)
-          Text('\u4F7F\u7528\u60AC\u6D6E\u7403\u83DC\u5355\u5207\u56DE\u201C\u5168\u90E8\u201D\u5373\u53EF')
+          Text('\u70B9\u51FB\u641C\u7D22\u680F\u53F3\u4FA7\u201C\u7B5B\u9009\u201D\u5207\u56DE\u201C\u5168\u90E8\u201D')
             .fontSize(13)
             .fontColor(this.themeTextSecondary)
         } else {
@@ -846,13 +853,6 @@ export struct QinseTab {
               .fontSize(13)
               .fontColor(this.themeTextSecondary)
           }
-
-          // 显示当前搜索模式
-          Text(`\u5F53\u524D\u6A21\u5F0F\uFF1A${this.apiModeLabel}`)
-            .fontSize(11)
-            .fontColor(this.themeTextSecondary)
-            .opacity(0.6)
-            .margin({ top: 4 })
         }
       }
       .width('100%')
@@ -860,49 +860,25 @@ export struct QinseTab {
       .justifyContent(FlexAlign.Center)
       .alignItems(HorizontalAlign.Center)
       .padding(40)
-      .layoutWeight(1)
     } else {
       Scroll(this.scroller) {
         Column({ space: 8 }) {
-          Row({ space: 8 }) {
-            Text(this.apiModeLabel)
-              .fontSize(10)
-              .fontColor(Color.White)
-              .backgroundColor(this.apiModeLabel === '自建API' ? '#007DFF' : '#FF9800')
-              .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-              .borderRadius(8)
-              .flexShrink(0)
-
-            // 自检完成后的总结：与徽章、右侧小字三者共存；总结占中间弹性位，超长省略不挤压
-            if (this.refreshSummaryVisible && this.refreshSummary.length > 0) {
-              Text(' / ' + this.refreshSummary)
-                .fontSize(12)
-                .fontColor(this.themeTextSecondary)
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .layoutWeight(1)
-                .textAlign(TextAlign.Start)
-              Text('\u53CC\u51FB\u64AD\u653E \u00B7 \u957F\u6309\u66F4\u591A\u64CD\u4F5C')
-                .fontSize(11)
-                .fontColor(this.themeTextSecondary)
-                .flexShrink(0)
-                .textAlign(TextAlign.End)
-            } else {
-              Text('\u53CC\u51FB\u64AD\u653E \u00B7 \u957F\u6309\u66F4\u591A\u64CD\u4F5C')
-                .fontSize(11)
-                .fontColor(this.themeTextSecondary)
-                .layoutWeight(1)
-                .textAlign(TextAlign.End)
-            }
+          if (this.refreshSummaryVisible && this.refreshSummary.length > 0) {
+            // 自检完成后的总结
+            Text(this.refreshSummary)
+              .fontSize(12)
+              .fontColor(this.themeTextSecondary)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+              .height(18)
+              .padding({ left: 4 })
           }
-          .width('100%')
-          .padding({ left: 4, bottom: 8 })
 
-          // Song list - 使用双击播放模式（来源筛选后只显示对应来源歌曲）
+          // Song list - 单击播放
           ForEach(this.getDisplayResults(), (song: SongInfo) => {
             SongCard({
               song: song,
-              doubleTapToPlay: true,
               onPlay: (s: SongInfo) => {
                 this.playSong(s)
               },
@@ -919,7 +895,7 @@ export struct QinseTab {
         .width('100%')
         .padding({ left: 16, right: 16 })
       }
-      .layoutWeight(1)
+      .height('100%')
       .scrollBar(BarState.Auto)
       .scrollBarColor('#CCCCCC')
       .scrollBarWidth(4)
@@ -955,19 +931,13 @@ export struct QinseTab {
     this.isLoading = true
     this.isSearched = true
     this.searchError = ''
-    // 新搜索重置来源筛选
+    // 新搜索重置筛选到“全部”
     this.sourceFilter = 'all'
-    this.showBallMenu = false
 
-    const mode = MusicApi.isSelfHostedMode() ? '自建API' : 'JS源'
-    console.info(`[QinseTab] doSearch: keyword="${kw}", source=${this.selectedSource}, mode=${mode}`)
+    console.info(`[QinseTab] doSearch: keyword="${kw}", source=${this.selectedSource}`)
 
     try {
       this.searchResults = await MusicApi.search(kw, this.selectedSource)
-      // V1.1.0 防御性过滤：确保只展示当前选中源的歌曲
-      if (this.selectedSource !== 'all' && this.searchResults.length > 0) {
-        this.searchResults = this.searchResults.filter(s => s.source === 'custom_' + this.selectedSource)
-      }
       console.info(`[QinseTab] search done: ${this.searchResults.length} results`)
       if (this.searchResults.length === 0) {
         this.searchError = MusicApi.lastError || '未找到相关歌曲'
@@ -997,56 +967,31 @@ export struct QinseTab {
   }
 
   private async playSong(song: SongInfo) {
-    // 获取播放链接
+    // 先立即切换曲目与队列（UI/歌词即时跟随），取链在后台完成后起播
+    const queue: SongInfo[] = this.searchResults
+    PlayerStore.play(song, queue, queue.indexOf(song))
+    const player = AudioPlayer.getInstance()
+    player.setCurrentSong(song)
+
     let playUrl = song.playUrl
     if (!playUrl) {
       playUrl = await MusicApi.getPlayUrl(song.songId, song.source, song)
     }
+    // 取链期间用户又点了其它歌曲：放弃本次起播，避免覆盖新歌
+    const now: SongInfo | undefined = PlayerStore.getCurrentTrack()
+    if (!now || now.songId !== song.songId || now.source !== song.source) {
+      return
+    }
     if (!playUrl) {
       SourceStatus.markUnplayable(song.source)
+      // 真正停掉 AVPlayer（PlayerStore.pause 只改 AppStorage 标记，旧歌会继续响）
+      await player.pause()
       this.showToastMessage('\u65E0\u6CD5\u83B7\u53D6\u64AD\u653E\u94FE\u63A5')
       return
     }
 
     // 更新歌曲播放链接
     song.playUrl = playUrl
-
-    // 设置播放器状态和队列
-    PlayerStore.play(song, this.searchResults, this.searchResults.indexOf(song))
-
-    // 配置音频播放器回调
-    const player = AudioPlayer.getInstance()
-    player.setCurrentSong(song)
-    player.onTimeUpdate = (time: number) => {
-      PlayerStore.updateTime(time)
-    }
-    player.onDurationUpdate = (duration: number) => {
-      PlayerStore.updateDuration(duration)
-    }
-    player.onPlayEnd = () => {
-      const nextTrack = PlayerStore.onTrackEnd()
-      if (nextTrack) {
-        this.playSong(nextTrack)
-      } else {
-        PlayerStore.pause()
-      }
-    }
-    player.onError = (error: string) => {
-      console.error('[QinseTab] play error:', error)
-      SourceStatus.markUnplayable(song.source)
-      PlayerStore.pause()
-      promptAction.showToast({
-        message: error || '播放失败，3秒后自动播放下一首',
-        duration: 3000,
-        bottom: '120vp'
-      })
-      setTimeout(() => {
-        const nextTrack = PlayerStore.next()
-        if (nextTrack) {
-          this.playSong(nextTrack)
-        }
-      }, 3000)
-    }
 
     await player.play(playUrl)
 

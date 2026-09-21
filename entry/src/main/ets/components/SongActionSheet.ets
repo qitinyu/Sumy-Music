@@ -1,10 +1,11 @@
 // SHMY 歌曲操作底部弹窗组件
 // SongActionSheet.ets
-import { SongInfo, Playlist, createEmptySongInfo } from '../model/MusicModel'
+import { SongInfo, Playlist, SourceInfo, createEmptySongInfo } from '../model/MusicModel'
 import { DatabaseHelper } from '../database/DatabaseHelper'
 import { PlayerStore } from '../utils/PlayerStore'
 import { MusicApi } from '../utils/MusicApi'
 import { AudioPlayer } from '../utils/AudioPlayer'
+import { CoverImage } from './CoverImage'
 import { common } from '@kit.AbilityKit'
 import { pasteboard } from '@kit.BasicServicesKit'
 import { systemShare } from '@kit.ShareKit'
@@ -89,7 +90,18 @@ export struct SongActionSheet {
   }
 
   private async loadPlaylists(): Promise<void> {
-    this.playlists = await this.db.getPlaylists()
+    const list: Playlist[] = await this.db.getPlaylists()
+    // 歌单自身未设封面时回退取第一首歌的封面（与轩窗歌单列表一致）
+    for (let i = 0; i < list.length; i++) {
+      const p: Playlist = list[i]
+      if (!p.coverUrl || p.coverUrl.length === 0) {
+        const songs: SongInfo[] = await this.db.getPlaylistSongs(p.id)
+        if (songs.length > 0 && songs[0].coverUrl.length > 0) {
+          p.coverUrl = songs[0].coverUrl
+        }
+      }
+    }
+    this.playlists = list
   }
 
   private async doAddToPlaylist(playlistId: string): Promise<void> {
@@ -322,6 +334,35 @@ export struct SongActionSheet {
     return FULL_ACTION_LIST
   }
 
+  /** 歌曲时长：quality 字段「128kbps/mm:ss」取时长段，缺失时回退 rawData.duration（毫秒） */
+  private getDurationLabel(): string {
+    const q: string = this.song.quality || ''
+    if (q.indexOf('/') >= 0) {
+      const parts: string[] = q.split('/')
+      const t: string = parts[parts.length - 1]
+      if (t.length > 0) {
+        return t
+      }
+    } else if (q.length > 0 && q.indexOf(':') >= 0) {
+      return q
+    }
+    const raw: string = this.song.rawData || ''
+    if (raw.length > 0) {
+      try {
+        const obj: Record<string, Object> = JSON.parse(raw) as Record<string, Object>
+        const d: Object | undefined = obj['duration']
+        if (d !== undefined && typeof d === 'number' && d > 0) {
+          const totalSec: number = d > 3600 ? Math.floor(d / 1000) : Math.floor(d)
+          const mm: number = Math.floor(totalSec / 60)
+          const ss: number = totalSec % 60
+          const pad = (n: number): string => n < 10 ? '0' + n : '' + n
+          return `${pad(mm)}:${pad(ss)}`
+        }
+      } catch (_e) {}
+    }
+    return ''
+  }
+
   build() {
     Stack() {
       Column() {
@@ -332,8 +373,9 @@ export struct SongActionSheet {
           .bindSheet($$this.sheetVisible, this.SheetContent(), {
             height: SheetSize.FIT_CONTENT,
             dragBar: true,
-            showClose: true,
-            backgroundColor: this.supportImmersive ? Color.Transparent : this.themeCardBg,
+            showClose: false,
+            backgroundColor: Color.Transparent,
+            systemMaterial: this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THICK) : undefined,
             onDisappear: () => {
               this.visible = false
               this.sheetVisible = false
@@ -350,8 +392,9 @@ export struct SongActionSheet {
           .bindSheet($$this.showPlaylistPicker, this.PlaylistPickerContent(), {
             height: SheetSize.FIT_CONTENT,
             dragBar: true,
-            showClose: true,
-            backgroundColor: this.themeCardBg,
+            showClose: false,
+            backgroundColor: Color.Transparent,
+            systemMaterial: this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THICK) : undefined,
             onDisappear: () => {
               this.showPlaylistPicker = false
               this.showCreatePlaylistInline = false
@@ -366,8 +409,9 @@ export struct SongActionSheet {
             .bindSheet($$this.showQualityPicker, this.QualityPickerContent(), {
               height: SheetSize.FIT_CONTENT,
               dragBar: true,
-              showClose: true,
-              backgroundColor: this.themeCardBg,
+              showClose: false,
+              backgroundColor: Color.Transparent,
+              systemMaterial: this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THICK) : undefined,
               onDisappear: () => {
                 this.showQualityPicker = false
               },
@@ -392,15 +436,16 @@ export struct SongActionSheet {
 
         Column({ space: 2 }) {
           Text(this.song.songName)
-            .fontSize(15)
+            .fontSize(17)
             .fontColor(this.themeTextPrimary)
             .fontWeight(FontWeight.Bold)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
 
           Text(this.song.artist)
-            .fontSize(12)
+            .fontSize(13)
             .fontColor(this.themeTextSecondary)
+            .fontWeight(FontWeight.Medium)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
@@ -414,54 +459,138 @@ export struct SongActionSheet {
         .width('100%')
         .color(this.themeDivider)
 
-      Column({ space: 0 }) {
-        ForEach(this.getActionList(), (item: ActionItem, index: number) => {
-          Row({ space: 12 }) {
-            Row() {
-              SymbolGlyph(item.icon)
-                .fontSize(18)
-                .fontColor(item.action === 'download_disabled' ? [this.themeTextSecondary] : [this.themePrimary])
-            }
-            .width(36)
-            .height(36)
-            .borderRadius(9)
-            .backgroundColor(item.action === 'download_disabled' ? this.themePlaceholder : this.themePrimaryLight)
-            .justifyContent(FlexAlign.Center)
-            .flexShrink(0)
-
-            Text(item.label)
-              .fontSize(14)
-              .fontColor(item.action === 'download_disabled' ? this.themeTextSecondary : this.themeTextPrimary)
-              .layoutWeight(1)
-
-            SymbolGlyph($r('sys.symbol.chevron_right'))
-              .fontSize(16)
-              .fontColor([this.themeTextSecondary])
-              .opacity(item.action === 'download_disabled' ? 0 : 1)
-              .flexShrink(0)
-          }
+      if (this.mode === 'search') {
+        // 基础操作：四宫格（图标 + 文字）
+        Text('\u57FA\u7840\u64CD\u4F5C')
+          .fontSize(16)
+          .fontColor(this.themeTextPrimary)
+          .fontWeight(FontWeight.Bold)
           .width('100%')
-          .padding({ left: 16, right: 16, top: 12, bottom: 12 })
-          .onClick(() => {
-            this.handleAction(item.action)
-          })
+          .padding({ left: 16, top: 12, bottom: 4 })
 
-          if (index < this.getActionList().length - 1) {
-            Divider()
-              .width('100%')
-              .color(this.themeDivider)
-              .margin({ left: 16, right: 16 })
-          }
-        })
+        Row() {
+          this.ActionGridItem('bofang.svg', '\u6B4C\u66F2\u64AD\u653E', 'play')
+          this.ActionGridItem('copy.svg', '\u52A0\u5165\u6B4C\u5355', 'playlist')
+          this.ActionGridItem('xys.svg', '\u4E0B\u9996\u64AD\u653E', 'play_next')
+          this.ActionGridItem('share.svg', '\u5206\u4EAB\u6B4C\u66F2', 'share')
+        }
+        .width('100%')
+        .padding({ left: 8, right: 8, top: 4, bottom: 12 })
+
+        Divider()
+          .width('100%')
+          .color(this.themeDivider)
+
+        // 歌曲信息：每行一条，无图标，缺失显示 -
+        Text('\u6B4C\u66F2\u4FE1\u606F')
+          .fontSize(16)
+          .fontColor(this.themeTextPrimary)
+          .fontWeight(FontWeight.Bold)
+          .width('100%')
+          .padding({ left: 16, top: 12, bottom: 4 })
+
+        Column() {
+          this.InfoRow('\u6B4C\u624B', this.song.artist)
+          this.InfoRow('\u4E13\u8F91', this.song.album)
+          this.InfoRow('\u6B4C\u66F2\u6765\u6E90', SourceInfo.getAbbr(this.song.source))
+          this.InfoRow('\u6B4C\u66F2\u65F6\u957F', this.getDurationLabel())
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 2 })
+      } else {
+        Column({ space: 0 }) {
+          ForEach(this.getActionList(), (item: ActionItem, index: number) => {
+            Row({ space: 12 }) {
+              Row() {
+                SymbolGlyph(item.icon)
+                  .fontSize(18)
+                  .fontColor(item.action === 'download_disabled' ? [this.themeTextSecondary] : [this.themePrimary])
+              }
+              .width(36)
+              .height(36)
+              .borderRadius(9)
+              .backgroundColor(item.action === 'download_disabled' ? this.themePlaceholder : this.themePrimaryLight)
+              .justifyContent(FlexAlign.Center)
+              .flexShrink(0)
+
+              Text(item.label)
+                .fontSize(14)
+                .fontColor(item.action === 'download_disabled' ? this.themeTextSecondary : this.themeTextPrimary)
+                .layoutWeight(1)
+
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(16)
+                .fontColor([this.themeTextSecondary])
+                .opacity(item.action === 'download_disabled' ? 0 : 1)
+                .flexShrink(0)
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+            .onClick(() => {
+              this.handleAction(item.action)
+            })
+
+            if (index < this.getActionList().length - 1) {
+              Divider()
+                .width('100%')
+                .color(this.themeDivider)
+                .margin({ left: 16, right: 16 })
+            }
+          })
+        }
+        .width('100%')
       }
-      .width('100%')
 
       Column().height(16)
     }
     .width('100%')
-    // 沉浸光感材质（不支持时回退卡片背景）
-    .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN) : undefined)
-    .backgroundColor(this.supportImmersive ? Color.Transparent : this.themeCardBg)
+  }
+
+  @Builder
+  ActionGridItem(iconRaw: string, label: string, action: string) {
+    Column({ space: 6 }) {
+      Row() {
+        Image($rawfile(iconRaw))
+          .width(24)
+          .height(24)
+      }
+      .width(44)
+      .height(44)
+      .borderRadius(12)
+      .backgroundColor(this.themePrimaryLight)
+      .justifyContent(FlexAlign.Center)
+
+      Text(label)
+        .fontSize(12)
+        .fontColor(this.themeTextPrimary)
+        .fontWeight(FontWeight.Medium)
+        .maxLines(1)
+    }
+    .layoutWeight(1)
+    .onClick(() => {
+      this.handleAction(action)
+    })
+  }
+
+  @Builder
+  InfoRow(label: string, value: string) {
+    Row() {
+      Text(label)
+        .fontSize(13)
+        .fontColor(this.themeTextSecondary)
+        .width(72)
+        .flexShrink(0)
+
+      Text(value && value.length > 0 ? value : '-')
+        .fontSize(13)
+        .fontColor(this.themeTextPrimary)
+        .layoutWeight(1)
+        .textAlign(TextAlign.End)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width('100%')
+    .padding({ top: 7, bottom: 7 })
   }
 
   @Builder
@@ -542,14 +671,25 @@ export struct SongActionSheet {
         // 歌单列表
         ForEach(this.playlists, (playlist: Playlist) => {
           Row({ space: 12 }) {
-            Row() {
-              SymbolGlyph($r('sys.symbol.list_bullet')).fontSize(18)
+            if (playlist.coverUrl && playlist.coverUrl.length > 0) {
+              CoverImage({
+                url: playlist.coverUrl,
+                coverWidth: 36,
+                coverHeight: 36,
+                radius: 8
+              })
+              .flexShrink(0)
+            } else {
+              Row() {
+                SymbolGlyph($r('sys.symbol.list_bullet')).fontSize(18)
+              }
+              .width(36)
+              .height(36)
+              .borderRadius(8)
+              .backgroundColor(this.themeCardBg)
+              .justifyContent(FlexAlign.Center)
+              .flexShrink(0)
             }
-            .width(36)
-            .height(36)
-            .borderRadius(8)
-            .backgroundColor(this.themeCardBg)
-            .justifyContent(FlexAlign.Center)
 
             Column({ space: 2 }) {
               Text(playlist.name)

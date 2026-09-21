@@ -2,7 +2,6 @@ import { SongInfo, LyricLine } from '../model/MusicModel'
 import { PlayerStore } from '../utils/PlayerStore'
 import { AudioPlayer } from '../utils/AudioPlayer'
 import { MusicApi } from '../utils/MusicApi'
-import { promptAction } from '@kit.ArkUI'
 import { CompatUtils } from '../utils/CompatUtils'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
 
@@ -78,35 +77,6 @@ export struct FloatingTabBar {
     PlayerStore.showFullPlayer()
   }
 
-  private async playTrack(track: SongInfo): Promise<void> {
-    let playUrl = track.playUrl
-    if (!playUrl && track.source !== 'local') {
-      playUrl = await MusicApi.getPlayUrl(track.songId, track.source, track)
-    }
-    if (!playUrl) {
-      PlayerStore.pause()
-      promptAction.showToast({ message: '无法获取播放链接', duration: 1500 })
-      return
-    }
-    track.playUrl = playUrl
-    PlayerStore.play(track)
-
-    const player = AudioPlayer.getInstance()
-    player.onTimeUpdate = (time: number) => { PlayerStore.updateTime(time) }
-    player.onDurationUpdate = (dur: number) => { PlayerStore.updateDuration(dur) }
-    player.onPlayEnd = () => {
-      const nextTrack = PlayerStore.onTrackEnd()
-      if (nextTrack) {
-        this.playTrack(nextTrack)
-      } else {
-        PlayerStore.pause()
-      }
-    }
-    player.onError = (_error: string) => { PlayerStore.pause() }
-
-    await player.play(playUrl)
-  }
-
   @Builder
   TabBarContent() {
     if (this.showPlayer) {
@@ -167,8 +137,8 @@ export struct FloatingTabBar {
           SymbolGlyph($r('sys.symbol.backward_end_fill'))
             .fontSize(18).fontColor([this.themeTextPrimary])
             .onClick(() => {
-              const track = PlayerStore.previous()
-              if (track) { this.playTrack(track) }
+              // 统一走 AudioPlayer 切歌：带取链失败自动跳下一首、防抖（代际）与真实暂停
+              AudioPlayer.getInstance().playPrevious().catch((): void => {})
             })
 
           SymbolGlyph(this.isPlaying ? $r('sys.symbol.pause_fill') : $r('sys.symbol.play_fill'))
@@ -178,8 +148,7 @@ export struct FloatingTabBar {
           SymbolGlyph($r('sys.symbol.forward_end_fill'))
             .fontSize(18).fontColor([this.themeTextPrimary])
             .onClick(() => {
-              const track = PlayerStore.next()
-              if (track) { this.playTrack(track) }
+              AudioPlayer.getInstance().playNext().catch((): void => {})
             })
         } else {
           // 无播放曲目时的占位提示

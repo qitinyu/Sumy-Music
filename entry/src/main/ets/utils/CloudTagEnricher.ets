@@ -28,6 +28,11 @@ export class CloudTagEnricher {
     return lrc === undefined ? '' : lrc
   }
 
+  static clearMemoryCache(): void {
+    CloudTagEnricher.attempted.clear()
+    CloudTagEnricher.lyricCache.clear()
+  }
+
   /** 确保尝试过内嵌标签解析（会话内仅一次），解析结果直接写回 song 对象 */
   static async ensureEnriched(song: SongInfo): Promise<void> {
     if (!song || song.source !== 'webdav' || !song.playUrl || song.playUrl.length === 0) {
