@@ -12,7 +12,12 @@
 
 ## Sumy V2.0
 ### Sumy V2.0.9
-- [] 修复应用在API24设备无法打开的问题
+- [✅] 修复应用在API24设备无法打开的问题 #2076
+  > 根因：`uiMaterial.ImmersiveStyle` 在 API24 运行时不存在，`MaterialCompat.immersiveMaterial()`
+  > 无守卫地读取其成员，在 `initialRender` 阶段抛 `TypeError: Cannot read property THICK of undefined` 导致闪退。
+  > （`uiMaterial`/`systemMaterial` 经查 SDK 类型定义为 `@since 26.0.0`）
+  > 修复：增加运行时能力探测，缺失能力即降级到 `backgroundEffect` 模拟材质。
+  > 详见 `docs/API24兼容性验证报告.md`（实机复测待执行）
 
 ### Sumy V2.0.8
 >通用
