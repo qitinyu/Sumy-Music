@@ -97,6 +97,14 @@ export class MaterialCompat {
       return undefined
     }
     try {
+      // 双重守卫：部分设备/模拟器的 deviceInfo.sdkApiVersion 已上报 26，
+      // 但运行时并未注入 uiMaterial.ImmersiveStyle（取值为 undefined），
+      // 此时读取其成员（如 .THICK）会抛 TypeError，且发生在 initialRender 阶段，
+      // 直接导致应用启动崩溃（实证见 ziyuan/log/1.txt）。
+      // 因此这里用 typeof 做一次运行时能力探测，缺能力即降级返回 undefined。
+      if (typeof uiMaterial.ImmersiveStyle === 'undefined') {
+        return undefined
+      }
       const s: MaterialCompatStyle = style !== undefined ? style : MaterialCompatStyle.REGULAR
       let immersiveStyle: uiMaterial.ImmersiveStyle
       switch (s) {

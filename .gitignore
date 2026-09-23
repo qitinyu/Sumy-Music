@@ -56,3 +56,6 @@ img*.png
 
 # JiuwenSwarm runtime file operation logs
 .agent_history/
+
+# 本地音源速查（不公开）
+/Music Source.md

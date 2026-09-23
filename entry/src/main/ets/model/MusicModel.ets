@@ -217,30 +217,6 @@ export interface LyricLine {
   text: string
 }
 
-// 下载状态
-export enum DownloadStatus {
-  PENDING = 'pending',
-  DOWNLOADING = 'downloading',
-  COMPLETED = 'completed',
-  FAILED = 'failed',
-}
-
-// 下载记录
-export interface DownloadItem {
-  id: string
-  songId: string
-  songName: string
-  artist: string
-  album: string
-  coverUrl: string
-  source: string
-  playUrl: string
-  quality: string
-  status: string
-  progress: number
-  createdAt: number
-}
-
 // 歌单
 export interface Playlist {
   id: string

@@ -1,7 +1,7 @@
 // DatabaseHelper.ets - 本地数据库管理
 // 基于 @kit.ArkData 的关系型数据库 RDB
 import { relationalStore } from '@kit.ArkData'
-import type { SongInfo, Playlist, DownloadItem } from '../model/MusicModel'
+import type { SongInfo, Playlist } from '../model/MusicModel'
 
 // 本地音乐条目类型
 export interface LocalMusicItem {
@@ -69,24 +69,6 @@ const SQL_CREATE_PLAYLIST_SONGS = `
   )
 `
 
-const SQL_CREATE_DOWNLOADS = `
-  CREATE TABLE IF NOT EXISTS download (
-    id TEXT PRIMARY KEY,
-    songId TEXT NOT NULL,
-    songName TEXT NOT NULL,
-    artist TEXT DEFAULT '',
-    album TEXT DEFAULT '',
-    coverUrl TEXT DEFAULT '',
-    source TEXT DEFAULT 'kg',
-    playUrl TEXT DEFAULT '',
-    quality TEXT DEFAULT 'standard',
-    status TEXT DEFAULT 'pending',
-    progress REAL DEFAULT 0,
-    createdAt INTEGER NOT NULL,
-    updatedAt INTEGER NOT NULL
-  )
-`
-
 const SQL_CREATE_SETTINGS = `
   CREATE TABLE IF NOT EXISTS app_setting (
     key TEXT PRIMARY KEY,
@@ -134,7 +116,6 @@ export class DatabaseHelper {
     await this.store.executeSql(SQL_CREATE_FAVORITES)
     await this.store.executeSql(SQL_CREATE_PLAYLISTS)
     await this.store.executeSql(SQL_CREATE_PLAYLIST_SONGS)
-    await this.store.executeSql(SQL_CREATE_DOWNLOADS)
     await this.store.executeSql(SQL_CREATE_SETTINGS)
     await this.store.executeSql(SQL_CREATE_LOCAL_MUSIC)
     // 迁移：添加 coverUrl / sortOrder 列（如果不存在）
@@ -466,94 +447,6 @@ export class DatabaseHelper {
     }
   }
 
-  // ===== 下载 CRUD =====
-
-  async addDownload(song: SongInfo, quality: string): Promise<string | null> {
-    if (!this.store) return null
-    try {
-      const id = generateId()
-      const now = Date.now()
-      const valueBucket: relationalStore.ValuesBucket = {
-        'id': id,
-        'songId': song.songId,
-        'songName': song.songName,
-        'artist': song.artist,
-        'album': song.album,
-        'coverUrl': song.coverUrl,
-        'source': song.source,
-        'playUrl': song.playUrl,
-        'quality': quality,
-        'status': 'pending',
-        'progress': 0,
-        'createdAt': now,
-        'updatedAt': now,
-      }
-      await this.store.insert('download', valueBucket)
-      return id
-    } catch (e) {
-      console.error('[DB] addDownload failed:', e)
-      return null
-    }
-  }
-
-  async getDownloads(): Promise<DownloadItem[]> {
-    if (!this.store) return []
-    try {
-      const predicates = new relationalStore.RdbPredicates('download')
-      predicates.orderByDesc('createdAt')
-      const cursor = await this.store.query(predicates)
-      const items: DownloadItem[] = []
-      while (cursor.goToNextRow()) {
-        items.push({
-          id: cursor.getString(cursor.getColumnIndex('id')),
-          songId: cursor.getString(cursor.getColumnIndex('songId')),
-          songName: cursor.getString(cursor.getColumnIndex('songName')),
-          artist: cursor.getString(cursor.getColumnIndex('artist')),
-          album: cursor.getString(cursor.getColumnIndex('album')),
-          coverUrl: cursor.getString(cursor.getColumnIndex('coverUrl')),
-          source: cursor.getString(cursor.getColumnIndex('source')),
-          playUrl: cursor.getString(cursor.getColumnIndex('playUrl')),
-          quality: cursor.getString(cursor.getColumnIndex('quality')),
-          status: cursor.getString(cursor.getColumnIndex('status')),
-          progress: cursor.getDouble(cursor.getColumnIndex('progress')),
-          createdAt: cursor.getLong(cursor.getColumnIndex('createdAt')),
-        })
-      }
-      cursor.close()
-      return items
-    } catch (e) {
-      console.error('[DB] getDownloads failed:', e)
-      return []
-    }
-  }
-
-  async updateDownloadStatus(id: string, status: string, progress: number): Promise<void> {
-    if (!this.store) return
-    try {
-      const valueBucket: relationalStore.ValuesBucket = {
-        'status': status,
-        'progress': progress,
-        'updatedAt': Date.now(),
-      }
-      const predicates = new relationalStore.RdbPredicates('download')
-      predicates.equalTo('id', id)
-      await this.store.update(valueBucket, predicates)
-    } catch (e) {
-      console.error('[DB] updateDownloadStatus failed:', e)
-    }
-  }
-
-  async deleteDownload(id: string): Promise<void> {
-    if (!this.store) return
-    try {
-      const predicates = new relationalStore.RdbPredicates('download')
-      predicates.equalTo('id', id)
-      await this.store.delete(predicates)
-    } catch (e) {
-      console.error('[DB] deleteDownload failed:', e)
-    }
-  }
-
   // ===== 设置 KV =====
 
   async getSetting(key: string): Promise<string> {
@@ -784,9 +677,6 @@ export class DatabaseHelper {
       // 导出 playlist_song 表
       data['playlist_song'] = await this.exportTable('playlist_song')
 
-      // 导出 download 表
-      data['download'] = await this.exportTable('download')
-
       // 导出 local_music 表
       data['local_music'] = await this.exportTable('local_music')
 
@@ -844,14 +734,14 @@ export class DatabaseHelper {
       if (!tables) return false
 
       // 按顺序清空再插入（注意外键依赖顺序）
-      const clearOrder = ['playlist_song', 'playlist', 'favorite', 'download', 'local_music', 'app_setting']
+      const clearOrder = ['playlist_song', 'playlist', 'favorite', 'local_music', 'app_setting']
       for (let i = 0; i < clearOrder.length; i++) {
         const predicates = new relationalStore.RdbPredicates(clearOrder[i])
         await this.store.delete(predicates)
       }
 
       // 按顺序插入（先 playlist 再 playlist_song）
-      const insertOrder = ['playlist', 'playlist_song', 'favorite', 'download', 'local_music', 'app_setting']
+      const insertOrder = ['playlist', 'playlist_song', 'favorite', 'local_music', 'app_setting']
       for (let i = 0; i < insertOrder.length; i++) {
         const tableName = insertOrder[i]
         const rows = tables[tableName]
@@ -903,20 +793,6 @@ export class DatabaseHelper {
         for (let j = 0; j < playlistSongs.length; j++) {
           addUnique(playlistSongs[j])
         }
-      }
-
-      const downloads = await this.getDownloads()
-      for (let i = 0; i < downloads.length; i++) {
-        const d = downloads[i]
-        addUnique({
-          songId: d.songId,
-          songName: d.songName,
-          artist: d.artist,
-          album: d.album,
-          coverUrl: d.coverUrl,
-          source: d.source,
-          playUrl: d.playUrl,
-        })
       }
     } catch (e) {
       console.error('[DB] getAllSongs failed:', e)

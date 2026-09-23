@@ -3,8 +3,6 @@
 import { SongInfo, Playlist, SourceInfo, createEmptySongInfo } from '../model/MusicModel'
 import { DatabaseHelper } from '../database/DatabaseHelper'
 import { PlayerStore } from '../utils/PlayerStore'
-import { MusicApi } from '../utils/MusicApi'
-import { AudioPlayer } from '../utils/AudioPlayer'
 import { CoverImage } from './CoverImage'
 import { common } from '@kit.AbilityKit'
 import { pasteboard } from '@kit.BasicServicesKit'
@@ -12,8 +10,6 @@ import { systemShare } from '@kit.ShareKit'
 import { uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
 import { CompatUtils } from '../utils/CompatUtils'
-import fs from '@ohos.file.fs'
-import { http } from '@kit.NetworkKit'
 import { promptAction } from '@kit.ArkUI'
 
 interface ActionItem {
@@ -29,7 +25,6 @@ const FULL_ACTION_LIST: ActionItem[] = [
   { icon: $r('sys.symbol.clock'), label: '\u7A0D\u540E\u64AD\u653E', action: 'later' },
   { icon: $r('sys.symbol.share'), label: '\u5206\u4EAB', action: 'share' },
   { icon: $r('sys.symbol.list_bullet'), label: '\u6DFB\u52A0\u5230\u6B4C\u5355', action: 'playlist' },
-  { icon: $r('sys.symbol.square_and_arrow_down'), label: '\u4E0B\u8F7D', action: 'download' },
 ]
 
 // 搜索模式操作列表（搜索版块用）：加入歌单 / 下曲播放 / 分享歌曲（系统分享）
@@ -37,18 +32,6 @@ const SEARCH_ACTION_LIST: ActionItem[] = [
   { icon: $r('sys.symbol.list_bullet'), label: '\u52A0\u5165\u6B4C\u5355', action: 'playlist' },
   { icon: $r('sys.symbol.forward_end_fill'), label: '\u4E0B\u66F2\u64AD\u653E', action: 'play_next' },
   { icon: $r('sys.symbol.share'), label: '\u5206\u4EAB\u6B4C\u66F2', action: 'share' },
-]
-
-// 下载音质选项
-interface QualityOption {
-  label: string
-  value: string
-}
-
-const QUALITY_OPTIONS: QualityOption[] = [
-  { label: '\u6807\u51C6\u54C1\u8D28 (128kbps)', value: 'standard' },
-  { label: '\u9AD8\u54C1\u8D28 (320kbps)', value: 'high' },
-  { label: '\u65E0\u635F\u54C1\u8D28 (FLAC)', value: 'lossless' },
 ]
 
 @Component
@@ -64,7 +47,6 @@ export struct SongActionSheet {
 
   @State private sheetVisible: boolean = false
   @State private showPlaylistPicker: boolean = false
-  @State private showQualityPicker: boolean = false
   @State private showCreatePlaylistInline: boolean = false
   @State private newPlaylistName: string = ''
   @State private playlists: Playlist[] = []
@@ -133,112 +115,10 @@ export struct SongActionSheet {
     }
   }
 
-  private async doDownload(quality: string): Promise<void> {
-    // 检查高品质并发下载限制
-    if (quality === 'high' || quality === 'lossless') {
-      const downloads = await this.db.getDownloads()
-      const activeCount = downloads.filter(d =>
-        d.status === 'downloading' || d.status === 'pending'
-      ).length
-      if (activeCount >= 5) {
-        this.showToastMsg('\u9AD8\u54C1\u8D28\u4E0B\u8F7D\u6700\u591A\u540C\u65F6\u8FDB\u884C5\u9996\uFF0C\u8BF7\u7B49\u5F85\u5B8C\u6210')
-        return
-      }
-    }
-
-    const result = await this.db.addDownload(this.song, quality)
-    if (result) {
-      this.showToastMsg('\u5DF2\u6DFB\u52A0\u5230\u4E0B\u8F7D\u5217\u8868')
-      this.executeDownload(result, this.song, quality)
-    } else {
-      this.showToastMsg('\u4E0B\u8F7D\u4EFB\u52A1\u6DFB\u52A0\u5931\u8D25')
-    }
-    this.showQualityPicker = false
-  }
-
-  // 搜索模式：自动下载普通音质
-  private async doAutoDownload(): Promise<void> {
-    const result = await this.db.addDownload(this.song, 'standard')
-    if (result) {
-      this.showToastMsg('\u5DF2\u5F00\u59CB\u4E0B\u8F7D\uFF08\u6807\u51C6\u54C1\u8D28\uFF09')
-      this.executeDownload(result, this.song, 'standard')
-    } else {
-      this.showToastMsg('\u4E0B\u8F7D\u4EFB\u52A1\u6DFB\u52A0\u5931\u8D25')
-    }
-  }
-
   // 下曲播放
   private doPlayNext(): void {
     PlayerStore.insertNext(this.song)
     this.showToastMsg('\u5DF2\u6DFB\u52A0\u5230\u4E0B\u4E00\u9996\u64AD\u653E')
-  }
-
-  private async executeDownload(downloadId: string, song: SongInfo, quality: string): Promise<void> {
-    try {
-      await this.db.updateDownloadStatus(downloadId, 'downloading', 0)
-
-      // 获取播放URL
-      let playUrl = song.playUrl
-      if (!playUrl) {
-        playUrl = await MusicApi.getPlayUrl(song.songId, song.source, song)
-      }
-      if (!playUrl) {
-        await this.db.updateDownloadStatus(downloadId, 'failed', 0)
-        return
-      }
-
-      // 使用 http 下载文件
-      const httpRequest = http.createHttp()
-
-      try {
-        const response = await httpRequest.request(playUrl, {
-          method: http.RequestMethod.GET,
-          readTimeout: 120000,
-          connectTimeout: 15000,
-        } as http.HttpRequestOptions)
-
-        if (response.responseCode === 200 && response.result) {
-          // 确定文件扩展名
-          let ext: string = '.mp3'
-          if (quality === 'lossless') {
-            ext = '.flac'
-          }
-
-          // 安全文件名
-          const safeName = song.songName.replace(/[\/\\:*?"<>|]/g, '_')
-          const fileName = `${safeName} - ${song.artist.replace(/[\/\\:*?"<>|]/g, '_')}${ext}`
-
-          // 确保目录存在
-          const dirPath = '/SHMY/Music/'
-          try {
-            fs.mkdir(dirPath, true)
-          } catch (_e) {
-            // 目录可能已存在
-          }
-
-          const filePath: string = dirPath + fileName
-
-          // 写入文件
-          if (typeof response.result === 'string') {
-            const file: fs.File = fs.openSync(filePath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY)
-            fs.writeSync(file.fd, response.result)
-            fs.closeSync(file)
-          }
-
-          await this.db.updateDownloadStatus(downloadId, 'completed', 100)
-        } else {
-          await this.db.updateDownloadStatus(downloadId, 'failed', 0)
-        }
-      } catch (_e) {
-        console.error('[SongActionSheet] download write failed')
-        await this.db.updateDownloadStatus(downloadId, 'failed', 0)
-      } finally {
-        httpRequest.destroy()
-      }
-    } catch (e) {
-      console.error('[SongActionSheet] executeDownload failed:', e)
-      await this.db.updateDownloadStatus(downloadId, 'failed', 0)
-    }
   }
 
   private async doShare(): Promise<void> {
@@ -401,22 +281,6 @@ export struct SongActionSheet {
             },
           })
 
-        // 音质选择面板（仅完整模式）
-        if (this.mode === 'full') {
-          Row()
-            .width(1)
-            .height(1)
-            .bindSheet($$this.showQualityPicker, this.QualityPickerContent(), {
-              height: SheetSize.FIT_CONTENT,
-              dragBar: true,
-              showClose: false,
-              backgroundColor: Color.Transparent,
-              systemMaterial: this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THICK) : undefined,
-              onDisappear: () => {
-                this.showQualityPicker = false
-              },
-            })
-        }
       }
 
     }
@@ -504,24 +368,23 @@ export struct SongActionSheet {
               Row() {
                 SymbolGlyph(item.icon)
                   .fontSize(18)
-                  .fontColor(item.action === 'download_disabled' ? [this.themeTextSecondary] : [this.themePrimary])
+                  .fontColor([this.themePrimary])
               }
               .width(36)
               .height(36)
               .borderRadius(9)
-              .backgroundColor(item.action === 'download_disabled' ? this.themePlaceholder : this.themePrimaryLight)
+              .backgroundColor(this.themePrimaryLight)
               .justifyContent(FlexAlign.Center)
               .flexShrink(0)
 
               Text(item.label)
                 .fontSize(14)
-                .fontColor(item.action === 'download_disabled' ? this.themeTextSecondary : this.themeTextPrimary)
+                .fontColor(this.themeTextPrimary)
                 .layoutWeight(1)
 
               SymbolGlyph($r('sys.symbol.chevron_right'))
                 .fontSize(16)
                 .fontColor([this.themeTextSecondary])
-                .opacity(item.action === 'download_disabled' ? 0 : 1)
                 .flexShrink(0)
             }
             .width('100%')
@@ -782,46 +645,6 @@ export struct SongActionSheet {
     }
   }
 
-  @Builder
-  QualityPickerContent() {
-    Column() {
-      Text('\u9009\u62E9\u4E0B\u8F7D\u97F3\u8D28')
-        .fontSize(17)
-        .fontColor(this.themeTextPrimary)
-        .fontWeight(FontWeight.Bold)
-        .width('100%')
-        .padding({ left: 24, right: 24, top: 16, bottom: 12 })
-
-      ForEach(QUALITY_OPTIONS, (option: QualityOption) => {
-        Row({ space: 12 }) {
-          Text(option.label)
-            .fontSize(15)
-            .fontColor(this.themeTextPrimary)
-            .layoutWeight(1)
-
-          SymbolGlyph($r('sys.symbol.chevron_right'))
-            .fontSize(16)
-            .fontColor([this.themeTextSecondary])
-        }
-        .width('100%')
-        .padding({ left: 24, right: 24, top: 14, bottom: 14 })
-        .onClick(() => {
-          this.doDownload(option.value)
-        })
-      })
-
-      if (QUALITY_OPTIONS.some(q => q.value === 'high' || q.value === 'lossless')) {
-        Text('\u9AD8\u54C1\u8D28\u97F3\u4E50\u4E00\u6B21\u81F3\u591A\u4E0B\u8F7D5\u9996')
-          .fontSize(12)
-          .fontColor(this.themeTextSecondary)
-          .width('100%')
-          .padding({ left: 24, right: 24, bottom: 16 })
-      }
-
-      Column().height(8)
-    }
-  }
-
   private handleAction(action: string): void {
     switch (action) {
       case 'play':
@@ -846,23 +669,14 @@ export struct SongActionSheet {
           this.showPlaylistPicker = true
         })
         break
-      case 'download':
-        this.showQualityPicker = true
-        break
       case 'play_next':
         this.doPlayNext()
-        break
-      case 'auto_download':
-        this.doAutoDownload()
-        break
-      case 'download_disabled':
-        this.showToastMsg('\u6B64\u529F\u80FD\u5C1A\u672A\u5F00\u542F')
         break
       default:
         break
     }
     // 非弹窗操作时关闭主面板
-    if (action !== 'playlist' && action !== 'download' && action !== 'download_disabled') {
+    if (action !== 'playlist') {
       this.dismiss()
     }
   }
