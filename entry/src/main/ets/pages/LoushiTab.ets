@@ -76,7 +76,7 @@ const aboutItems: AboutItem[] = [
   {
     label: '版本日志',
     type: 'text',
-    content: 'v2.0.7.7\n' +
+    content: 'v2.0.8.2\n' +
       '1. 重点：修复切歌后封面已切换但歌曲没变、无反馈、进度继承的问题\n' +
       '2. 修复单击歌曲长时间无法播放：取链提速，失败提示并自动切下一首\n' +
       '3. 修复播放页进度条无法拖动、本地音乐歌词乱码\n' +
@@ -145,6 +145,12 @@ export struct LoushiTab {
   @State searchPersist: boolean = false // 搜索常驻，默认关闭
   @State searchSuggest: boolean = true // 搜索联想词，默认开启
   @State showHomeStats: boolean = true // 默认开启
+  // 筛选源规定-自动定位跳转（默认开启）：自动记忆、定位、跳转上次的音源位置
+  @State searchSourceLocate: boolean = true
+  // 歌单内设置-定位播放歌曲（默认关闭）：开启后进入歌单自动定位并跳转播放中歌曲
+  @State playlistLocatePlaying: boolean = false
+  // 播放列表设置-定位播放歌曲（默认关闭）：开启后进入歌单自动定位并跳转播放中歌曲
+  @State queueLocatePlaying: boolean = false
   @StorageProp('theme_primary') themePrimary: string = '#007DFF'
   @StorageProp('theme_bg') themeBg: string = '#F8F8FA'
   @StorageProp('theme_cardBg') themeCardBg: string = '#FFFFFF'
@@ -315,6 +321,18 @@ export struct LoushiTab {
     this.searchSuggest = searchSuggest !== 'false' // 默认开启
     const homeStats = await this.db.getSetting('showHomeStats')
     this.showHomeStats = homeStats !== 'false' // 默认开启
+    // 筛选源规定-自动定位跳转（默认开启）
+    const sourceLocate = await this.db.getSetting('searchSourceLocate')
+    this.searchSourceLocate = sourceLocate !== 'false'
+    AppStorage.setOrCreate('searchSourceLocate', this.searchSourceLocate)
+    // 歌单内设置-定位播放歌曲（默认关闭）
+    const playlistLocate = await this.db.getSetting('playlistLocatePlaying')
+    this.playlistLocatePlaying = playlistLocate === 'true'
+    AppStorage.setOrCreate('playlistLocatePlaying', this.playlistLocatePlaying)
+    // 播放列表设置-定位播放歌曲（默认关闭）
+    const queueLocate = await this.db.getSetting('queueLocatePlaying')
+    this.queueLocatePlaying = queueLocate === 'true'
+    AppStorage.setOrCreate('queueLocatePlaying', this.queueLocatePlaying)
 
     // WebDAV
     this.webdavUrl = (await this.db.getSetting('webdav_url')) || ''
@@ -1516,7 +1534,7 @@ export struct LoushiTab {
                 .fontSize(22)
                 .fontColor(this.themeTextPrimary)
                 .fontWeight(FontWeight.Bold)
-              Text('Version 2.0.7.7')
+              Text('Version 2.0.8.2')
                 .fontSize(13)
                 .fontColor(this.themeTextSecondary)
             }
@@ -1798,6 +1816,35 @@ export struct LoushiTab {
     .justifyContent(FlexAlign.Start)
   }
 
+  // V2.1.0 精简版块设置：单行开关条目（可选小字 subTitle，一行一个功能）
+  @Builder
+  SettingToggleRow(title: string, subTitle: string, isOn: boolean, onChanged: (v: boolean) => void) {
+    Row({ space: 12 }) {
+      Column({ space: 2 }) {
+        Text(title)
+          .fontSize(15)
+          .fontColor(this.themeTextPrimary)
+          .width('100%')
+        if (subTitle.length > 0) {
+          Text(subTitle)
+            .fontSize(12)
+            .fontColor(this.themeTextSecondary)
+            .width('100%')
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      Toggle({ type: ToggleType.Switch, isOn: isOn })
+        .selectedColor(this.themePrimary)
+        .onChange((v: boolean) => {
+          onChanged(v)
+        })
+    }
+    .width('100%')
+    .padding({ top: 12, bottom: 12 })
+  }
+
   // ======================== 主页设置 ========================
   @Builder
   XuanchuangSettingsPage() {
@@ -1805,31 +1852,53 @@ export struct LoushiTab {
       this.SubPageHeader('\u4E3B\u9875\u8BBE\u7F6E')
       Scroll() {
         Column({ space: 12 }) {
-          // 统计卡片开关
-          Column({ space: 8 }) {
-            Text('\u4E3B\u9875\u7EDF\u8BA1')
-              .fontSize(16).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Medium).width('100%')
-            Text('\u5728\u4E3B\u9875\u663E\u793A\u6B4C\u5355\u6570\u3001\u542C\u6B4C\u65F6\u957F\u3001\u542C\u6B4C\u66F2\u76EE\u7B49\u7EDF\u8BA1\u4FE1\u606F')
-              .fontSize(13).fontColor(this.themeTextSecondary).width('100%')
-            Row({ space: 12 }) {
-              Column({ space: 2 }) {
-                Text('\u663E\u793A\u7EDF\u8BA1\u5361\u7247')
-                  .fontSize(15).fontColor(this.themeTextPrimary).width('100%')
-                Text('\u5173\u95ED\u540E\u4E3B\u9875\u5C06\u9690\u85CF\u9876\u90E8\u7EDF\u8BA1\u5361\u7247')
-                  .fontSize(12).fontColor(this.themeTextSecondary).width('100%')
-              }
-              .layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.showHomeStats })
-                .selectedColor(this.themePrimary)
-                .onChange((v: boolean) => {
-                  this.showHomeStats = v
-                  this.saveSetting('showHomeStats', String(v))
-                })
-            }
-            .width('100%').padding({ top: 8 })
+          // V2.1.0 精简：主页统计单行开关
+          Column() {
+            this.SettingToggleRow('主页统计', '', this.showHomeStats, (v: boolean) => {
+              this.showHomeStats = v
+              this.saveSetting('showHomeStats', String(v))
+            })
           }
-          .width('100%').padding(16)
-          .backgroundColor(this.themeCardBg).borderRadius(12)
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+          .backgroundColor(this.themeCardBg)
+          .borderRadius(12)
+
+          // 歌单内设置：定位播放歌曲（默认关闭）
+          Column() {
+            Text('歌单内设置')
+              .fontSize(13)
+              .fontColor(this.themeTextSecondary)
+              .width('100%')
+              .padding({ top: 12 })
+            this.SettingToggleRow('定位播放歌曲', '开启后进入歌单自动定位并跳转播放中歌曲', this.playlistLocatePlaying, (v: boolean) => {
+              this.playlistLocatePlaying = v
+              this.saveSetting('playlistLocatePlaying', String(v))
+              AppStorage.setOrCreate('playlistLocatePlaying', v)
+            })
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+          .backgroundColor(this.themeCardBg)
+          .borderRadius(12)
+
+          // 播放列表设置：定位播放歌曲（默认关闭）
+          Column() {
+            Text('播放列表设置')
+              .fontSize(13)
+              .fontColor(this.themeTextSecondary)
+              .width('100%')
+              .padding({ top: 12 })
+            this.SettingToggleRow('定位播放歌曲', '开启后进入歌单自动定位并跳转播放中歌曲', this.queueLocatePlaying, (v: boolean) => {
+              this.queueLocatePlaying = v
+              this.saveSetting('queueLocatePlaying', String(v))
+              AppStorage.setOrCreate('queueLocatePlaying', v)
+            })
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+          .backgroundColor(this.themeCardBg)
+          .borderRadius(12)
 
           Column().height(168)
         }
@@ -1849,83 +1918,45 @@ export struct LoushiTab {
       this.SubPageHeader('\u641C\u7D22\u8BBE\u7F6E')
       Scroll() {
         Column({ space: 12 }) {
-          // 搜索记忆开关
-          Column({ space: 8 }) {
-            Text('\u641C\u7D22\u8BB0\u5FC6')
-              .fontSize(16).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Medium).width('100%')
-            Text('\u8BB0\u4F4F\u641C\u7D22\u5173\u952E\u8BCD\u548C\u7ED3\u679C\uFF0C\u5207\u6362\u9875\u9762\u540E\u81EA\u52A8\u6062\u590D')
-              .fontSize(13).fontColor(this.themeTextSecondary).width('100%')
-            Row({ space: 12 }) {
-              Column({ space: 2 }) {
-                Text('\u542F\u7528\u641C\u7D22\u8BB0\u5FC6')
-                  .fontSize(15).fontColor(this.themeTextPrimary).width('100%')
-                Text('\u5173\u95ED\u540E\u5207\u6362\u9875\u9762\u4E0D\u518D\u4FDD\u7559\u641C\u7D22\u7ED3\u679C')
-                  .fontSize(12).fontColor(this.themeTextSecondary).width('100%')
-              }
-              .layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.searchMemory })
-                .selectedColor(this.themePrimary)
-                .onChange((v: boolean) => {
-                  this.searchMemory = v
-                  this.saveSetting('searchMemory', String(v))
-                })
-            }
-            .width('100%').padding({ top: 8 })
+          // V2.1.0 精简：一区块一行功能
+          Column() {
+            this.SettingToggleRow('搜索记忆', '', this.searchMemory, (v: boolean) => {
+              this.searchMemory = v
+              this.saveSetting('searchMemory', String(v))
+            })
+            Divider().width('100%').color(this.themeDivider)
+            this.SettingToggleRow('搜索常驻', '', this.searchPersist, (v: boolean) => {
+              this.searchPersist = v
+              this.saveSetting('searchPersist', String(v))
+            })
+            Divider().width('100%').color(this.themeDivider)
+            this.SettingToggleRow('搜索联想词', '', this.searchSuggest, (v: boolean) => {
+              this.searchSuggest = v
+              this.saveSetting('searchSuggest', String(v))
+            })
           }
-          .width('100%').padding(16)
-          .backgroundColor(this.themeCardBg).borderRadius(12)
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+          .backgroundColor(this.themeCardBg)
+          .borderRadius(12)
 
-          // 搜索常驻开关
-          Column({ space: 8 }) {
-            Text('\u641C\u7D22\u5E38\u9A7B')
-              .fontSize(16).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Medium).width('100%')
-            Text('\u5E38\u9A7B\u4E0A\u6B21\u7684\u641C\u7D22\u540D\u548C\u641C\u7D22\u7ED3\u679C\uFF0C\u9700\u624B\u52A8\u6E05\u7A7A')
-              .fontSize(13).fontColor(this.themeTextSecondary).width('100%')
-            Row({ space: 12 }) {
-              Column({ space: 2 }) {
-                Text('\u542F\u7528\u641C\u7D22\u5E38\u9A7B')
-                  .fontSize(15).fontColor(this.themeTextPrimary).width('100%')
-                Text('\u5173\u95ED\u540E\u4E0D\u5E38\u9A7B\u641C\u7D22\u540D\u548C\u7ED3\u679C')
-                  .fontSize(12).fontColor(this.themeTextSecondary).width('100%')
-              }
-              .layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.searchPersist })
-                .selectedColor(this.themePrimary)
-                .onChange((v: boolean) => {
-                  this.searchPersist = v
-                  this.saveSetting('searchPersist', String(v))
-                })
-            }
-            .width('100%').padding({ top: 8 })
+          // 筛选源规定：自动定位跳转（默认开启）
+          Column() {
+            Text('筛选源规定')
+              .fontSize(13)
+              .fontColor(this.themeTextSecondary)
+              .width('100%')
+              .padding({ top: 12 })
+            this.SettingToggleRow('自动定位跳转', '自动记忆、定位、跳转上次的音源位置', this.searchSourceLocate, (v: boolean) => {
+              this.searchSourceLocate = v
+              this.saveSetting('searchSourceLocate', String(v))
+              AppStorage.setOrCreate('searchSourceLocate', v)
+            })
           }
-          .width('100%').padding(16)
-          .backgroundColor(this.themeCardBg).borderRadius(12)
-
-          // 搜索联想词开关
-          Column({ space: 8 }) {
-            Text('\u641C\u7D22\u8054\u60F3\u8BCD')
-              .fontSize(16).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Medium).width('100%')
-            Text('\u8F93\u5165\u5173\u952E\u8BCD\u65F6\u5C55\u793A\u641C\u7D22\u8054\u60F3\u5F39\u7A97\uFF0C\u70B9\u51FB\u8BCD\u6761\u5FEB\u6377\u641C\u7D22')
-              .fontSize(13).fontColor(this.themeTextSecondary).width('100%')
-            Row({ space: 12 }) {
-              Column({ space: 2 }) {
-                Text('\u542F\u7528\u641C\u7D22\u8054\u60F3\u8BCD')
-                  .fontSize(15).fontColor(this.themeTextPrimary).width('100%')
-                Text('\u5173\u95ED\u540E\u641C\u7D22\u4E0D\u518D\u5C55\u793A\u8054\u60F3\u5F39\u7A97')
-                  .fontSize(12).fontColor(this.themeTextSecondary).width('100%')
-              }
-              .layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.searchSuggest })
-                .selectedColor(this.themePrimary)
-                .onChange((v: boolean) => {
-                  this.searchSuggest = v
-                  this.saveSetting('searchSuggest', String(v))
-                })
-            }
-            .width('100%').padding({ top: 8 })
-          }
-          .width('100%').padding(16)
-          .backgroundColor(this.themeCardBg).borderRadius(12)
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+          .backgroundColor(this.themeCardBg)
+          .borderRadius(12)
 
           Column().height(168)
         }

@@ -53,6 +53,8 @@ export class PlayerStore {
     AppStorage.setOrCreate(PlayerKeys.LYRICS, [])
     AppStorage.setOrCreate(PlayerKeys.LYRICS_RAW, '')
     PlayerStore.loadLyricsAsync(track)
+    // V2.1.6：切歌统一补全 WebDAV 授权封面（所有切歌路径生效：搜索页/迷你栏/播放页/自动下一首）
+    PlayerStore.ensureCoverAsync(track)
   }
 
   // 异步加载当前曲目歌词（带切歌竞态保护）
@@ -88,6 +90,30 @@ export class PlayerStore {
         PlayerStore.setLyrics(parsed, raw)
       }
     }
+  }
+
+  // V2.1.6：切歌统一补全 WebDAV 授权封面（user:pass@ 的 http URL 系统组件无法直显），
+  // 解析为本地 file:// 后刷新当前曲目，背景取色/列表封面同步受益
+  static ensureCoverAsync(track: SongInfo): void {
+    const cover: string = track.coverUrl
+    if (cover.length === 0 || cover.indexOf('@') < 0 || cover.indexOf('://') < 0) {
+      return
+    }
+    if (!cover.startsWith('http://') && !cover.startsWith('https://')) {
+      return
+    }
+    MusicApi.fetchCoverFromOnline(track).then((resolved: string) => {
+      if (resolved.length === 0 || resolved === cover) {
+        return
+      }
+      // 期间已切歌则丢弃，避免污染新歌封面
+      const now: SongInfo | undefined = PlayerStore.getCurrentTrack()
+      if (now && now.songId === track.songId && now.source === track.source) {
+        track.coverUrl = resolved
+        PlayerStore.refreshCurrentTrack(track)
+      }
+    }).catch((_e: Error) => {
+    })
   }
 
   // 暂停

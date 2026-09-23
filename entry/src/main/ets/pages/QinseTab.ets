@@ -33,9 +33,6 @@ export struct QinseTab {
   @StorageProp('theme_bgImageName') themeBgImageName: string = ''
   @StorageProp('isDarkMode') isDarkMode: boolean = false
 
-  // 返回回调：切回推荐页（由 Index 注入）
-  onBack: () => void = () => {}
-
   @State keyword: string = ''
   @State selectedSource: string = 'all'
   @State searchResults: SongInfo[] = []
@@ -44,6 +41,10 @@ export struct QinseTab {
   @State searchError: string = ''
   // 筛选：从当前结果中自动检测可用音源
   @State sourceFilter: string = 'all'
+  // 版块设置-搜索：筛选源规定-自动定位跳转（默认开启）：自动记忆、定位、跳转上次的音源位置
+  @StorageProp('searchSourceLocate') searchSourceLocate: boolean = true
+  // 上次选择的音源筛选（持久化，新搜索自动沿用）
+  private lastSourceFilter: string = 'all'
 
   // Action sheet
   @State selectedSong: SongInfo | null = null
@@ -89,6 +90,14 @@ export struct QinseTab {
   private db: DatabaseHelper = DatabaseHelper.getInstance()
   private supportImmersive: boolean = CompatUtils.isImmersiveSupported()
 
+  // V2.0.8 单曲换源会话状态：播放失败后在已有搜索结果内换源重播（不改歌名）
+  private sessionToken: number = 0            // 会话令牌：每次新会话递增，旧异步流程据此自行中止
+  private sessionSong: SongInfo | null = null // 本会话正在播放的原曲（歌名/歌手展示保持不变）
+  private sessionCandidates: SongInfo[] = []  // 候选音源列表：[0]=原曲 + 搜索结果中同名其它源
+  private sessionCursor: number = 0           // 当前尝试到的候选下标
+  private sessionBusyToken: number = -1       // 正在运行的重试循环令牌（-1=无循环在跑）
+  private sessionAttemptFailed: boolean = false // 起播宽限期内的失败标记（由播放错误回调写入）
+
   async aboutToAppear() {
     // 读取搜索常驻 / 搜索记忆 / 搜索联想词开关
     const persist = await this.db.getSetting('searchPersist')
@@ -97,6 +106,9 @@ export struct QinseTab {
     this.searchMemoryEnabled = mem !== 'false'
     const suggest = await this.db.getSetting('searchSuggest')
     this.searchSuggestEnabled = suggest !== 'false'
+    // 自动定位跳转开启时恢复上次选择的音源筛选
+    const savedFilter = await this.db.getSetting('searchSourceFilter')
+    this.lastSourceFilter = savedFilter.length > 0 ? savedFilter : 'all'
     // 恢复上次搜索（搜索常驻 / 搜索记忆开启时）
     await this.restorePersistedSearch()
     this.loadSearchHistory()
@@ -122,6 +134,7 @@ export struct QinseTab {
       this.keyword = savedKeyword ?? ''
       this.searchResults = savedResults
       this.isSearched = true
+      this.applyRememberedFilter()
       return
     }
     // 2. 跨进程重启：AppStorage 不持久化，回退到数据库恢复上次搜索
@@ -134,8 +147,21 @@ export struct QinseTab {
         AppStorage.setOrCreate('qinseKeyword', saved.keyword)
         AppStorage.setOrCreate('qinseSearchResults', saved.results)
         AppStorage.setOrCreate('qinseIsSearched', true)
+        this.applyRememberedFilter()
       }
     }
+  }
+
+  // 自动定位跳转：新搜索/恢复结果后自动沿用上次选择的音源（结果中无该源时回退"全部"）
+  private applyRememberedFilter(): void {
+    let next: string = 'all'
+    if (this.searchSourceLocate && this.lastSourceFilter !== 'all') {
+      const hasSource = this.searchResults.some((s: SongInfo) => this.getSourceOfSong(s) === this.lastSourceFilter)
+      if (hasSource) {
+        next = this.lastSourceFilter
+      }
+    }
+    this.sourceFilter = next
   }
 
   private async loadSearchHistory(): Promise<void> {
@@ -160,45 +186,17 @@ export struct QinseTab {
       clearTimeout(this.resultPillTimer)
       this.resultPillTimer = -1
     }
+    // V2.0.8：销毁搜索页时结束换源会话，恢复默认错误处理
+    this.sessionToken++
+    this.sessionSong = null
+    this.sessionCandidates = []
+    AudioPlayer.getInstance().endRetrySession()
   }
 
   build() {
     Stack() {
       Column() {
         Row() {
-          Button({ type: ButtonType.Normal }) {
-            Row() {
-              SymbolGlyph($r('sys.symbol.chevron_left'))
-                .fontSize(18)
-                .fontColor([$r('sys.color.font_primary')])
-            }
-            .width(32)
-            .height(32)
-            .justifyContent(FlexAlign.Center)
-            .borderRadius(16)
-            .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN) : undefined)
-            .backgroundColor(this.supportImmersive ? Color.Transparent : (this.isDarkMode ? '#2A2A2A' : '#EDEDED'))
-          }
-          .width(32)
-          .height(32)
-          .padding(0)
-          .margin({ right: 8 })
-          .backgroundColor(Color.Transparent)
-          .onClick(() => {
-            this.hideSuggestPanel()
-            if (this.searchTimer !== -1) {
-              clearTimeout(this.searchTimer)
-            }
-            this.keyword = ''
-            this.isSearched = false
-            this.searchResults = []
-            AppStorage.setOrCreate('qinseKeyword', '')
-            AppStorage.setOrCreate('qinseIsSearched', false)
-            AppStorage.setOrCreate('qinseSearchResults', [])
-            this.db.clearSearchResults()
-            this.onBack()
-          })
-
           Row({ space: 6 }) {
             SymbolGlyph($r('sys.symbol.magnifyingglass'))
               .fontSize(14)
@@ -267,17 +265,17 @@ export struct QinseTab {
           .backgroundColor(this.themeCardBg)
           .padding({ right: 8 })
 
-          // 筛选：点击展开当前结果中自动检测到的音源
+          // 筛选：点击展开当前结果中自动检测到的音源（选中具体音源时标蓝）
           Button({ type: ButtonType.Normal }) {
             Row({ space: 3 }) {
               Text(this.sourceFilter === 'all' ? '筛选' : SourceInfo.getAbbr(this.sourceFilter))
                 .fontSize(11)
-                .fontColor($r('sys.color.font_primary'))
+                .fontColor(this.sourceFilter === 'all' ? $r('sys.color.font_primary') : this.themePrimary)
                 .fontWeight(FontWeight.Medium)
                 .maxLines(1)
               SymbolGlyph($r('sys.symbol.chevron_down'))
                 .fontSize(9)
-                .fontColor([$r('sys.color.font_primary')])
+                .fontColor([this.sourceFilter === 'all' ? $r('sys.color.font_primary') : this.themePrimary])
             }
             .justifyContent(FlexAlign.Center)
           }
@@ -285,7 +283,7 @@ export struct QinseTab {
           .padding({ left: 10, right: 10 })
           .margin({ left: 8 })
           .borderRadius(18)
-          .backgroundColor(this.themeCardBg)
+          .backgroundColor(this.sourceFilter === 'all' ? this.themeCardBg : this.themePrimaryLight)
           .enabled(this.isSearched && this.searchResults.length > 0)
           .opacity(this.isSearched && this.searchResults.length > 0 ? 1 : 0.4)
           .bindMenu(this.buildFilterMenuItems())
@@ -604,6 +602,8 @@ export struct QinseTab {
       value: `全部（${this.searchResults.length}）`,
       action: () => {
         this.sourceFilter = 'all'
+        this.lastSourceFilter = 'all'
+        this.db.setSetting('searchSourceFilter', 'all')
       }
     })
     // 统计当前结果中各音源数量
@@ -623,6 +623,8 @@ export struct QinseTab {
         value: `${SourceInfo.getAbbr(src)}（${counts.get(src) ?? 0}）`,
         action: () => {
           this.sourceFilter = src
+          this.lastSourceFilter = src
+          this.db.setSetting('searchSourceFilter', src)
         }
       })
     }
@@ -931,8 +933,6 @@ export struct QinseTab {
     this.isLoading = true
     this.isSearched = true
     this.searchError = ''
-    // 新搜索重置筛选到“全部”
-    this.sourceFilter = 'all'
 
     console.info(`[QinseTab] doSearch: keyword="${kw}", source=${this.selectedSource}`)
 
@@ -947,6 +947,9 @@ export struct QinseTab {
       this.searchResults = []
       this.searchError = '搜索异常：' + String(e)
     }
+
+    // 自动定位跳转开启时沿用上次选择的音源筛选（新结果中无该源则回退"全部"），否则重置"全部"
+    this.applyRememberedFilter()
 
     this.isLoading = false
     this.saveToAppStorage()
@@ -966,42 +969,173 @@ export struct QinseTab {
     promptAction.showToast({ message: '\u641C\u7D22\u8BB0\u5F55\u5DF2\u6E05\u7A7A', duration: 1500 })
   }
 
-  private async playSong(song: SongInfo) {
-    // 先立即切换曲目与队列（UI/歌词即时跟随），取链在后台完成后起播
+  // V2.0.8：单歌播放（带失败自动换源）
+  // 先立即切换曲目与队列（UI/歌词即时跟随）；取链/起播失败时在已有搜索结果内
+  // 逐个换源重播同一首歌（不改变歌名），每一步通过底部弹窗可视化。
+  private async playSong(song: SongInfo): Promise<void> {
     const queue: SongInfo[] = this.searchResults
-    PlayerStore.play(song, queue, queue.indexOf(song))
+    const idx: number = queue.indexOf(song)
+    PlayerStore.play(song, queue, idx >= 0 ? idx : 0)
+
+    // 开启新的换源会话：作废旧会话，注册错误接管回调
+    this.sessionToken++
+    const token: number = this.sessionToken
+    this.sessionSong = song
+    this.sessionCursor = 0
+    this.sessionAttemptFailed = false
+    this.sessionCandidates = this.buildSourceCandidates(song)
+
     const player = AudioPlayer.getInstance()
-    player.setCurrentSong(song)
+    player.beginRetrySession(song.source + '|' + song.songId, (message: string): void => {
+      this.onSessionPlayError(token)
+    })
 
-    let playUrl = song.playUrl
-    if (!playUrl) {
-      playUrl = await MusicApi.getPlayUrl(song.songId, song.source, song)
+    this.runSourceFallback(token)
+  }
+
+  // 组装备选音源列表：首位为原曲，其后为搜索结果中同名同歌手的其它音源（去重）
+  private buildSourceCandidates(song: SongInfo): SongInfo[] {
+    const candidates: SongInfo[] = [song]
+    for (let i = 0; i < this.searchResults.length; i++) {
+      const c: SongInfo = this.searchResults[i]
+      if (c.source === song.source && c.songId === song.songId) {
+        continue
+      }
+      if (!this.isSameSongForSwitch(c, song)) {
+        continue
+      }
+      let dup: boolean = false
+      for (let j = 0; j < candidates.length; j++) {
+        if (candidates[j].source === c.source) {
+          dup = true
+          break
+        }
+      }
+      if (!dup) {
+        candidates.push(c)
+      }
     }
-    // 取链期间用户又点了其它歌曲：放弃本次起播，避免覆盖新歌
-    const now: SongInfo | undefined = PlayerStore.getCurrentTrack()
-    if (!now || now.songId !== song.songId || now.source !== song.source) {
+    return candidates
+  }
+
+  // 换源匹配：歌名一致（忽略大小写/首尾空白），歌手互相包含（为空则放行）
+  private isSameSongForSwitch(a: SongInfo, b: SongInfo): boolean {
+    const na: string = a.songName.trim().toLowerCase()
+    const nb: string = b.songName.trim().toLowerCase()
+    if (na !== nb) {
+      return false
+    }
+    const aa: string = a.artist.trim().toLowerCase()
+    const ab: string = b.artist.trim().toLowerCase()
+    if (aa.length === 0 || ab.length === 0) {
+      return true
+    }
+    return aa.includes(ab) || ab.includes(aa)
+  }
+
+  // 换源会话内的播放错误回调（由 AudioPlayer 在会话曲目出错时调用）
+  private onSessionPlayError(token: number): void {
+    if (token !== this.sessionToken) {
+      return // 旧会话的错误：忽略
+    }
+    if (token === this.sessionBusyToken) {
+      // 重试循环正在运行：置失败标记，由循环在起播宽限期后读取
+      this.sessionAttemptFailed = true
       return
     }
-    if (!playUrl) {
-      SourceStatus.markUnplayable(song.source)
-      // 真正停掉 AVPlayer（PlayerStore.pause 只改 AppStorage 标记，旧歌会继续响）
+    // 之前已成功起播、播放中途失败：从下一个候选源继续换源
+    this.sessionCursor++
+    this.runSourceFallback(token)
+  }
+
+  // 换源重试主循环：从 sessionCursor 起依次尝试候选音源，直至起播成功或全部失败
+  private async runSourceFallback(token: number): Promise<void> {
+    if (token !== this.sessionToken || token <= this.sessionBusyToken) {
+      return // 会话已过期，或已有更新的循环在运行
+    }
+    this.sessionBusyToken = token
+    const player = AudioPlayer.getInstance()
+    const origin: SongInfo | null = this.sessionSong
+    try {
+      while (token === this.sessionToken && this.sessionCursor < this.sessionCandidates.length) {
+        const candidate: SongInfo = this.sessionCandidates[this.sessionCursor]
+        const isOrigin: boolean = this.sessionCursor === 0
+        const label: string = SourceInfo.getName(candidate.source)
+
+        // 步骤1：取链
+        this.showResultPill(`正在获取「${label}」播放链接…`, false)
+        let playUrl: string = candidate.playUrl
+        if (!playUrl) {
+          playUrl = await MusicApi.getPlayUrl(candidate.songId, candidate.source, candidate)
+        }
+        if (token !== this.sessionToken) {
+          return
+        }
+        if (!playUrl) {
+          SourceStatus.markUnplayable(candidate.source)
+          if (this.sessionCursor >= this.sessionCandidates.length - 1) {
+            break // 最后一个候选也取链失败
+          }
+          this.showResultPill(`「${label}」取链失败，准备换源…`, false)
+          this.sessionCursor++
+          continue
+        }
+        candidate.playUrl = playUrl
+
+        // 步骤2：起播（曲目信息始终保持原歌，仅换播放链接）
+        this.showResultPill(isOrigin ? `正在通过「${label}」播放…` : `已换源至「${label}」，正在播放…`, false)
+        if (origin !== null) {
+          player.setCurrentSong(origin)
+        }
+        this.sessionAttemptFailed = false
+        await player.play(playUrl)
+        if (token !== this.sessionToken) {
+          return
+        }
+
+        // 步骤3：起播宽限期（2秒），捕获“play() 成功但随即出错”的情况
+        await this.waitMoment(2000)
+        if (token !== this.sessionToken) {
+          return
+        }
+        if (this.sessionAttemptFailed) {
+          // 起播失败：标记不可用并换下一个源
+          if (this.sessionCursor >= this.sessionCandidates.length - 1) {
+            break
+          }
+          this.showResultPill(`「${label}」播放失败，准备换源…`, false)
+          this.sessionCursor++
+          continue
+        }
+
+        // 播放成功：标记该音源可用，保留会话以接管后续中途失败
+        SourceStatus.markPlayable(candidate.source)
+        this.sessionCursor++
+        this.showResultPill(`「${origin?.songName ?? candidate.songName}」播放成功`, true)
+        // 自动详情：点击歌曲后同步打开详情页
+        if (AppStorage.get<boolean>('autoJumpDetail') === true) {
+          PlayerStore.showFullPlayer()
+        }
+        return
+      }
+
+      // 全部候选源尝试完毕仍失败：结束会话并停止播放
+      this.showResultPill('已尝试所有音源，均无法播放', true)
       await player.pause()
-      this.showToastMessage('\u65E0\u6CD5\u83B7\u53D6\u64AD\u653E\u94FE\u63A5')
-      return
+      player.endRetrySession()
+      this.sessionSong = null
+      this.sessionCandidates = []
+    } finally {
+      if (this.sessionBusyToken === token) {
+        this.sessionBusyToken = -1
+      }
     }
+  }
 
-    // 更新歌曲播放链接
-    song.playUrl = playUrl
-
-    await player.play(playUrl)
-
-    // 播放成功：标记该音源可用（恢复彩色标签）
-    SourceStatus.markPlayable(song.source)
-
-    // 自动详情：点击歌曲后同步打开详情页
-    if (AppStorage.get<boolean>('autoJumpDetail') === true) {
-      PlayerStore.showFullPlayer()
-    }
+  private waitMoment(ms: number): Promise<void> {
+    return new Promise<void>((resolve: () => void) => {
+      setTimeout(resolve, ms)
+    })
   }
 
   private async addFavorite(song: SongInfo) {

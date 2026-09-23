@@ -460,7 +460,7 @@ export struct SongActionSheet {
         .color(this.themeDivider)
 
       if (this.mode === 'search') {
-        // 基础操作：四宫格（图标 + 文字）
+        // 基础操作：四宫格（单图标 + 文字，无背景色）
         Text('\u57FA\u7840\u64CD\u4F5C')
           .fontSize(16)
           .fontColor(this.themeTextPrimary)
@@ -549,16 +549,10 @@ export struct SongActionSheet {
   @Builder
   ActionGridItem(iconRaw: string, label: string, action: string) {
     Column({ space: 6 }) {
-      Row() {
-        Image($rawfile(iconRaw))
-          .width(24)
-          .height(24)
-      }
-      .width(44)
-      .height(44)
-      .borderRadius(12)
-      .backgroundColor(this.themePrimaryLight)
-      .justifyContent(FlexAlign.Center)
+      // V2.1.6：取消背景色容器，采用单图标
+      Image($rawfile(iconRaw))
+        .width(24)
+        .height(24)
 
       Text(label)
         .fontSize(12)

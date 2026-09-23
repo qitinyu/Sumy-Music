@@ -59,18 +59,25 @@ export struct FullPlayerPage {
   @State lyricPullHint: string = ''
   @State lyricsViewHeight: number = 600
   private lyricsScroller: Scroller = new Scroller()
+  // 版块设置-主页-播放列表设置：定位播放歌曲（默认关闭）
+  @StorageProp('queueLocatePlaying') queueLocatePlaying: boolean = false
+  // 播放列表弹窗滚动器（打开弹窗时定位播放中歌曲）
+  private queueSheetScroller: Scroller = new Scroller()
   private progressTimer: number = -1
   private controlsTimer: number = -1
   private db: DatabaseHelper = DatabaseHelper.getInstance()
   private dragTime: number = 0
   private supportImmersive: boolean = CompatUtils.isImmersiveSupported()
   private onSeekDoneBound: (time: number) => void = (_t: number) => {}
+  // V2.1.6：同曲守卫（source+songId），区分真切歌与封面等字段异步补全触发的同曲刷新
+  private lastTrackKey: string = ''
 
   aboutToAppear(): void {
     this.playModeLocal = this.playMode
     this.loadSettings()
     if (this.currentTrack) {
       this.loadLyrics()
+      this.lastTrackKey = this.currentTrack.source + '|' + this.currentTrack.songId
     }
     this.startProgressTimer()
     this.setupPlayerCallbacks()
@@ -82,8 +89,15 @@ export struct FullPlayerPage {
   // 切歌（含控制中心上一首/下一首命令）时联动：重载歌词、重置进度与歌词滚动
   onTrackChanged(): void {
     if (!this.currentTrack) {
+      this.lastTrackKey = ''
       return
     }
+    // V2.1.6：同曲刷新（封面异步补全触发 refreshCurrentTrack）不重置进度/歌词
+    const trackKey: string = this.currentTrack.source + '|' + this.currentTrack.songId
+    if (trackKey === this.lastTrackKey) {
+      return
+    }
+    this.lastTrackKey = trackKey
     this.loadLyrics()
     this.progress = 0
     this.sliderValue = 0
@@ -611,6 +625,41 @@ export struct FullPlayerPage {
     })
   }
 
+  // V2.0.8：rawfile 图标版圆形图标按钮（down/more 等自定义 svg），样式与 PlayerIconButton 一致
+  @Builder
+  PlayerRawIconButton(icon: Resource, iconSize: number, btnSize: number, click: () => void) {
+    Row() {
+      Image(icon)
+        .width(iconSize)
+        .height(iconSize)
+        .objectFit(ImageFit.Contain)
+        .fillColor(this.themeTextPrimary)
+    }
+    .width(btnSize)
+    .height(btnSize)
+    .borderRadius(btnSize / 2)
+    .backgroundColor(Color.Transparent)
+    .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN) : undefined)
+    .backgroundEffect(this.supportImmersive ? undefined : MaterialCompat.effect(this.isDarkMode, this.themeCardBg, MaterialCompatStyle.THIN))
+    .visualEffect(new hdsEffect.HdsEffectBuilder()
+      .pressShadow(hdsEffect.PressShadowType.BLEND_WHITE)
+      .pointLight({
+        sourceType: hdsEffect.PointLightSourceType.SOFT,
+        illuminatedType: hdsEffect.PointLightIlluminatedType.BORDER_CONTENT,
+        options: {
+          color: this.themePrimary,
+          intensity: 0.6,
+          height: 60,
+          bloom: 0.3
+        }
+      })
+      .buildEffect())
+    .justifyContent(FlexAlign.Center)
+    .onClick(() => {
+      click()
+    })
+  }
+
   @Builder
   ThemeBackgroundImage() {
     if (this.themeBgImageName === 'lxtx') {
@@ -665,14 +714,14 @@ export struct FullPlayerPage {
 
       Column() {
         Row() {
-          this.PlayerIconButton($r('sys.symbol.chevron_down'), 18, 32, () => {
+          this.PlayerRawIconButton($rawfile('down.svg'), 18, 32, () => {
             this.doBack()
           })
 
           Blank().layoutWeight(1)
 
           // 右上角：更多（从底部弹窗，复用统一沉浸光感图标按钮）
-          this.PlayerIconButton($r('sys.symbol.ellipsis_circle'), 18, 32, () => {
+          this.PlayerRawIconButton($rawfile('more.svg'), 18, 32, () => {
             this.showMoreSheet = true
           })
         }
@@ -851,7 +900,7 @@ export struct FullPlayerPage {
             .fontColor(this.themeTextPrimary)
             .fontWeight(FontWeight.Bold)
             .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .textOverflow({ overflow: TextOverflow.MARQUEE })
           if (this.currentTrack && this.currentTrack.source && this.currentTrack.source.length > 0) {
             Text(SourceInfo.getAbbr(this.resolveDisplaySource(this.currentTrack)))
               .fontSize(11)
@@ -915,7 +964,7 @@ export struct FullPlayerPage {
         .fontColor(this.themeTextPrimary)
         .fontWeight(FontWeight.Medium)
         .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .textOverflow({ overflow: TextOverflow.MARQUEE })
         .textAlign(TextAlign.Center)
         .width('100%')
         .padding({
@@ -1179,7 +1228,23 @@ export struct FullPlayerPage {
     .justifyContent(FlexAlign.Center)
     .onClick(() => {
       this.showListSheet = true
+      // 播放列表设置-定位播放歌曲开启时，弹窗打开自动定位到播放中的歌曲
+      if (this.queueLocatePlaying) {
+        this.locateQueuePlaying()
+      }
     })
+  }
+
+  // 打开播放列表弹窗时自动定位/跳转正在播放的歌曲（行高：封面40 + 上下内边距8×2 = 56）
+  private locateQueuePlaying(): void {
+    const idx: number = this.queueIndex
+    if (idx <= 0 || idx >= this.queue.length) {
+      return
+    }
+    const scroller: Scroller = this.queueSheetScroller
+    setTimeout(() => {
+      scroller.scrollTo({ xOffset: 0, yOffset: idx * 56, animation: { duration: 300, curve: Curve.EaseOut } })
+    }, 250)
   }
 
   @Builder
@@ -1215,7 +1280,7 @@ export struct FullPlayerPage {
         bottom: 12
       })
 
-      Scroll() {
+      Scroll(this.queueSheetScroller) {
         Column({ space: 0 }) {
           ForEach(this.queue, (track: SongInfo, index?: number) => {
             Row({ space: 10 }) {

@@ -51,6 +51,23 @@ export class AudioPlayer {
   private _seekPending: boolean = false
   private seekWatchdog: number = -1
 
+  // V2.0.8 单曲换源会话：会话曲目播放失败时交由注册方接管（换源重播），
+  // 不弹全局"即将播放下一首"提示、不自动切下一首。会话按"source|songId"匹配当前曲目。
+  private retrySessionKey: string = ''
+  private retrySessionHandler: ((message: string) => void) | null = null
+
+  // 注册单曲换源会话（如搜索页单歌播放：失败后逐源重试同一首歌）
+  beginRetrySession(songKey: string, handler: (message: string) => void): void {
+    this.retrySessionKey = songKey
+    this.retrySessionHandler = handler
+  }
+
+  // 结束换源会话：恢复默认的"播放失败自动切下一首"行为
+  endRetrySession(): void {
+    this.retrySessionKey = ''
+    this.retrySessionHandler = null
+  }
+
   onTimeUpdate?: (time: number) => void
   onDurationUpdate?: (duration: number) => void
   onPlayEnd?: () => void
@@ -295,6 +312,16 @@ export class AudioPlayer {
     if (this.currentSong) {
       playLog('播放', `出错曲目: ${this.currentSong.songName} - ${this.currentSong.artist} source=${this.currentSong.source}`)
       SourceStatus.markUnplayable(this.currentSong.source)
+    }
+    // V2.0.8 单曲换源会话：会话内曲目播放失败时交由注册方接管（换源重播），
+    // 不弹全局提示、不自动切下一首
+    const songKey: string = this.currentSong ? this.currentSong.source + '|' + this.currentSong.songId : ''
+    if (this.retrySessionHandler !== null && songKey.length > 0 && songKey === this.retrySessionKey) {
+      const handler: ((message: string) => void) | null = this.retrySessionHandler
+      if (handler !== null) {
+        handler(message)
+      }
+      return
     }
     AppStorage.setOrCreate('playerErrorNotice', message + '|' + Date.now().toString())
     if (this.errorRetryTimer >= 0) {

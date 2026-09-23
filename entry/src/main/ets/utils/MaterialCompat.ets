@@ -1,8 +1,12 @@
 // MaterialCompat.ets - 沉浸式材质兼容层（V1.1.0）
 // API 26+ 使用真正的 uiMaterial.ImmersiveMaterial + systemMaterial
 // API 24-25 使用 backgroundEffect 模拟沉浸光感
+// V2.1.6：immersiveMaterial 内部加版本守卫——API 26 以下 uiMaterial.ImmersiveStyle
+// 运行时不存在，直接访问 .THICK 等成员会抛 TypeError 导致低版本设备启动崩溃，
+// 统一返回 undefined（systemMaterial 参数接受 undefined，走默认弹窗背景）。
 
 import { uiMaterial } from '@kit.ArkUI'
+import { CompatUtils } from './CompatUtils'
 
 // 材质分档，对应 uiMaterial.ImmersiveStyle（从薄到厚）
 export enum MaterialCompatStyle {
@@ -80,42 +84,51 @@ export class MaterialCompat {
   }
 
   /**
-   * API 26+ 使用真正的沉浸式材质对象，配合 .systemMaterial() 使用
+   * API 26+ 使用真正的沉浸式材质对象，配合 .systemMaterial() 使用；
+   * API 26 以下返回 undefined（调用方传给 systemMaterial 即走默认样式）
    * @param style 材质分档
    * @param options interactive 是否启用按压形变；lightEffect 是否启用光感交互反馈
    */
   static immersiveMaterial(
     style?: MaterialCompatStyle,
     options?: MaterialImmersiveOptions
-  ): uiMaterial.Material {
-    const s: MaterialCompatStyle = style !== undefined ? style : MaterialCompatStyle.REGULAR
-    let immersiveStyle: uiMaterial.ImmersiveStyle
-    switch (s) {
-      case MaterialCompatStyle.ULTRA_THIN:
-        immersiveStyle = uiMaterial.ImmersiveStyle.ULTRA_THIN
-        break
-      case MaterialCompatStyle.THIN:
-        immersiveStyle = uiMaterial.ImmersiveStyle.THIN
-        break
-      case MaterialCompatStyle.THICK:
-        immersiveStyle = uiMaterial.ImmersiveStyle.THICK
-        break
-      case MaterialCompatStyle.ULTRA_THICK:
-        immersiveStyle = uiMaterial.ImmersiveStyle.ULTRA_THICK
-        break
-      case MaterialCompatStyle.REGULAR:
-      default:
-        immersiveStyle = uiMaterial.ImmersiveStyle.REGULAR
-        break
+  ): uiMaterial.Material | undefined {
+    if (!CompatUtils.isImmersiveSupported()) {
+      return undefined
     }
-    const opts: uiMaterial.ImmersiveOptions = { style: immersiveStyle }
-    if (options !== undefined && options.interactive === true) {
-      opts.interactive = true
+    try {
+      const s: MaterialCompatStyle = style !== undefined ? style : MaterialCompatStyle.REGULAR
+      let immersiveStyle: uiMaterial.ImmersiveStyle
+      switch (s) {
+        case MaterialCompatStyle.ULTRA_THIN:
+          immersiveStyle = uiMaterial.ImmersiveStyle.ULTRA_THIN
+          break
+        case MaterialCompatStyle.THIN:
+          immersiveStyle = uiMaterial.ImmersiveStyle.THIN
+          break
+        case MaterialCompatStyle.THICK:
+          immersiveStyle = uiMaterial.ImmersiveStyle.THICK
+          break
+        case MaterialCompatStyle.ULTRA_THICK:
+          immersiveStyle = uiMaterial.ImmersiveStyle.ULTRA_THICK
+          break
+        case MaterialCompatStyle.REGULAR:
+        default:
+          immersiveStyle = uiMaterial.ImmersiveStyle.REGULAR
+          break
+      }
+      const opts: uiMaterial.ImmersiveOptions = { style: immersiveStyle }
+      if (options !== undefined && options.interactive === true) {
+        opts.interactive = true
+      }
+      if (options !== undefined && options.lightEffect === true) {
+        opts.lightEffect = { color: Color.White }
+      }
+      return new uiMaterial.ImmersiveMaterial(opts)
+    } catch (_e) {
+      // 兜底：个别设备 API 版本达标但材质接口异常时降级为默认样式，不崩溃
+      return undefined
     }
-    if (options !== undefined && options.lightEffect === true) {
-      opts.lightEffect = { color: Color.White }
-    }
-    return new uiMaterial.ImmersiveMaterial(opts)
   }
 
   /** 将 #RRGGBB 颜色转换为 #AARRGGBB（追加/替换 alpha 通道） */

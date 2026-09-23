@@ -29,7 +29,6 @@ import { uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { common } from '@kit.AbilityKit'
 import { CloudTagEnricher } from '../utils/CloudTagEnricher'
 import { HdsNavDestination } from '@kit.UIDesignKit'
-import { SymbolGlyphModifier } from '@kit.ArkUI'
 
 type SubPage = 'main' | 'playlistDetail' | 'localMusicDetail' | 'cloudPlaylistDetail'
 
@@ -62,6 +61,8 @@ export struct XuanchuangTab {
   @StorageProp('theme_primaryLight') themePrimaryLight: string = '#E0F0FF'
   @StorageProp('theme_danger') themeDanger: string = '#F44336'
   @StorageProp('theme_bgImageName') themeBgImageName: string = ''
+  // 当前播放曲目（V2.0.8：歌单打开自动定位 + 正在播放行高亮）
+  @StorageProp('currentTrack') currentTrack: SongInfo | null = null
 
   @State favorites: SongInfo[] = []
   @State playlists: Playlist[] = []
@@ -181,6 +182,13 @@ export struct XuanchuangTab {
 
   private db: DatabaseHelper = DatabaseHelper.getInstance()
   private supportImmersive: boolean = CompatUtils.isImmersiveSupported()
+
+  // 列表滚动器（V2.0.8：打开歌单时自动定位到正在播放的歌曲）
+  private playlistDetailScroller: Scroller = new Scroller()
+  private localDetailScroller: Scroller = new Scroller()
+  private cloudDetailScroller: Scroller = new Scroller()
+  // 版块设置-主页-歌单内设置：定位播放歌曲（默认关闭）
+  @StorageProp('playlistLocatePlaying') playlistLocatePlaying: boolean = false
 
   async aboutToAppear() {
     await this.loadAllData()
@@ -448,24 +456,7 @@ export struct XuanchuangTab {
       return
     }
 
-    // 在线源兜底：无封面时按需获取封面（不阻塞播放），webdav/内置源均适用
-    if (song.coverUrl && song.coverUrl.indexOf('@') >= 0 && song.coverUrl.indexOf('://') >= 0) {
-      MusicApi.fetchCoverFromOnline(song).then((coverUrl) => {
-        if (coverUrl && coverUrl.length > 0) {
-          song.coverUrl = coverUrl
-          PlayerStore.refreshCurrentTrack(song)
-        }
-      }).catch((_e: Error) => {})
-    } else if ((!song.coverUrl || song.coverUrl.length === 0) &&
-      song.source !== 'local' && song.source !== 'webdav') {
-      // 内置五源（kw/kg/tx/wy/mg）无封面 → 内置封面接口补全
-      MusicApi.fetchCoverFromOnline(song).then((coverUrl) => {
-        if (coverUrl && coverUrl.length > 0) {
-          song.coverUrl = coverUrl
-          PlayerStore.refreshCurrentTrack(song)
-        }
-      }).catch((_e: Error) => {})
-    }
+    // V2.1.6：WebDAV 授权封面补全统一移入 PlayerStore.play（ensureCoverAsync），所有切歌路径共用
     // V2.1.2：确保云端歌曲内嵌标签已解析（歌名/歌手/封面/歌词）
     if (song.source === 'webdav' && !CloudTagEnricher.isAttempted(song.songId)) {
       CloudTagEnricher.ensureEnriched(song).then(() => {
@@ -711,6 +702,49 @@ export struct XuanchuangTab {
     this.playlistSortMode = savedMode.length > 0 ? savedMode : 'old'
     this.playlistSongs = this.sortPlaylistSongs(this.playlistSongs, this.playlistSortMode)
     this.subPage = 'playlistDetail'
+    // V2.0.8：打开歌单自动定位到正在播放的歌曲（受"歌单内-定位播放歌曲"开关控制，默认关闭）
+    if (this.playlistLocatePlaying) {
+      this.locatePlayingSong('playlist')
+    }
+  }
+
+  // V2.0.8：打开列表后自动定位/跳转正在播放的歌曲（滚动到该行）
+  // 行高：歌单/云端行 64 + 间距 8 = 72；本地行 72 + 间距 8 = 80
+  private locatePlayingSong(list: string): void {
+    const track: SongInfo | null = this.currentTrack
+    if (!track) {
+      return
+    }
+    let idx: number = -1
+    let step: number = 72
+    let scroller: Scroller | null = null
+    if (list === 'playlist') {
+      idx = this.playlistSongs.findIndex(s => s.songId === track.songId && s.source === track.source)
+      scroller = this.playlistDetailScroller
+    } else if (list === 'local') {
+      step = 80
+      if (track.source === 'local' && track.songId.startsWith('local_')) {
+        idx = this.localMusicList.findIndex(lm => 'local_' + lm.id === track.songId)
+      }
+      scroller = this.localDetailScroller
+    } else {
+      idx = this.cloudPlaylistSongs.findIndex(s => s.songId === track.songId && s.source === track.source)
+      scroller = this.cloudDetailScroller
+    }
+    if (idx <= 0 || !scroller) {
+      return
+    }
+    const target: Scroller | null = scroller
+    const yOffset: number = Math.max(0, idx * step)
+    setTimeout(() => {
+      target.scrollTo({ xOffset: 0, yOffset: yOffset, animation: { duration: 300, curve: Curve.EaseOut } })
+    }, 300)
+  }
+
+  // 正在播放的歌曲行（歌单/云端列表高亮）
+  private isPlayingTrackSong(song: SongInfo): boolean {
+    const t: SongInfo | null = this.currentTrack
+    return t !== null && t.songId === song.songId && t.source === song.source
   }
 
   // ===== 歌单排序（新在前/旧在前/按字母，各歌单独立记忆） =====
@@ -2641,9 +2675,11 @@ export struct XuanchuangTab {
         this.playPlaylist(playlist)
       })
 
-      SymbolGlyph($r('sys.symbol.chevron_right'))
-        .fontSize(16)
-        .fontColor([this.themeTextSecondary])
+      Image($rawfile('jinxin_right.svg'))
+        .width(16)
+        .height(16)
+        .objectFit(ImageFit.Contain)
+        .fillColor(this.themeTextSecondary)
         .flexShrink(0)
     }
     .width('100%')
@@ -2762,15 +2798,21 @@ export struct XuanchuangTab {
           }
         })
 
-        SymbolGlyph($r('sys.symbol.chevron_right'))
-          .fontSize(16)
-          .fontColor([this.themeTextSecondary])
+        Image($rawfile('jinxin_right.svg'))
+          .width(16)
+          .height(16)
+          .objectFit(ImageFit.Contain)
+          .fillColor(this.themeTextSecondary)
           .flexShrink(0)
       }
       .width('100%')
       .padding({ left: 12, right: 12, top: 10, bottom: 10 })
       .onClick(() => {
         this.subPage = 'localMusicDetail'
+        // V2.0.8：打开本地音乐自动定位到正在播放的歌曲（受"歌单内-定位播放歌曲"开关控制）
+        if (this.playlistLocatePlaying) {
+          this.locatePlayingSong('local')
+        }
       })
     }
     .width('100%')
@@ -2816,8 +2858,10 @@ export struct XuanchuangTab {
           }
           .alignItems(HorizontalAlign.Start).layoutWeight(1)
 
-          SymbolGlyph($r('sys.symbol.chevron_right'))
-            .fontSize(16).fontColor([this.themeTextSecondary]).flexShrink(0)
+          Image($rawfile('jinxin_right.svg'))
+            .width(16).height(16)
+            .objectFit(ImageFit.Contain)
+            .fillColor(this.themeTextSecondary).flexShrink(0)
         }
         .width('100%')
         .padding({ left: 12, right: 12, top: 10, bottom: 10 })
@@ -2852,8 +2896,10 @@ export struct XuanchuangTab {
           }
           .alignItems(HorizontalAlign.Start).layoutWeight(1)
 
-          SymbolGlyph($r('sys.symbol.chevron_right'))
-            .fontSize(16).fontColor([this.themeTextSecondary]).flexShrink(0)
+          Image($rawfile('jinxin_right.svg'))
+            .width(16).height(16)
+            .objectFit(ImageFit.Contain)
+            .fillColor(this.themeTextSecondary).flexShrink(0)
         }
         .width('100%')
         .padding({ left: 12, right: 12, top: 10, bottom: 10 })
@@ -2903,15 +2949,22 @@ export struct XuanchuangTab {
                   this.playPlaylist(playlist)
                 })
 
-                SymbolGlyph($r('sys.symbol.chevron_right'))
-                  .fontSize(16).fontColor([this.themeTextSecondary]).flexShrink(0)
+                Image($rawfile('jinxin_right.svg'))
+                  .width(16).height(16)
+                  .objectFit(ImageFit.Contain)
+                  .fillColor(this.themeTextSecondary).flexShrink(0)
               }
               .width('100%')
               .padding({ left: 12, right: 12, top: 10, bottom: 10 })
               .onClick(() => {
                 this.selectedCloudPlaylist = playlist
                 this.subPage = 'cloudPlaylistDetail'
-                this.loadCloudPlaylistSongs(playlist)
+                this.loadCloudPlaylistSongs(playlist).then(() => {
+                  // V2.0.8：云端歌曲加载完成后自动定位到正在播放的歌曲（受"歌单内-定位播放歌曲"开关控制）
+                  if (this.playlistLocatePlaying) {
+                    this.locatePlayingSong('cloud')
+                  }
+                })
               })
             }
           }, (playlist: Playlist) => playlist.id)
@@ -3181,9 +3234,11 @@ export struct XuanchuangTab {
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
 
-          SymbolGlyph($r('sys.symbol.chevron_right'))
-            .fontSize(18)
-            .fontColor([this.themeTextSecondary])
+          Image($rawfile('jinxin_right.svg'))
+            .width(18)
+            .height(18)
+            .objectFit(ImageFit.Contain)
+            .fillColor(this.themeTextSecondary)
             .flexShrink(0)
         }
         .width('100%')
@@ -3722,9 +3777,11 @@ export struct XuanchuangTab {
         if (this.multiSelectMode) {
           Row({ space: 12 }) {
             Row() {
-              SymbolGlyph($r('sys.symbol.chevron_left'))
-                .fontSize(24)
-                .fontColor([this.themeTextPrimary])
+              Image($rawfile('fanhui_left.svg'))
+                .width(22)
+                .height(22)
+                .objectFit(ImageFit.Contain)
+                .fillColor(this.themeTextPrimary)
             }
             .width(36)
             .height(36)
@@ -3801,7 +3858,7 @@ export struct XuanchuangTab {
         EmptyState({ icon: '', title: '歌单是空的', subtitle: '在搜索页搜索并添加歌曲' })
       } else {
         Refresh({ refreshing: $$this.detailRefreshing, offset: 64 }) {
-        Scroll() {
+        Scroll(this.playlistDetailScroller) {
           Column({ space: 8 }) {
             ForEach(this.playlistSongs, (song: SongInfo, index?: number) => {
               Row({ space: 10 }) {
@@ -3817,6 +3874,12 @@ export struct XuanchuangTab {
                   .height(28)
                   .justifyContent(FlexAlign.Center)
                   .flexShrink(0)
+                } else if (this.isPlayingTrackSong(song)) {
+                  SymbolGlyph($r('sys.symbol.waveform'))
+                    .fontSize(14)
+                    .fontColor([this.themePrimary])
+                    .width(28)
+                    .flexShrink(0)
                 } else {
                   Text(`${(index ?? 0) + 1}`)
                     .fontSize(14)
@@ -3956,7 +4019,7 @@ export struct XuanchuangTab {
           ],
         },
         backIcon: {
-          icon: new SymbolGlyphModifier($r('sys.symbol.chevron_left')),
+          icon: $rawfile('fanhui_left.svg'),
           action: (): void => {
             if (this.multiSelectMode) {
               this.exitMultiSelectMode()
@@ -3965,6 +4028,11 @@ export struct XuanchuangTab {
             }
           },
         },
+      },
+      style: {
+        scrollEffectOpts: {
+          enableScrollEffect: false
+        }
       },
     })
     .hideTitleBar(this.multiSelectMode)
@@ -4104,7 +4172,10 @@ export struct XuanchuangTab {
         if (this.multiSelectMode) {
           Row({ space: 12 }) {
             Row() {
-              SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(24).fontColor([this.themeTextPrimary])
+              Image($rawfile('fanhui_left.svg'))
+                .width(22).height(22)
+                .objectFit(ImageFit.Contain)
+                .fillColor(this.themeTextPrimary)
             }
             .width(36).height(36).justifyContent(FlexAlign.Center)
             .onClick(() => {
@@ -4177,7 +4248,7 @@ export struct XuanchuangTab {
         .width('100%').layoutWeight(1).justifyContent(FlexAlign.Center).alignItems(HorizontalAlign.Center)
       } else {
         Refresh({ refreshing: $$this.detailRefreshing, offset: 64 }) {
-        Scroll() {
+        Scroll(this.localDetailScroller) {
           Column({ space: 8 }) {
             ForEach(this.localMusicList, (item: LocalMusicItem) => {
               Row({ space: 12 }) {
@@ -4329,7 +4400,7 @@ export struct XuanchuangTab {
           ],
         },
         backIcon: {
-          icon: new SymbolGlyphModifier($r('sys.symbol.chevron_left')),
+          icon: $rawfile('fanhui_left.svg'),
           action: (): void => {
             if (this.multiSelectMode) {
               this.exitMultiSelectMode()
@@ -4338,6 +4409,11 @@ export struct XuanchuangTab {
             }
           },
         },
+      },
+      style: {
+        scrollEffectOpts: {
+          enableScrollEffect: false
+        }
       },
     })
     .hideTitleBar(this.multiSelectMode)
@@ -4363,13 +4439,21 @@ export struct XuanchuangTab {
         EmptyState({ icon: '', title: '歌单是空的', subtitle: '请检查网盘目录是否有音乐文件' })
       } else {
         Refresh({ refreshing: $$this.detailRefreshing, offset: 64 }) {
-        Scroll() {
+        Scroll(this.cloudDetailScroller) {
           Column({ space: 8 }) {
             ForEach(this.cloudPlaylistSongs, (song: SongInfo, index?: number) => {
               Row({ space: 10 }) {
-                Text(`${(index ?? 0) + 1}`)
-                  .fontSize(14).fontColor(this.themeTextSecondary)
-                  .width(28).textAlign(TextAlign.Center).flexShrink(0)
+                if (this.isPlayingTrackSong(song)) {
+                  SymbolGlyph($r('sys.symbol.waveform'))
+                    .fontSize(14)
+                    .fontColor([this.themePrimary])
+                    .width(28)
+                    .flexShrink(0)
+                } else {
+                  Text(`${(index ?? 0) + 1}`)
+                    .fontSize(14).fontColor(this.themeTextSecondary)
+                    .width(28).textAlign(TextAlign.Center).flexShrink(0)
+                }
 
                 Row() {
                   CoverImage({
@@ -4477,11 +4561,16 @@ export struct XuanchuangTab {
           ],
         },
         backIcon: {
-          icon: new SymbolGlyphModifier($r('sys.symbol.chevron_left')),
+          icon: $rawfile('fanhui_left.svg'),
           action: (): void => {
             this.subPage = 'main'
           },
         },
+      },
+      style: {
+        scrollEffectOpts: {
+          enableScrollEffect: false
+        }
       },
     })
     .width('100%')

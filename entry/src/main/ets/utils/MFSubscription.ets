@@ -13,6 +13,7 @@ import { playLog } from './PlayLog'
 const KEY_URL: string = 'mfSubscriptionUrl'
 const KEY_LIST: string = 'mfSubscriptionList'
 const KEY_ENABLED: string = 'mfSubscriptionEnabled'
+const KEY_ACTIVE: string = 'mfSubscriptionActive'
 
 /** 订阅内插件条目 */
 export interface MFSubPlugin {
@@ -81,6 +82,16 @@ export class MFSubscription {
   /** 保存启用状态 */
   static async saveEnabled(enabled: boolean): Promise<void> {
     await DatabaseHelper.getInstance().setSetting(KEY_ENABLED, enabled ? 'true' : 'false')
+  }
+
+  /** 读取当前启用的订阅源地址（''=未启用任何订阅，只允许单一启用） */
+  static async getActive(): Promise<string> {
+    return await DatabaseHelper.getInstance().getSetting(KEY_ACTIVE)
+  }
+
+  /** 保存当前启用的订阅源地址（传空串即释放） */
+  static async saveActive(url: string): Promise<void> {
+    await DatabaseHelper.getInstance().setSetting(KEY_ACTIVE, url)
   }
 
   /** 校验订阅源地址：http(s) 且以 .js 或 .json 结尾 */

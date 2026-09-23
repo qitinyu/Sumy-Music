@@ -69,6 +69,7 @@ struct Index {
     AppStorage.setOrCreate('loushi_subPage', 'main')
     this.checkAnnouncementDate()
     this.loadAutoJumpSetting()
+    this.loadSectionSettings()
     // 默认展示展开的迷你栏
     setTimeout(() => {
       if (!this.miniBarApplied) {
@@ -95,6 +96,12 @@ struct Index {
     }
 
     if (this.showSettingsSidebar) {
+      // 设置子页内先返回设置主界面（与子页左上角返回一致），再次返回才关闭侧边栏
+      const loushiSubPage: string = AppStorage.get<string>('loushi_subPage') ?? 'main'
+      if (loushiSubPage !== 'main') {
+        AppStorage.setOrCreate('loushi_subPage', 'main')
+        return true
+      }
       this.closeSettingsSidebar()
       return true
     }
@@ -144,6 +151,16 @@ struct Index {
     if (val === 'true') {
       AppStorage.setOrCreate('autoJumpDetail', true)
     }
+  }
+
+  // 版块设置项启动加载：同步到 AppStorage 供各页面实时读取（默认：自动定位跳转开，定位播放歌曲关）
+  private async loadSectionSettings(): Promise<void> {
+    const sourceLocate = await this.db.getSetting('searchSourceLocate')
+    AppStorage.setOrCreate('searchSourceLocate', sourceLocate !== 'false')
+    const playlistLocate = await this.db.getSetting('playlistLocatePlaying')
+    AppStorage.setOrCreate('playlistLocatePlaying', playlistLocate === 'true')
+    const queueLocate = await this.db.getSetting('queueLocatePlaying')
+    AppStorage.setOrCreate('queueLocatePlaying', queueLocate === 'true')
   }
 
   private getTodayStr(): string {
@@ -220,12 +237,7 @@ struct Index {
         // index=3：启动默认展示「我的」页；index=0：搜索页（常驻）
         HdsTabs({ controller: this.controller, index: this.activeTab }) {
           TabContent() {
-            QinseTab({
-              onBack: () => {
-                // 搜索页返回：回到推荐页
-                this.controller.changeIndex(1)
-              }
-            })
+            QinseTab()
           }
           .tabBar(this.buildTabBarBuilder(0, '搜索', $r('sys.symbol.magnifyingglass'), 'serch.svg'))
 

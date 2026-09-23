@@ -41,7 +41,13 @@ export struct MiniBarPlayer {
   @State coverDisplay: string = ''
   @State showQueueSheet: boolean = false
   private lastCoverUrl: string = ''
+  // V2.1.6：解析中封面 URL，防止 500ms tick 在解析窗口内重复发起
+  private pendingCoverUrl: string = ''
   private supportImmersive: boolean = CompatUtils.isImmersiveSupported()
+  // 版块设置-主页-播放列表设置：定位播放歌曲（默认关闭）
+  @StorageProp('queueLocatePlaying') queueLocatePlaying: boolean = false
+  // 播放列表弹窗滚动器（打开弹窗时定位播放中歌曲）
+  private queueSheetScroller: Scroller = new Scroller()
 
   aboutToAppear(): void {
     this.resolveCover()
@@ -59,17 +65,32 @@ export struct MiniBarPlayer {
     if (url === this.lastCoverUrl && this.coverDisplay.length > 0) {
       return
     }
-    this.lastCoverUrl = url
-    if (!url || url.length === 0) {
-      this.coverDisplay = ''
+    // 同一封面解析中：跳过，避免 tick 在解析窗口内重复发起
+    if (url === this.lastCoverUrl && url === this.pendingCoverUrl) {
       return
     }
+    this.lastCoverUrl = url
+    // V2.1.6：切歌即时切换封面源——清掉旧封面，回退显示新 URL（普通 http 直接可加载）或占位图
+    this.coverDisplay = ''
+    if (!url || url.length === 0) {
+      this.pendingCoverUrl = ''
+      return
+    }
+    this.pendingCoverUrl = url
     CoverFetcher.resolve(url).then((resolved: string) => {
+      // 期间已切歌：丢弃旧结果
+      if (this.pendingCoverUrl !== url) {
+        return
+      }
+      this.pendingCoverUrl = ''
       const now: SongInfo | null = this.currentTrack
       if (now && now.coverUrl === url && resolved.length > 0) {
         this.coverDisplay = resolved
       }
     }).catch((_e: Error) => {
+      if (this.pendingCoverUrl === url) {
+        this.pendingCoverUrl = ''
+      }
     })
   }
 
@@ -148,6 +169,18 @@ export struct MiniBarPlayer {
 
     AppStorage.setOrCreate(PlayerKeys.QUEUE, newQueue)
     AppStorage.setOrCreate(PlayerKeys.QUEUE_INDEX, newIndex)
+  }
+
+  // 打开播放列表弹窗时自动定位/跳转正在播放的歌曲（受"播放列表设置-定位播放歌曲"开关控制）
+  private locateQueuePlaying(): void {
+    const idx: number = this.queueIndex
+    if (idx <= 0 || idx >= this.queue.length) {
+      return
+    }
+    const scroller: Scroller = this.queueSheetScroller
+    setTimeout(() => {
+      scroller.scrollToIndex(idx, true, ScrollAlign.CENTER)
+    }, 250)
   }
 
   private async togglePlay(): Promise<void> {
@@ -258,7 +291,7 @@ export struct MiniBarPlayer {
           .fontColor(this.themeTextPrimary)
           .fontWeight(FontWeight.Bold)
           .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .textOverflow({ overflow: TextOverflow.MARQUEE })
           .width('100%')
 
         Row({ space: 5 }) {
@@ -319,6 +352,10 @@ export struct MiniBarPlayer {
         .objectFit(ImageFit.Contain)
         .onClick(() => {
           this.showQueueSheet = true
+          // 播放列表设置-定位播放歌曲开启时，弹窗打开自动定位到播放中的歌曲
+          if (this.queueLocatePlaying) {
+            this.locateQueuePlaying()
+          }
         })
     }
     .width('100%')
@@ -388,7 +425,7 @@ export struct MiniBarPlayer {
         .height(120)
         .justifyContent(FlexAlign.Center)
       } else {
-        List() {
+        List({ scroller: this.queueSheetScroller }) {
           ForEach(this.queue, (track: SongInfo, index?: number) => {
             ListItem() {
               Row({ space: 10 }) {

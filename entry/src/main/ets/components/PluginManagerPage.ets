@@ -44,11 +44,21 @@ interface DiagnosticSignal {
   urlOk: boolean
   lrcOk: boolean
   coverOk: boolean
+  // 歌手字段：搜索结果是否携带歌手信息（四项能力之一）
+  artistOk: boolean
   searchErr: string
   urlErr: string
   engineErr: string
   // 取链失败的平台名（如「酷狗、酷我」），用于分平台诊断
   platFail: string
+}
+
+/** 音源四项能力（自检汇总用）：歌手 / 可播放 / 歌词 / 封面 */
+interface SourceCaps {
+  artist: boolean
+  playable: boolean
+  lrc: boolean
+  cover: boolean
 }
 
 /** MusicFree 订阅源卡片（id 用于 ForEach 稳定 key） */
@@ -95,11 +105,15 @@ export struct PluginManagerPage {
   @State prefixModifierLog: SymbolGlyphModifier = new SymbolGlyphModifier($r('sys.symbol.waveform'))
   @State prefixModifierLogActivated: SymbolGlyphModifier = new SymbolGlyphModifier($r('sys.symbol.waveform'))
   @State testLogHistory: TestLogRecord[] = []
+  // 自检四项能力记录（歌手/可播放/歌词/封面），键为音源名
+  private sourceCaps: Map<string, SourceCaps> = new Map()
   // MusicFree 订阅导入（多订阅卡片）
   @State mfSubs: MFSubCard[] = []
   @State mfSubEnabled: boolean = true
   @State mfChecking: boolean = false
   @State mfCheckLines: string[] = []
+  // 当前启用的订阅源地址（单一启用，''=未启用任何订阅）
+  @State mfActiveUrl: string = ''
   private mfSubSeq: number = 1
   onBack?: () => void
 
@@ -275,7 +289,7 @@ export struct PluginManagerPage {
     playLog('自检', `开始自检音源: ${name}`)
 
     // 收集失败信号：各步骤失败时的错误文本，供末尾诊断归类使用
-    const signals: DiagnosticSignal = { searchOk: false, urlOk: false, lrcOk: false, coverOk: false, searchErr: '', urlErr: '', engineErr: '', platFail: '' }
+    const signals: DiagnosticSignal = { searchOk: false, urlOk: false, lrcOk: false, coverOk: false, artistOk: false, searchErr: '', urlErr: '', engineErr: '', platFail: '' }
 
     // 检查是否为 v3 插件，需要等待 WebView 引擎就绪
     const cfg = SourceManager.getConfig(name)
@@ -336,6 +350,7 @@ export struct PluginManagerPage {
       for (let i = 0; i < failedDiag.length; i++) {
         push(failedDiag[i], true)
       }
+      this.sourceCaps.set(name, { artist: false, playable: false, lrc: false, cover: false })
       this.sourceTestStatus.set(name, 'fail')
       this.testingSource = ''
       const record: TestLogRecord = {
@@ -353,6 +368,18 @@ export struct PluginManagerPage {
     push(`搜索到 ${songs.length} 首`, true)
     const first: SongInfo = songs[0]
     push(`示例：${first.songName} - ${first.artist}`, true)
+    // 歌手能力：搜索结果是否携带歌手字段
+    for (let i = 0; i < songs.length; i++) {
+      if (songs[i].artist && songs[i].artist.length > 0) {
+        signals.artistOk = true
+        break
+      }
+    }
+    if (signals.artistOk) {
+      push('歌手信息已提供', true)
+    } else {
+      push('歌手信息缺失（搜索结果无歌手字段）', true)
+    }
 
     // 2. 播放链接：按平台分组逐平台取链（fastTest：跳过跨源兜底，只测目标插件取链）
     // 搜索结果是聚合多平台的（kg/kw/tx/wy/mg），只测第一首会漏掉其它平台的失败。
@@ -457,6 +484,15 @@ export struct PluginManagerPage {
     for (let i = 0; i < diagnosis.length; i++) {
       push(diagnosis[i], true)
     }
+    // 记录四项能力（歌手/可播放/歌词/封面）
+    const caps: SourceCaps = { artist: signals.artistOk, playable: signals.urlOk, lrc: signals.lrcOk, cover: signals.coverOk }
+    this.sourceCaps.set(name, caps)
+    const missingCaps: string[] = this.capsMissing(caps)
+    if (missingCaps.length === 0) {
+      push('四项能力：歌手、可播放、歌词、封面 全部具备', true)
+    } else {
+      push(`四项能力：具备 ${4 - missingCaps.length}/4（缺：${missingCaps.join('、')}）`, true)
+    }
     playLog('自检', `自检结束 音源=${name} searchOk=${signals.searchOk} urlOk=${signals.urlOk} lrcOk=${signals.lrcOk}`)
 
     // 记录该源的可用状态（部分平台失败 → 部分可用）
@@ -514,6 +550,7 @@ export struct PluginManagerPage {
     this.testPanelExpanded = true
     // 清空旧状态
     this.sourceTestStatus = new Map()
+    this.sourceCaps = new Map()
     for (let i = 0; i < this.sourceNames.length; i++) {
       await this.runSourceTest(this.sourceNames[i])
     }
@@ -527,7 +564,50 @@ export struct PluginManagerPage {
       if (st === 'ok') label = '✅ 可用'
       else if (st === 'partial') label = '⚠️ 部分可用（部分平台取链失败，详见日志）'
       else if (st === 'fail') label = '❌ 不可用'
+      // 四项能力标注（歌手/可播放/歌词/封面）
+      if (st === 'ok' || st === 'partial') {
+        const caps = this.sourceCaps.get(name)
+        if (caps) {
+          const missing = this.capsMissing(caps)
+          if (missing.length === 0) {
+            label += '｜四项能力齐备'
+          } else {
+            label += `｜缺：${missing.join('、')}`
+          }
+        }
+      }
       summary.push(`${i + 1}. ${name}：${label}`)
+    }
+    // 四项能力统计：哪些音源同时具备歌手/可播放/歌词/封面，哪些四缺一
+    summary.push('— 四项能力统计（歌手/可播放/歌词/封面）—')
+    const fullCaps: string[] = []
+    const missOne: string[] = []
+    const missMore: string[] = []
+    for (let i = 0; i < this.sourceNames.length; i++) {
+      const name = this.sourceNames[i]
+      const st = this.sourceTestStatus.get(name)
+      if (st !== 'ok' && st !== 'partial') {
+        continue
+      }
+      const caps = this.sourceCaps.get(name)
+      if (!caps) {
+        continue
+      }
+      const missing = this.capsMissing(caps)
+      if (missing.length === 0) {
+        fullCaps.push(name)
+      } else if (missing.length === 1) {
+        missOne.push(`${name}（缺${missing[0]}）`)
+      } else {
+        missMore.push(`${name}（缺${missing.join('、')}）`)
+      }
+    }
+    summary.push(`四项齐备：${fullCaps.length > 0 ? fullCaps.join('、') : '（无）'}`)
+    if (missOne.length > 0) {
+      summary.push(`四缺一：${missOne.join('、')}`)
+    }
+    if (missMore.length > 0) {
+      summary.push(`缺多项：${missMore.join('、')}`)
     }
     this.testResults = summary
     this.showToastMsg('全部音源自测完成')
@@ -615,10 +695,20 @@ export struct PluginManagerPage {
     return out
   }
 
+  /** 返回四项能力中缺失项的中文名列表 */
+  private capsMissing(caps: SourceCaps): string[] {
+    const missing: string[] = []
+    if (!caps.artist) missing.push('歌手')
+    if (!caps.playable) missing.push('可播放')
+    if (!caps.lrc) missing.push('歌词')
+    if (!caps.cover) missing.push('封面')
+    return missing
+  }
+
   private testLineColor(line: string): string {
     if (/^\d+\./.test(line)) return this.themePrimary
     if (line.indexOf('失败') >= 0 || line.indexOf('无结果') >= 0 || line.indexOf('为空') >= 0) return this.themeDanger
-    if (line.indexOf('可用') >= 0 || line.indexOf('已提供') >= 0) return '#2E7D32'
+    if (line.indexOf('可用') >= 0 || line.indexOf('已提供') >= 0 || line.indexOf('齐备') >= 0) return '#2E7D32'
     return this.themeTextSecondary
   }
 
@@ -631,6 +721,7 @@ export struct PluginManagerPage {
   // ===== MusicFree 订阅导入（多订阅卡片） =====
   private async loadMfSubscription(): Promise<void> {
     this.mfSubEnabled = await MFSubscription.getEnabled()
+    this.mfActiveUrl = await MFSubscription.getActive()
     const urls: string[] = await MFSubscription.getList()
     const cards: MFSubCard[] = []
     this.mfSubSeq = 1
@@ -647,6 +738,12 @@ export struct PluginManagerPage {
   }
 
   private updateSubUrl(sub: MFSubCard, url: string): void {
+    // 已启用的订阅地址被修改时自动释放启用状态，避免标记与实际地址不符
+    if (this.mfActiveUrl.length > 0 && sub.url.trim() === this.mfActiveUrl && url.trim() !== this.mfActiveUrl) {
+      this.mfActiveUrl = ''
+      MFSubscription.saveActive('')
+      this.showToastMsg('订阅地址已修改，请重新启用')
+    }
     sub.url = url
     this.touchSubs()
   }
@@ -715,6 +812,51 @@ export struct PluginManagerPage {
     this.showToastMsg(url.length > 0 ? '订阅已保存' : '订阅已清空')
   }
 
+  /** 该订阅是否为当前启用的订阅（按地址匹配） */
+  private isSubActive(sub: MFSubCard): boolean {
+    return this.mfActiveUrl.length > 0 && sub.url.trim() === this.mfActiveUrl
+  }
+
+  /** 是否存在已启用的订阅（存在时其余订阅的「启用」按钮锁定为黑色） */
+  private hasAnyActiveSub(): boolean {
+    if (this.mfActiveUrl.length === 0) {
+      return false
+    }
+    for (let i = 0; i < this.mfSubs.length; i++) {
+      if (this.mfSubs[i].url.trim() === this.mfActiveUrl) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /** 启用订阅（只允许单一启用）：标记后立即拉取安装该订阅的插件 */
+  private async enableMfSub(sub: MFSubCard): Promise<void> {
+    if (this.mfChecking) {
+      return
+    }
+    const url: string = sub.url.trim()
+    if (url.length === 0) {
+      this.showToastMsg('请输入订阅源地址')
+      return
+    }
+    if (!MFSubscription.isValidUrl(url)) {
+      this.showToastMsg('地址需为 http(s) 且以 .js 或 .json 结尾')
+      return
+    }
+    await MFSubscription.saveActive(url)
+    this.mfActiveUrl = url
+    this.showToastMsg('已启用该订阅源，开始安装插件…')
+    await this.runMfCheck(sub, true)
+  }
+
+  /** 释放已启用的订阅（再次点击已启用订阅的「已启用」按钮触发，之后才能启用其它订阅） */
+  private async releaseMfSub(): Promise<void> {
+    await MFSubscription.saveActive('')
+    this.mfActiveUrl = ''
+    this.showToastMsg('已释放订阅源，可启用其它订阅源')
+  }
+
   // 把订阅启用状态应用到全部已安装的 MusicFree 插件
   private async applyMfEnabledToSources(): Promise<void> {
     for (let i = 0; i < this.sourceNames.length; i++) {
@@ -775,8 +917,9 @@ export struct PluginManagerPage {
     }
   }
 
-  // 订阅自检：校验 → 沙箱就绪/依赖库检测 → 拉取安装 → 搜索/取链冒烟 → 汇总写历史
-  private async runMfCheck(sub: MFSubCard): Promise<void> {
+  // 订阅自检/启用安装：校验 → 沙箱就绪/依赖库检测 → 拉取安装 →（自检模式）搜索/取链冒烟 → 汇总写历史
+  // enableMode=true 为「启用」按钮触发：跳过冒烟测试，只拉取安装并应用启用状态
+  private async runMfCheck(sub: MFSubCard, enableMode: boolean = false): Promise<void> {
     if (this.mfChecking) {
       return
     }
@@ -788,6 +931,7 @@ export struct PluginManagerPage {
     // 自检基于当前输入内容，先静默保存
     await this.persistMfSubs()
     await MFSubscription.saveEnabled(this.mfSubEnabled)
+    const logTag: string = enableMode ? '订阅启用' : '订阅自检'
 
     this.mfChecking = true
     this.mfCheckLines = []
@@ -802,13 +946,13 @@ export struct PluginManagerPage {
       }
       this.mfCheckLines = lines.slice()
     }
-    playLog('订阅自检', `开始自检订阅源: ${url}`)
+    playLog(logTag, `开始${enableMode ? '启用' : '自检'}订阅源: ${url}`)
 
     // 1. 地址校验
     push('地址校验')
     if (!MFSubscription.isValidUrl(url)) {
       push('地址需为 http(s) 且以 .js 或 .json 结尾', true)
-      playLog('订阅自检', '地址校验失败')
+      playLog(logTag, '地址校验失败')
       this.finishMfCheck(0, 1, lines)
       return
     }
@@ -819,7 +963,10 @@ export struct PluginManagerPage {
     const engineReady: boolean = await this.waitMfEngineReady(10000)
     if (!engineReady) {
       push('MF 沙箱引擎未就绪（WebView 加载失败）', true)
-      playLog('订阅自检', 'MF 沙箱引擎未就绪')
+      playLog(logTag, 'MF 沙箱引擎未就绪')
+      if (enableMode) {
+        this.showToastMsg('订阅已启用，但沙箱引擎未就绪，详见订阅自检')
+      }
       this.finishMfCheck(0, 1, lines)
       return
     }
@@ -842,7 +989,7 @@ export struct PluginManagerPage {
         push(`依赖库 ${libs}/${total} 全部可用`, true)
       } else {
         push(`依赖库 ${libs}/${total} 可用，缺失: ${missing}（插件将无法使用这些库）`, true)
-        playLog('订阅自检', `沙箱依赖库缺失: ${missing}`)
+        playLog(logTag, `沙箱依赖库缺失: ${missing}`)
       }
     } catch (_e) {
       push('依赖库检测失败（沙箱协议异常）', true)
@@ -856,10 +1003,10 @@ export struct PluginManagerPage {
     })
     push(`安装完成：成功 ${result.okCount} 个，失败 ${result.failCount} 个，耗时 ${Date.now() - started}ms`, true)
 
-    // 4. 冒烟测试：搜索 + 取链（最多测 2 个已安装插件）
+    // 4. 冒烟测试：搜索 + 取链（最多测 2 个已安装插件）；启用模式跳过，只做安装
     let smokeOk = false
     let smokeFail = 0
-    if (result.installedNames.length > 0) {
+    if (!enableMode && result.installedNames.length > 0) {
       push('搜索冒烟测试')
       const testNames: string[] = result.installedNames.slice(0, 2)
       for (let i = 0; i < testNames.length; i++) {
@@ -887,19 +1034,22 @@ export struct PluginManagerPage {
     }
 
     // 5. 汇总
-    push('自检汇总')
+    push(enableMode ? '启用汇总' : '自检汇总')
     push(`插件安装：成功 ${result.okCount}，失败 ${result.failCount}`, true)
-    if (result.installedNames.length > 0) {
+    if (!enableMode && result.installedNames.length > 0) {
       push(`冒烟测试：${smokeOk ? '通过' : '未通过'}${smokeFail > 0 ? `（${smokeFail} 项失败）` : ''}`, true)
     }
     push('已安装插件可在「插件管理」页单独启用/关闭', true)
-    playLog('订阅自检', `自检结束 安装成功=${result.okCount} 失败=${result.failCount}`)
+    playLog(logTag, `${enableMode ? '启用' : '自检'}结束 安装成功=${result.okCount} 失败=${result.failCount}`)
 
     // 刷新插件列表并应用订阅启用状态
     await this.loadSources()
     await this.applyMfEnabledToSources()
     await this.loadEnabledStates()
     this.finishMfCheck(result.okCount, result.failCount, lines)
+    if (enableMode) {
+      this.showToastMsg(result.okCount > 0 ? `订阅已启用，安装成功 ${result.okCount} 个插件` : '订阅已启用，但插件安装失败，详见订阅自检')
+    }
   }
 
   getPluginType(name: string): string {
@@ -1298,9 +1448,25 @@ export struct PluginManagerPage {
                     }
                     .width('100%')
 
-                    Row({ space: 12 }) {
+                    Row({ space: 10 }) {
+                      // 启用：单一启用；已启用=红色背景，再点释放；存在已启用订阅时其余「启用」标黑锁定
+                      Button(this.isSubActive(sub) ? '已启用' : '启用')
+                        .fontSize(13)
+                        .fontColor(this.isSubActive(sub) || this.hasAnyActiveSub() ? Color.White : this.themeTextPrimary)
+                        .backgroundColor(this.isSubActive(sub) ? this.themeDanger : (this.hasAnyActiveSub() ? (this.isDarkMode ? '#333333' : '#000000') : this.themePlaceholder))
+                        .borderRadius(10)
+                        .layoutWeight(1)
+                        .enabled(!this.mfChecking && (!this.hasAnyActiveSub() || this.isSubActive(sub)))
+                        .onClick(() => {
+                          if (this.isSubActive(sub)) {
+                            this.releaseMfSub()
+                          } else if (!this.hasAnyActiveSub()) {
+                            this.enableMfSub(sub)
+                          }
+                        })
+
                       Button('保存')
-                        .fontSize(14)
+                        .fontSize(13)
                         .fontColor(this.themeTextPrimary)
                         .backgroundColor(this.themePlaceholder)
                         .borderRadius(10)
@@ -1310,7 +1476,7 @@ export struct PluginManagerPage {
                         })
 
                       Button(this.mfChecking ? '自检中…' : '自检')
-                        .fontSize(14)
+                        .fontSize(13)
                         .fontColor(Color.White)
                         .backgroundColor(this.themePrimary)
                         .borderRadius(10)

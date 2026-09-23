@@ -14,6 +14,8 @@ export class CoverFetcher {
   private context: common.UIAbilityContext | null = null
   private memCache: Map<string, string> = new Map()
   private failedCache: Map<string, number> = new Map()
+  // V2.1.6：同 URL 下载去重（播放页/迷你栏/队列封面可能同时请求同一授权 URL）
+  private inflight: Map<string, Promise<string>> = new Map()
 
   static getInstance(): CoverFetcher {
     if (!CoverFetcher.instance) {
@@ -99,14 +101,25 @@ export class CoverFetcher {
     if (lastFail !== undefined && Date.now() - lastFail < 10000) {
       return ''
     }
-    const localPath: string = await this.download(url)
-    if (localPath.length > 0) {
-      this.memCache.set(url, localPath)
-      this.failedCache.delete(url)
-    } else {
-      this.failedCache.set(url, Date.now())
+    // V2.1.6：同一 URL 已在下载中：复用在途 Promise，避免并发重复下载
+    const downloading: Promise<string> | undefined = this.inflight.get(url)
+    if (downloading !== undefined) {
+      return await downloading
     }
-    return localPath
+    const task: Promise<string> = this.download(url)
+    this.inflight.set(url, task)
+    try {
+      const localPath: string = await task
+      if (localPath.length > 0) {
+        this.memCache.set(url, localPath)
+        this.failedCache.delete(url)
+      } else {
+        this.failedCache.set(url, Date.now())
+      }
+      return localPath
+    } finally {
+      this.inflight.delete(url)
+    }
   }
 
   private async download(rawUrl: string): Promise<string> {
