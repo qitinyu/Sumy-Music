@@ -34,7 +34,7 @@
 - **HarmonyOS** Stage模型
 - **ArkTS** + ArkUI 声明式UI
 - **QuickJS** 原生JS内核（NAPI，承载 JS 音源插件执行）
-- **API 26**（HarmonyOS 6.0），最低兼容 6.1.1(API 23)
+- **API 26**（HarmonyOS 6.0），最低兼容 6.1.0(API 23)
 - 关键Kit：AccountKit、NetworkKit、CoreFileKit、MediaKit、ArkData
 
 ## 项目结构

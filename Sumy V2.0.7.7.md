@@ -13,15 +13,19 @@
 ## Sumy V2.0
 ### Sumy V2.0.9
 - [✅] 修复应用在API24设备无法打开的问题 #2076
-  > 根因：`uiMaterial.ImmersiveStyle` 在 API24 运行时不存在，`MaterialCompat.immersiveMaterial()`
-  > 无守卫地读取其成员，在 `initialRender` 阶段抛 `TypeError: Cannot read property THICK of undefined` 导致闪退。
+  > 根因：`uiMaterial.ImmersiveStyle` 在低于 API 26 的设备上不存在，而
+  > `MaterialCompat.immersiveMaterial()` 无守卫地读取其成员，在 `initialRender`
+  > 阶段抛 `TypeError: Cannot read property THICK of undefined` 导致启动闪退。
   > （`uiMaterial`/`systemMaterial` 经查 SDK 类型定义为 `@since 26.0.0`）
-  > 修复：增加运行时能力探测，缺失能力即降级到 `backgroundEffect` 模拟材质。
-  > 详见 `docs/API24兼容性验证报告.md`（实机复测待执行）
+  > 修复：增加运行时能力探测，能力缺失即降级到 `backgroundEffect` 模拟材质（API 12+ 可用）。
+  > 详见 `docs/API23-26兼容性验证报告.md`（实机复测待执行）
+- [✅] 因本地未安装 API 24 SDK，最低兼容版本由 `6.1.1(24)` 下调至 `6.1.0(23)`
+  > 已核查项目依赖的 HDS / ShareKit / AccountKit 能力在 API 23 均有定义，
+  > 且编译 SDK 中无 `@since 24/25` 声明，降级无需额外代码改动。
 
 ### Sumy V2.0.8
 >通用
-- [] minibar以及歌曲播放页的歌曲名+来源徽章如果超长则采用滚动的形式展现
+- [✅] minibar以及歌曲播放页的歌曲名+来源徽章如果超长则采用滚动的形式展现 #2084
 > 我的
 - [✅] 播放列表打开自动定位和跳转正在播放的歌曲 #2081
 - [✅] 歌单内左上角的<使用fanhui_left，歌单外条目的>使用jinxin_right，歌曲播放页左上角向下图标使用down，右上角更多使用more #2082
