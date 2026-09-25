@@ -2,7 +2,7 @@
 
 一款鸿蒙原生音乐播放器，支持插件化多音源聚合搜索、自建API、本地音乐、WebDAV云盘播放与数据同步。听你想听，回归音乐本质！
 
-> 当前版本：V2.0.8.2 ｜ [完整更新日志](https://github.com/qitinyu/Sumy-Music/wiki/)
+> 当前版本：V2.0.9.6 ｜ [完整更新日志](https://github.com/qitinyu/Sumy-Music/wiki/)
 
 ## 功能特性
 
@@ -34,7 +34,7 @@
 - **HarmonyOS** Stage模型
 - **ArkTS** + ArkUI 声明式UI
 - **QuickJS** 原生JS内核（NAPI，承载 JS 音源插件执行）
-- **API 26**（HarmonyOS 6.0），最低兼容 6.1.1(API 24)
+- **API 26**（HarmonyOS 6.0），最低兼容 6.1.1(API 23)
 - 关键Kit：AccountKit、NetworkKit、CoreFileKit、MediaKit、ArkData
 
 ## 项目结构
