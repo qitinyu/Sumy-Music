@@ -35,7 +35,7 @@ async function httpGet(url: string, extraHeaders?: Record<string, string>, timeo
     }
     if (result instanceof ArrayBuffer) {
       const decoder: util.TextDecoder = util.TextDecoder.create('utf-8')
-      return decoder.decodeWithStream(new Uint8Array(result))
+      return decoder.decodeToString(new Uint8Array(result))
     }
     return ''
   } catch (_e) {
@@ -251,7 +251,9 @@ export class MusicApi {
         return url
       }
 
-      if (song) {
+      // V2.1.9 自动换源开关（设置-播放器-播放设置，默认开启）：
+      // 关闭后不再全网换源取链，原源取链失败直接返回空，由上层"自动跳过"处理
+      if (song && AppStorage.get<boolean>('autoSourceSwitch') !== false) {
         const fallbackUrl = await SourceManager.getPlayUrlFromAny(songId, song.songName, song.artist)
         if (fallbackUrl.length > 0) {
           MusicApi.lastError = ''

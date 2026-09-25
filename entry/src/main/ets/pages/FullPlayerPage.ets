@@ -4,7 +4,7 @@ import { AudioPlayer } from '../utils/AudioPlayer'
 import { MusicApi } from '../utils/MusicApi'
 import { PlayerStore, PlayerKeys } from '../utils/PlayerStore'
 import { DatabaseHelper } from '../database/DatabaseHelper'
-import { promptAction } from '@kit.ArkUI'
+
 import { CompatUtils } from '../utils/CompatUtils'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
 import { hdsEffect } from '@kit.UIDesignKit'
@@ -15,6 +15,7 @@ import { common } from '@kit.AbilityKit'
 import { CoverImage } from '../components/CoverImage'
 import { LocalTagEnricher } from '../utils/LocalTagEnricher'
 import { playLog } from '../utils/PlayLog'
+import { StatusBarManager } from '../utils/StatusBarManager'
 
 @Entry
 @Component
@@ -88,6 +89,8 @@ export struct FullPlayerPage {
 
   // 切歌（含控制中心上一首/下一首命令）时联动：重载歌词、重置进度与歌词滚动
   onTrackChanged(): void {
+    // V2.1.7：切歌/封面异步补全后背景可能变化，同步校正状态栏文字色
+    this.applyPlayerStatusBar()
     if (!this.currentTrack) {
       this.lastTrackKey = ''
       return
@@ -125,10 +128,18 @@ export struct FullPlayerPage {
     if (bgColor === 'true') {
       this.bgColorEnabled = true
     }
+    // V2.1.7：按实际背景校正状态栏文字色（背景取色且有封面→白字，否则跟随主题背景）
+    this.applyPlayerStatusBar()
     const autoHide = await this.db.getSetting('autoHideControls')
     if (autoHide === 'true') {
       this.autoHideControls = true
     }
+  }
+
+  // V2.1.7：播放页状态栏文字色跟随实际背景——背景取色且有封面为模糊深底（白字），否则按主题背景判定
+  private applyPlayerStatusBar(): void {
+    const hasCover: boolean = this.bgColorEnabled && this.currentTrack !== null && this.currentTrack.coverUrl.length > 0
+    StatusBarManager.applyForBackground(hasCover ? '#1A1A1A' : this.themeBg)
   }
 
   private resetControlsTimer(): void {
@@ -186,7 +197,7 @@ export struct FullPlayerPage {
       playLog('播放', `取链失败，无法播放: ${err}`)
       // 真正停掉 AVPlayer（PlayerStore.pause 只改 AppStorage 标记，旧歌会继续响）
       await AudioPlayer.getInstance().pause()
-      promptAction.showToast({ message: `无法播放: ${track.songName}`, duration: 1500 })
+      this.getUIContext().getPromptAction().showToast({ message: `无法播放: ${track.songName}`, duration: 1500 })
       return
     }
     track.playUrl = playUrl
@@ -404,7 +415,18 @@ export struct FullPlayerPage {
   }
 
   private async showPlaylistSheet(): Promise<void> {
-    this.playlists = await this.db.getPlaylists()
+    const list: Playlist[] = await this.db.getPlaylists()
+    // 歌单自身未设封面时回退取第一首歌的封面（与歌曲弹窗/轩窗歌单列表一致）
+    for (let i = 0; i < list.length; i++) {
+      const p: Playlist = list[i]
+      if (!p.coverUrl || p.coverUrl.length === 0) {
+        const songs: SongInfo[] = await this.db.getPlaylistSongs(p.id)
+        if (songs.length > 0 && songs[0].coverUrl.length > 0) {
+          p.coverUrl = songs[0].coverUrl
+        }
+      }
+    }
+    this.playlists = list
     this.showPlaylistPicker = true
     this.showMoreSheet = false
   }
@@ -415,9 +437,9 @@ export struct FullPlayerPage {
     }
     const result = await this.db.addSongToPlaylist(playlist.id, this.currentTrack)
     if (result) {
-      promptAction.showToast({ message: `已添加到「${playlist.name}」`, duration: 2000 })
+      this.getUIContext().getPromptAction().showToast({ message: `已添加到「${playlist.name}」`, duration: 2000 })
     } else {
-      promptAction.showToast({ message: '添加失败，请重试', duration: 2000 })
+      this.getUIContext().getPromptAction().showToast({ message: '添加失败，请重试', duration: 2000 })
     }
     this.showPlaylistPicker = false
   }
@@ -426,15 +448,16 @@ export struct FullPlayerPage {
     this.lyricsAlign = align
     await this.db.setSetting('lyricsAlign', align)
     this.showLyricsAlignPicker = false
-    promptAction.showToast(
+    this.getUIContext().getPromptAction().showToast(
       { message: `歌词对齐：${align === 'left' ? '左对齐' : align === 'right' ? '右对齐' : '居中'}`, duration: 1500 })
   }
 
   private async toggleBgColor(): Promise<void> {
     this.bgColorEnabled = !this.bgColorEnabled
     await this.db.setSetting('bgColorEnabled', this.bgColorEnabled ? 'true' : 'false')
+    this.applyPlayerStatusBar()
     this.showMoreSheet = false
-    promptAction.showToast({ message: this.bgColorEnabled ? '背景取色已开启' : '背景取色已关闭', duration: 1500 })
+    this.getUIContext().getPromptAction().showToast({ message: this.bgColorEnabled ? '背景取色已开启' : '背景取色已关闭', duration: 1500 })
   }
 
   private async toggleAutoHideControls(): Promise<void> {
@@ -449,7 +472,7 @@ export struct FullPlayerPage {
         clearTimeout(this.controlsTimer)
       }
     }
-    promptAction.showToast({ message: this.autoHideControls ? '组件隐藏已开启' : '组件隐藏已关闭', duration: 1500 })
+    this.getUIContext().getPromptAction().showToast({ message: this.autoHideControls ? '组件隐藏已开启' : '组件隐藏已关闭', duration: 1500 })
   }
 
   private async shareSong(): Promise<void> {
@@ -466,7 +489,7 @@ export struct FullPlayerPage {
         description: `${this.currentTrack.songName} - ${this.currentTrack.artist}`,
       })
       const controller: systemShare.ShareController = new systemShare.ShareController(shareData)
-      const context = getContext(this) as common.UIAbilityContext
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext
       await controller.show(context, {
         selectionMode: systemShare.SelectionMode.SINGLE,
         previewMode: systemShare.SharePreviewMode.DETAIL,
@@ -479,9 +502,9 @@ export struct FullPlayerPage {
         const pasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, shareText)
         const systemPasteboard = pasteboard.getSystemPasteboard()
         await systemPasteboard.setDataSync(pasteData)
-        promptAction.showToast({ message: '分享面板拉起失败，已复制到剪贴板', duration: 2000 })
+        this.getUIContext().getPromptAction().showToast({ message: '分享面板拉起失败，已复制到剪贴板', duration: 2000 })
       } catch (_e) {
-        promptAction.showToast({ message: '分享失败', duration: 2000 })
+        this.getUIContext().getPromptAction().showToast({ message: '分享失败', duration: 2000 })
       }
     }
     this.showMoreSheet = false
@@ -778,7 +801,7 @@ export struct FullPlayerPage {
               if (event.offsetY > 150) {
                 this.doBack()
               }
-              animateTo({ duration: 200, curve: Curve.EaseOut }, () => {
+              this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut }, () => {
                 this.dragOffset = 0
               })
             })
@@ -1045,7 +1068,7 @@ export struct FullPlayerPage {
           const center = this.lyricsViewHeight / 2
           if (this.lyricPullOffset > center) {
             this.doBack()
-            animateTo({ duration: 200 }, () => {
+            this.getUIContext().animateTo({ duration: 200 }, () => {
               this.lyricPullOffset = 0
             })
             setTimeout(() => {
@@ -1057,7 +1080,7 @@ export struct FullPlayerPage {
             this.lyricPullHint = '刷新中...'
             this.loadLyrics()
           }
-          animateTo({ duration: 200 }, () => {
+          this.getUIContext().animateTo({ duration: 200 }, () => {
             this.lyricPullOffset = 0
           })
           setTimeout(() => {
@@ -1192,7 +1215,7 @@ export struct FullPlayerPage {
     .justifyContent(FlexAlign.Center)
     .onClick(() => {
       this.togglePlayMode()
-      promptAction.showToast({ message: this.getPlayModeLabelLocal(), duration: 1500 })
+      this.getUIContext().getPromptAction().showToast({ message: this.getPlayModeLabelLocal(), duration: 1500 })
     })
   }
 
@@ -1269,7 +1292,7 @@ export struct FullPlayerPage {
           .borderRadius(12)
           .onClick(() => {
             this.togglePlayMode();
-            promptAction.showToast({ message: this.getPlayModeLabelLocal(), duration: 1500 })
+            this.getUIContext().getPromptAction().showToast({ message: this.getPlayModeLabelLocal(), duration: 1500 })
           })
       }
       .width('100%')
@@ -1398,14 +1421,25 @@ export struct FullPlayerPage {
       } else {
         ForEach(this.playlists, (playlist: Playlist) => {
           Row({ space: 12 }) {
-            Row() {
-              SymbolGlyph($r('sys.symbol.list_bullet')).fontSize(18).fontColor([this.themePrimary])
+            if (playlist.coverUrl && playlist.coverUrl.length > 0) {
+              CoverImage({
+                url: playlist.coverUrl,
+                coverWidth: 36,
+                coverHeight: 36,
+                radius: 8
+              })
+              .flexShrink(0)
+            } else {
+              Row() {
+                SymbolGlyph($r('sys.symbol.list_bullet')).fontSize(18).fontColor([this.themePrimary])
+              }
+              .width(36)
+              .height(36)
+              .borderRadius(8)
+              .backgroundColor(this.themePlaceholder)
+              .justifyContent(FlexAlign.Center)
+              .flexShrink(0)
             }
-            .width(36)
-            .height(36)
-            .borderRadius(8)
-            .backgroundColor(this.themePlaceholder)
-            .justifyContent(FlexAlign.Center)
 
             Column({ space: 2 }) {
               Text(playlist.name).fontSize(15).fontColor(this.themeTextPrimary).fontWeight(FontWeight.Medium)

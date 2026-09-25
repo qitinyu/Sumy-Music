@@ -8,9 +8,10 @@ import { PlayerStore } from '../utils/PlayerStore'
 import { SongCard } from '../components/SongCard'
 
 import { SongActionSheet } from '../components/SongActionSheet'
-import { promptAction } from '@kit.ArkUI'
+
 import { CompatUtils } from '../utils/CompatUtils'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
+import { HdsNavDestination, ScrollEffectType, hdsMaterial } from '@kit.UIDesignKit'
 
 interface SearchSuggestion {
   text: string
@@ -97,6 +98,7 @@ export struct QinseTab {
   private sessionCursor: number = 0           // 当前尝试到的候选下标
   private sessionBusyToken: number = -1       // 正在运行的重试循环令牌（-1=无循环在跑）
   private sessionAttemptFailed: boolean = false // 起播宽限期内的失败标记（由播放错误回调写入）
+  private sessionShownKey: string = ''        // 当前 UI 展示的会话曲目标识（source|songId），换源成功后随身份过继更新
 
   async aboutToAppear() {
     // 读取搜索常驻 / 搜索记忆 / 搜索联想词开关
@@ -195,106 +197,19 @@ export struct QinseTab {
 
   build() {
     Stack() {
-      Column() {
-        Row() {
-          Row({ space: 6 }) {
-            SymbolGlyph($r('sys.symbol.magnifyingglass'))
-              .fontSize(14)
-              .fontColor([$r('sys.color.font_primary')])
-              .margin({ left: 10 })
-
-            TextInput({ placeholder: '搜索音乐', text: this.keyword })
-              .layoutWeight(1)
-              .height(32)
-              .backgroundColor(Color.Transparent)
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .placeholderColor($r('sys.color.font_secondary'))
-              .placeholderFont({ size: 14 })
-              .onChange((value: string) => {
-                // 程序化设置 text（选中联想词/历史记录、清空）时也会触发 onChange：
-                // 值与当前关键词一致说明不是用户输入，跳过，避免重复触发联想/搜索
-                if (value === this.keyword) {
-                  return
-                }
-                this.keyword = value
-                if (this.searchSuggestEnabled) {
-                  // 联想模式：输入即出联想词，不再自动搜索
-                  this.handleSuggestInput(value)
-                } else {
-                  this.debouncedSearch(value)
-                }
-              })
-              .onSubmit(() => {
-                if (this.keyword.trim().length > 0) {
-                  this.hideSuggestPanel()
-                  if (this.searchTimer !== -1) {
-                    clearTimeout(this.searchTimer)
-                  }
-                  this.doSearch(this.keyword.trim())
-                }
-              })
-
-            if (this.keyword.length > 0) {
-              Row() {
-                SymbolGlyph($r('sys.symbol.xmark_circle_fill'))
-                  .fontSize(16)
-                  .fontColor([$r('sys.color.font_primary')])
-              }
-              .width(28)
-              .height(28)
-              .justifyContent(FlexAlign.Center)
-              .onClick(() => {
-                this.keyword = ''
-                this.isSearched = false
-                this.searchResults = []
-                this.hideSuggestPanel()
-                AppStorage.setOrCreate('qinseKeyword', '')
-                AppStorage.setOrCreate('qinseIsSearched', false)
-                AppStorage.setOrCreate('qinseSearchResults', [])
-                this.db.clearSearchResults()
-                if (this.searchTimer !== -1) {
-                  clearTimeout(this.searchTimer)
-                }
-              })
+      // V2.1.9：搜索栏迁入 HdsNavDestination 标题栏 bottomBuilder（HDS 官方模式：自定义区放搜索框），
+      // 栏体静止透明、样式与歌单详情页一致（GRADIENT_BLUR + systemMaterialEffect）
+      HdsNavDestination() {
+        Column() {
+          // === 搜索联想词面板（直接展示在搜索栏下方，把历史挤压到下面） ===
+          if (this.showSuggestPanel && this.keyword.trim().length > 0) {
+            // 宽度与标题栏搜索栏对齐（V2.1.9：左右各 16vp）
+            Column() {
+              this.SuggestPanel()
             }
+            .width('100%')
+            .padding({ left: 16, right: 16 })
           }
-          .layoutWeight(1)
-          .height(36)
-          .borderRadius(18)
-          .backgroundColor(this.themeCardBg)
-          .padding({ right: 8 })
-
-          // 筛选：点击展开当前结果中自动检测到的音源（选中具体音源时标蓝）
-          Button({ type: ButtonType.Normal }) {
-            Row({ space: 3 }) {
-              Text(this.sourceFilter === 'all' ? '筛选' : SourceInfo.getAbbr(this.sourceFilter))
-                .fontSize(11)
-                .fontColor(this.sourceFilter === 'all' ? $r('sys.color.font_primary') : this.themePrimary)
-                .fontWeight(FontWeight.Medium)
-                .maxLines(1)
-              SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(9)
-                .fontColor([this.sourceFilter === 'all' ? $r('sys.color.font_primary') : this.themePrimary])
-            }
-            .justifyContent(FlexAlign.Center)
-          }
-          .height(36)
-          .padding({ left: 10, right: 10 })
-          .margin({ left: 8 })
-          .borderRadius(18)
-          .backgroundColor(this.sourceFilter === 'all' ? this.themeCardBg : this.themePrimaryLight)
-          .enabled(this.isSearched && this.searchResults.length > 0)
-          .opacity(this.isSearched && this.searchResults.length > 0 ? 1 : 0.4)
-          .bindMenu(this.buildFilterMenuItems())
-        }
-        .width('100%')
-        .padding({ left: 12, right: 12, top: 10, bottom: 6 })
-
-        // === 搜索联想词面板（直接展示在搜索栏下方，把历史挤压到下面） ===
-        if (this.showSuggestPanel && this.keyword.trim().length > 0) {
-          this.SuggestPanel()
-        }
 
         if (this.showPullIndicator) {
           Column({ space: 2 }) {
@@ -357,6 +272,28 @@ export struct QinseTab {
         }
         this.handleContentPull(event)
       })
+      // V2.1.9：为浮动标题栏让位（stackBuilder 56vp + 8vp 间隙）
+      .padding({ top: 64 })
+      }
+      .titleBar({
+        content: {
+          // V2.1.9：stackBuilder 叠加于标题行，栏高保持 56vp（bottomBuilder 会附加 56vp 空标题行，弃用）
+          stackBuilder: (): void => this.SearchBar(),
+        },
+        // V2.1.9：与详情页同款——静止透明，滚动浮出浅灰模糊板
+        style: {
+          scrollEffectOpts: {
+            enableScrollEffect: true,
+            scrollEffectType: ScrollEffectType.GRADIENT_BLUR,
+          },
+          systemMaterialEffect: {
+            materialType: hdsMaterial.MaterialType.IMMERSIVE,
+            materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+          },
+        },
+      })
+      .width('100%')
+      .height('100%')
 
       // === 自检进度/结果弹窗（底部，与“播放失败”同一位置，沉浸光感） ===
       if (this.resultPillVisible && this.resultPillText.length > 0) {
@@ -369,7 +306,7 @@ export struct QinseTab {
           }
           .padding({ left: 18, right: 18, top: 9, bottom: 9 })
           .systemMaterial(this.supportImmersive ? MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN) : undefined)
-          .backgroundColor(this.supportImmersive ? Color.Transparent : (this.isDarkMode ? '#CC1A1A1A' : '#CCFFFFFF'))
+          .backgroundColor(this.supportImmersive ? Color.Transparent : (this.isDarkMode ? '#1A1A1A' : '#FFFFFF'))
           .borderRadius(22)
           .shadow({ radius: 12, color: '#33000000', offsetY: 3 })
           .onClick(() => {
@@ -404,6 +341,106 @@ export struct QinseTab {
     }
     .width('100%')
     .height('100%')
+  }
+
+  // V2.1.9：搜索栏（迁入标题栏 stackBuilder，行高 56vp，左右 16vp 与联想面板对齐）
+  @Builder
+  SearchBar() {
+    Row() {
+      Row({ space: 6 }) {
+        SymbolGlyph($r('sys.symbol.magnifyingglass'))
+          .fontSize(14)
+          .fontColor([$r('sys.color.font_primary')])
+          .margin({ left: 10 })
+
+        TextInput({ placeholder: '搜索音乐', text: this.keyword })
+          .layoutWeight(1)
+          .height(32)
+          .backgroundColor(Color.Transparent)
+          .fontSize(14)
+          .fontColor($r('sys.color.font_primary'))
+          .placeholderColor($r('sys.color.font_secondary'))
+          .placeholderFont({ size: 14 })
+          .onChange((value: string) => {
+            // 程序化设置 text（选中联想词/历史记录、清空）时也会触发 onChange：
+            // 值与当前关键词一致说明不是用户输入，跳过，避免重复触发联想/搜索
+            if (value === this.keyword) {
+              return
+            }
+            this.keyword = value
+            if (this.searchSuggestEnabled) {
+              // 联想模式：输入即出联想词，不再自动搜索
+              this.handleSuggestInput(value)
+            } else {
+              this.debouncedSearch(value)
+            }
+          })
+          .onSubmit(() => {
+            if (this.keyword.trim().length > 0) {
+              this.hideSuggestPanel()
+              if (this.searchTimer !== -1) {
+                clearTimeout(this.searchTimer)
+              }
+              this.doSearch(this.keyword.trim())
+            }
+          })
+
+        if (this.keyword.length > 0) {
+          Row() {
+            SymbolGlyph($r('sys.symbol.xmark_circle_fill'))
+              .fontSize(16)
+              .fontColor([$r('sys.color.font_primary')])
+          }
+          .width(28)
+          .height(28)
+          .justifyContent(FlexAlign.Center)
+          .onClick(() => {
+            this.keyword = ''
+            this.isSearched = false
+            this.searchResults = []
+            this.hideSuggestPanel()
+            AppStorage.setOrCreate('qinseKeyword', '')
+            AppStorage.setOrCreate('qinseIsSearched', false)
+            AppStorage.setOrCreate('qinseSearchResults', [])
+            this.db.clearSearchResults()
+            if (this.searchTimer !== -1) {
+              clearTimeout(this.searchTimer)
+            }
+          })
+        }
+      }
+      .layoutWeight(1)
+      .height(36)
+      .borderRadius(18)
+      .backgroundColor(this.themeCardBg)
+      .padding({ right: 8 })
+
+      // 筛选：点击展开当前结果中自动检测到的音源（选中具体音源时标蓝）
+      Button({ type: ButtonType.Normal }) {
+        Row({ space: 3 }) {
+          Text(this.sourceFilter === 'all' ? '筛选' : SourceInfo.getAbbr(this.sourceFilter))
+            .fontSize(11)
+            .fontColor(this.sourceFilter === 'all' ? $r('sys.color.font_primary') : this.themePrimary)
+            .fontWeight(FontWeight.Medium)
+            .maxLines(1)
+          SymbolGlyph($r('sys.symbol.chevron_down'))
+            .fontSize(9)
+            .fontColor([this.sourceFilter === 'all' ? $r('sys.color.font_primary') : this.themePrimary])
+        }
+        .justifyContent(FlexAlign.Center)
+      }
+      .height(36)
+      .padding({ left: 10, right: 10 })
+      .margin({ left: 8 })
+      .borderRadius(18)
+      .backgroundColor(this.sourceFilter === 'all' ? this.themeCardBg : this.themePrimaryLight)
+      .enabled(this.isSearched && this.searchResults.length > 0)
+      .opacity(this.isSearched && this.searchResults.length > 0 ? 1 : 0.4)
+      .bindMenu(this.buildFilterMenuItems())
+    }
+    .width('100%')
+    .height(56)
+    .padding({ left: 16, right: 16 })
   }
 
   // ===== 搜索联想词 =====
@@ -449,7 +486,7 @@ export struct QinseTab {
       }
     }
     .width('100%')
-    .margin({ left: 16, right: 16, top: 2 })
+    .margin({ top: 2 })
     .padding({ left: 14, right: 14, top: 4, bottom: 4 })
     .backgroundColor(this.themeCardBg)
     .borderRadius(14)
@@ -966,7 +1003,7 @@ export struct QinseTab {
     await this.db.clearSearchHistory()
     await this.db.clearSearchResults()
     this.searchHistory = []
-    promptAction.showToast({ message: '\u641C\u7D22\u8BB0\u5F55\u5DF2\u6E05\u7A7A', duration: 1500 })
+    this.getUIContext().getPromptAction().showToast({ message: '\u641C\u7D22\u8BB0\u5F55\u5DF2\u6E05\u7A7A', duration: 1500 })
   }
 
   // V2.0.8：单歌播放（带失败自动换源）
@@ -977,12 +1014,41 @@ export struct QinseTab {
     const idx: number = queue.indexOf(song)
     PlayerStore.play(song, queue, idx >= 0 ? idx : 0)
 
+    // V2.1.9 自动换源关闭：不做候选换源，直接取链起播；失败提示后自动跳过下一首
+    if (AppStorage.get<boolean>('autoSourceSwitch') === false) {
+      this.sessionToken++
+      this.sessionSong = null
+      this.sessionCandidates = []
+      const player = AudioPlayer.getInstance()
+      player.endRetrySession()
+      let directUrl: string = song.playUrl
+      if (!directUrl) {
+        directUrl = await MusicApi.getPlayUrl(song.songId, song.source, song)
+      }
+      if (!directUrl) {
+        SourceStatus.markUnplayable(song.source)
+        this.showResultPill(`「${song.songName}」取链失败，已跳过`, true)
+        player.playNext()
+        return
+      }
+      song.playUrl = directUrl
+      player.setCurrentSong(song)
+      await player.play(directUrl)
+      SourceStatus.markPlayable(song.source)
+      this.showResultPill(`「${song.songName}」播放成功`, true)
+      if (AppStorage.get<boolean>('autoJumpDetail') === true) {
+        PlayerStore.showFullPlayer()
+      }
+      return
+    }
+
     // 开启新的换源会话：作废旧会话，注册错误接管回调
     this.sessionToken++
     const token: number = this.sessionToken
     this.sessionSong = song
     this.sessionCursor = 0
     this.sessionAttemptFailed = false
+    this.sessionShownKey = song.source + '|' + song.songId
     this.sessionCandidates = this.buildSourceCandidates(song)
 
     const player = AudioPlayer.getInstance()
@@ -1110,6 +1176,54 @@ export struct QinseTab {
 
         // 播放成功：标记该音源可用，保留会话以接管后续中途失败
         SourceStatus.markPlayable(candidate.source)
+        // V2.1.8 换源成功：把新源的播放身份过继给原曲（歌名/歌手/封面保持不变），
+        // 使来源徽章与歌词/收藏取数都切换到实际可用的新源
+        if (!isOrigin && origin !== null) {
+          const prevSource: string = origin.source
+          const prevSongId: string = origin.songId
+          const shown: SongInfo | undefined = PlayerStore.getCurrentTrack()
+          if (shown !== undefined && shown.source + '|' + shown.songId === this.sessionShownKey) {
+            origin.source = candidate.source
+            origin.songId = candidate.songId
+            origin.rawData = candidate.rawData
+            origin.playUrl = playUrl
+            if (candidate.lyric !== undefined && candidate.lyric.length > 0) {
+              origin.lyric = candidate.lyric
+            }
+            if (candidate.albumId !== undefined) {
+              origin.albumId = candidate.albumId
+            }
+            if (candidate.artistId !== undefined) {
+              origin.artistId = candidate.artistId
+            }
+            if (candidate.hash !== undefined) {
+              origin.hash = candidate.hash
+            }
+            if (candidate.mid !== undefined) {
+              origin.mid = candidate.mid
+            }
+            this.sessionShownKey = origin.source + '|' + origin.songId
+            // 无条件克隆刷新当前曲目（同曲守卫会拦截身份已变的曲目）
+            PlayerStore.forceRefreshCurrentTrack(origin)
+            // 同步到操作面板选中的歌曲引用（若为独立克隆对象），确保随后「加入歌单」保存的是实际可用的新源
+            if (this.selectedSong !== null && this.selectedSong !== undefined &&
+              this.selectedSong.source === prevSource && this.selectedSong.songId === prevSongId) {
+              this.selectedSong.source = origin.source
+              this.selectedSong.songId = origin.songId
+              this.selectedSong.rawData = origin.rawData
+              this.selectedSong.playUrl = origin.playUrl
+              this.selectedSong.coverUrl = origin.coverUrl
+            }
+            // 重注册换源会话：错误接管按 source|songId 匹配，身份已变需同步更新
+            player.beginRetrySession(this.sessionShownKey, (message: string): void => {
+              this.onSessionPlayError(token)
+            })
+            // 歌词改从新源获取（旧源接口可能已不可用）
+            PlayerStore.loadLyricsAsync(origin)
+            // 重赋值触发搜索结果行的来源徽章刷新
+            this.searchResults = this.searchResults.slice()
+          }
+        }
         this.sessionCursor++
         this.showResultPill(`「${origin?.songName ?? candidate.songName}」播放成功`, true)
         // 自动详情：点击歌曲后同步打开详情页
@@ -1148,6 +1262,6 @@ export struct QinseTab {
   }
 
   private showToastMessage(message: string) {
-    promptAction.showToast({ message, duration: 2000 })
+    this.getUIContext().getPromptAction().showToast({ message, duration: 2000 })
   }
 }

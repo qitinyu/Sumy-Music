@@ -15,7 +15,7 @@ import { PlayerStore, PlayerKeys } from '../utils/PlayerStore'
 import { AudioPlayer } from '../utils/AudioPlayer'
 import { MusicApi } from '../utils/MusicApi'
 import { CoverFetcher } from '../utils/CoverFetcher'
-import { promptAction } from '@kit.ArkUI'
+
 import { CoverImage } from './CoverImage'
 import { CompatUtils } from '../utils/CompatUtils'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
@@ -102,7 +102,7 @@ export struct MiniBarPlayer {
     if (!playUrl) {
       // 真正停掉 AVPlayer（PlayerStore.pause 只改 AppStorage 标记，旧歌会继续响）
       await AudioPlayer.getInstance().pause()
-      promptAction.showToast({ message: '无法获取播放链接', duration: 1500 })
+      this.getUIContext().getPromptAction().showToast({ message: '无法获取播放链接', duration: 1500 })
       return
     }
     track.playUrl = playUrl
@@ -250,7 +250,7 @@ export struct MiniBarPlayer {
 
   private togglePlayMode(): void {
     PlayerStore.togglePlayMode()
-    promptAction.showToast({ message: PlayerStore.getPlayModeLabel(), duration: 1500 })
+    this.getUIContext().getPromptAction().showToast({ message: PlayerStore.getPlayModeLabel(), duration: 1500 })
   }
 
   build() {

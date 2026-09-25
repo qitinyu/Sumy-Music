@@ -43,7 +43,7 @@ export class CompatUtils {
   private static tryDecode(label: string, bytes: Uint8Array): string {
     try {
       const decoder: util.TextDecoder = util.TextDecoder.create(label)
-      return decoder.decodeWithStream(bytes)
+      return decoder.decodeToString(bytes)
     } catch (_e) {
       return ''
     }

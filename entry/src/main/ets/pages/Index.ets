@@ -9,6 +9,7 @@ import {
   HdsTabsFloatingStyle,
   HdsBarStyle,
   HdsTabsBarChangeMode,
+  HdsNavigation,
   hdsMaterial
 } from '@kit.UIDesignKit'
 
@@ -22,7 +23,7 @@ import { MFEngineHost } from '../components/MFEngineHost'
 import { LXSourceHost } from '../source/LXSourceHost'
 import { MiniBarPlayer } from '../components/MiniBarPlayer'
 import { MaterialCompat } from '../utils/MaterialCompat'
-import { promptAction } from '@kit.ArkUI'
+
 
 @Entry
 @Component
@@ -41,11 +42,15 @@ struct Index {
   @StorageProp('playerErrorNotice') @Watch('onPlayerErrorNotice') playerErrorNotice: string = ''
   // 推荐页搜索栏点击信号（时间戳）：跳转到搜索 Tab
   @StorageProp('jumpToSearchTab') @Watch('onJumpToSearchTab') jumpToSearchTab: number = 0
+  // 我的页听歌统计卡片点击信号（时间戳）：跳转到音迹 Tab
+  @StorageProp('jumpToYinjiTab') @Watch('onJumpToYinjiTab') jumpToYinjiTab: number = 0
   @State showPlayerOverlay: boolean = false
 
   private db: DatabaseHelper = DatabaseHelper.getInstance()
   private controller: HdsTabsController = new HdsTabsController()
   @State private miniBarApplied: boolean = false
+  // 设备支持 IMMERSIVE 材质类型时，底部栏材质等级用 EXQUISITE 精美档；否则 ADAPTIVE 系统自适应
+  private useExquisiteMaterial: boolean = false
 
   aboutToAppear(): void {
     // 主题初始化已移至 EntryAbility.onCreate，在 UI 创建前完成
@@ -60,6 +65,8 @@ struct Index {
     AppStorage.setOrCreate('miniBarStyle', 1)
     // 封面/歌词自动补全默认关闭（设置-播放器内开启；LocalTagEnricher 读取此开关）
     AppStorage.setOrCreate('autoEnrichTags', false)
+    // 自动换源默认开启（设置-播放器-播放设置内开关；关闭后播放失败自动跳过不再换源）
+    AppStorage.setOrCreate('autoSourceSwitch', true)
     // 迷你栏歌曲来源徽章默认开启（设置-播放器-Minibar 设置内开关）
     AppStorage.setOrCreate('miniBarShowSource', true)
     // 设置页以全屏侧边栏形式展开，默认关闭
@@ -70,6 +77,8 @@ struct Index {
     this.checkAnnouncementDate()
     this.loadAutoJumpSetting()
     this.loadSectionSettings()
+    // 官方要求：选用 EXQUISITE/GENTLE 前必须查询设备材质能力，不支持 IMMERSIVE 时强制精美档会卡顿发热
+    this.useExquisiteMaterial = MaterialCompat.supportsImmersiveMaterial()
     // 默认展示展开的迷你栏
     setTimeout(() => {
       if (!this.miniBarApplied) {
@@ -84,7 +93,7 @@ struct Index {
     const sep: number = this.playerErrorNotice.indexOf('|')
     const msg: string = sep > 0 ? this.playerErrorNotice.substring(0, sep) : this.playerErrorNotice
     if (msg.length > 0) {
-      promptAction.showToast({ message: msg, duration: 2000, bottom: '120vp' })
+      this.getUIContext().getPromptAction().showToast({ message: msg, duration: 2000, bottom: '120vp' })
     }
   }
 
@@ -96,10 +105,11 @@ struct Index {
     }
 
     if (this.showSettingsSidebar) {
-      // 设置子页内先返回设置主界面（与子页左上角返回一致），再次返回才关闭侧边栏
+      // 设置子页内先返回设置主界面（与子页标题栏返回键一致），再次返回才关闭侧边栏
       const loushiSubPage: string = AppStorage.get<string>('loushi_subPage') ?? 'main'
       if (loushiSubPage !== 'main') {
-        AppStorage.setOrCreate('loushi_subPage', 'main')
+        // V2.1.9：设置子页已路由化（HdsNavDestination），发信号由 LoushiTab pop 路由栈
+        AppStorage.setOrCreate('loushiNavBackSignal', Date.now())
         return true
       }
       this.closeSettingsSidebar()
@@ -127,6 +137,11 @@ struct Index {
   private onJumpToSearchTab(): void {
     // 推荐页搜索栏被点击，切换到搜索 Tab
     this.controller.changeIndex(0)
+  }
+
+  private onJumpToYinjiTab(): void {
+    // 我的页听歌统计卡片被点击，切换到音迹 Tab
+    this.controller.changeIndex(2)
   }
 
   private onSettingsSidebarChange(): void {
@@ -161,6 +176,9 @@ struct Index {
     AppStorage.setOrCreate('playlistLocatePlaying', playlistLocate === 'true')
     const queueLocate = await this.db.getSetting('queueLocatePlaying')
     AppStorage.setOrCreate('queueLocatePlaying', queueLocate === 'true')
+    // 自动换源：默认开启（设置-播放器-播放设置）
+    const autoSwitch = await this.db.getSetting('autoSourceSwitch')
+    AppStorage.setOrCreate('autoSourceSwitch', autoSwitch !== 'false')
   }
 
   private getTodayStr(): string {
@@ -176,6 +194,10 @@ struct Index {
     if (index === 0) {
       // 搜索 Tab 可见：通知 QinseTab 恢复上次搜索状态
       AppStorage.setOrCreate('qinseTabVisible', Date.now())
+    }
+    if (index === 2) {
+      // 音迹 Tab 可见：通知 YinjiTab 刷新听歌统计数据
+      AppStorage.setOrCreate('yinjiTabVisible', Date.now())
     }
   }
 
@@ -194,12 +216,10 @@ struct Index {
   private onShowFullPlayerChange(): void {
     if (this.showFullPlayer) {
       this.showPlayerOverlay = true
-      // 全屏播放器使用深色背景，状态栏文字改为白色
-      StatusBarManager.applyForBackground('#1A1A1A')
-    } else {
-      // 退出全屏播放器，恢复主题背景色的状态栏
-      StatusBarManager.applyForBackground(this.themeBg)
     }
+    // V2.1.7：播放页状态栏文字色跟随主题背景（默认浅色主题→黑字，修复对比度不足）；
+    // 背景取色开启时由 FullPlayerPage 按实际背景自行校正
+    StatusBarManager.applyForBackground(this.themeBg)
   }
 
   private closePlayerOverlay(): void {
@@ -211,9 +231,12 @@ struct Index {
     return {
       barBottomMargin: 20,
       // V2.1.0：加强底部栏沉浸光感 —— 系统沉浸式材质 + 主题色光晕 + 微透明
+      // V2.1.8：设备支持 IMMERSIVE 时材质等级升级 EXQUISITE 精美档，否则保持 ADAPTIVE 自适应
       systemMaterialEffect: {
         materialType: hdsMaterial.MaterialType.IMMERSIVE,
-        materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE
+        materialLevel: this.useExquisiteMaterial
+          ? hdsMaterial.MaterialLevel.EXQUISITE
+          : hdsMaterial.MaterialLevel.ADAPTIVE
       },
       lightColor: MaterialCompat.withAlpha(this.themePrimary, 0.12),
       barOpacity: 0.9,
@@ -232,42 +255,50 @@ struct Index {
       // 全局主题背景图（仅部分主题有背景图）
       this.ThemeBackgroundImage()
 
-      // 顶部留出 44px 状态栏高度，HdsTabs 内容从此处开始
+      // 页面根自动避让状态栏（安全区起点），内容直接从状态栏下方开始
       Column() {
-        // index=3：启动默认展示「我的」页；index=0：搜索页（常驻）
-        HdsTabs({ controller: this.controller, index: this.activeTab }) {
-          TabContent() {
-            QinseTab()
-          }
-          .tabBar(this.buildTabBarBuilder(0, '搜索', $r('sys.symbol.magnifyingglass'), 'serch.svg'))
+        // HdsNavigation 仅作容器：为「我的」页 HdsNavDestination 提供导航上下文；主页不展示 HDS 标题栏
+        HdsNavigation() {
+          // index=3：启动默认展示「我的」页；index=0：搜索页（常驻）
+          HdsTabs({ controller: this.controller, index: this.activeTab }) {
+            TabContent() {
+              QinseTab()
+            }
+            .tabBar(this.buildTabBarBuilder(0, '搜索', $r('sys.symbol.magnifyingglass'), 'serch.svg'))
 
-          TabContent() {
-            TuijianTab()
-          }
-          .tabBar(this.buildTabBarBuilder(1, '推荐', $r('sys.symbol.star'), 'tj.svg'))
+            TabContent() {
+              TuijianTab()
+            }
+            .tabBar(this.buildTabBarBuilder(1, '推荐', $r('sys.symbol.star'), 'tj.svg'))
 
-          TabContent() {
-            YinjiTab()
-          }
-          .tabBar(this.buildTabBarBuilder(2, '音迹', $r('sys.symbol.waveform'), 'xj.svg'))
+            TabContent() {
+              YinjiTab()
+            }
+            .tabBar(this.buildTabBarBuilder(2, '音迹', $r('sys.symbol.waveform'), 'xj.svg'))
 
-          TabContent() {
-            XuanchuangTab()
+            TabContent() {
+              XuanchuangTab()
+            }
+            .tabBar(this.buildTabBarBuilder(3, '我的', $r('sys.symbol.person_fill'), 'my.svg'))
           }
-          .tabBar(this.buildTabBarBuilder(3, '我的', $r('sys.symbol.person_fill'), 'my.svg'))
+          .vertical(false)
+          .barPosition(BarPosition.End)
+          .barMode(BarMode.Fixed)
+          .scrollable(false)
+          .barOverlap(true)
+          .onChange((index: number) => {
+            this.onTabChange(index)
+          })
+          .barFloatingStyle(this.getBarFloatingStyle())
         }
-        .vertical(false)
-        .barPosition(BarPosition.End)
-        .barMode(BarMode.Fixed)
-        .scrollable(false)
-        .barOverlap(true)
-        .onChange((index: number) => {
-          this.onTabChange(index)
-        })
-        .barFloatingStyle(this.getBarFloatingStyle())
+        // V2.1.9：主页不展示 HDS 标题栏（大标题+空菜单观感差，滚动黑板与状态栏割裂），仅保留容器
+        .hideTitleBar(true)
       }
       .width('100%')
       .height('100%')
+      // V2.1.9：HdsNavigation 无标题栏时按沉浸式全出血渲染，内容起点会上移整段状态栏高度（约 39.4vp），
+      // 本 padding 即四个 Tab 内容与歌单详情页标题栏的实际顶部起点：44 = 状态栏 39.4 + 4.6 间隙。
+      // 实证：padding 5 时内容起点 y=17.5px（搜索框钻入状态栏、详情标题栏贴边退化压扁）；44 时回到 y=154px 状态栏下方
       .padding({ top: 44 })
 
       StartupDialog({

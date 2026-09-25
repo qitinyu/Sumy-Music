@@ -1,5 +1,5 @@
-// LevelGuideDialog.ets - 等级明示弹窗：LV1-16 四区段色彩表
-import { LevelRangeInfo, buildLevelTable, SEGMENT_NAMES } from '../utils/LevelConfig'
+// LevelGuideDialog.ets - 等级明示弹窗：LV1-8 八区段色彩表
+import { LevelRangeInfo, buildLevelTable, LEVEL_TEXT_COLOR } from '../utils/LevelConfig'
 
 @CustomDialog
 export struct LevelGuideDialog {
@@ -17,28 +17,37 @@ export struct LevelGuideDialog {
     this.rows = buildLevelTable()
   }
 
+  // 千分位格式化（区间最大 160000）
+  private formatNum(n: number): string {
+    const s: string = String(n)
+    if (s.length <= 3) {
+      return s
+    }
+    return s.substring(0, s.length - 3) + ',' + s.substring(s.length - 3)
+  }
+
   @Builder
   LevelRow(row: LevelRangeInfo) {
     Row({ space: 12 }) {
-      // 等级徽章（文字镂空，背景填充等级色）
+      // 等级徽章（区段色均为浅/中亮度，黑色文字保证对比度）
       Stack() {
         Text(`LV${row.level}`)
           .fontSize(12)
           .fontWeight(FontWeight.Bold)
-          .fontColor(this.themeCardBg)
+          .fontColor(LEVEL_TEXT_COLOR)
           .backgroundColor(row.color)
           .padding({ left: 10, right: 10, top: 3, bottom: 3 })
           .borderRadius(8)
       }
 
       Row({ space: 6 }) {
-        Text(`${row.rangeStart}`)
+        Text(this.formatNum(row.rangeStart))
           .fontSize(13)
           .fontColor(this.themeTextPrimary)
         Text('~')
           .fontSize(13)
           .fontColor(this.themeTextSecondary)
-        Text(`${row.rangeEnd}`)
+        Text(this.formatNum(row.rangeEnd))
           .fontSize(13)
           .fontColor(this.themeTextPrimary)
         Text('分钟')
@@ -60,28 +69,6 @@ export struct LevelGuideDialog {
     .padding({ top: 5, bottom: 5 })
   }
 
-  @Builder
-  SegmentHeader(segment: number) {
-    Row({ space: 6 }) {
-      Row()
-        .width(8)
-        .height(8)
-        .borderRadius(4)
-        .backgroundColor(this.segmentColor(segment))
-      Text(SEGMENT_NAMES[segment - 1])
-        .fontSize(12)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.themeTextSecondary)
-    }
-    .width('100%')
-    .padding({ top: 8, bottom: 2 })
-  }
-
-  private segmentColor(segment: number): string {
-    const colors: string[] = ['#2D529F', '#ADD88D', '#C55C10', '#C91D32']
-    return colors[Math.max(0, Math.min(3, segment - 1))]
-  }
-
   build() {
     Column({ space: 12 }) {
       Text('等级明示')
@@ -96,18 +83,12 @@ export struct LevelGuideDialog {
       List({ space: 2 }) {
         ForEach(this.rows, (row: LevelRangeInfo) => {
           ListItem() {
-            Column() {
-              if (row.level === 1 || row.level === 5 || row.level === 9 || row.level === 13) {
-                this.SegmentHeader(row.segment)
-              }
-              this.LevelRow(row)
-            }
-            .width('100%')
+            this.LevelRow(row)
           }
         }, (row: LevelRangeInfo) => `${row.level}`)
       }
       .width('100%')
-      .height(320)
+      .height(280)
       .scrollBar(BarState.Off)
       .divider({ strokeWidth: 1, color: this.themeDivider, startMargin: 40, endMargin: 0 })
 

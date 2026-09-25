@@ -188,14 +188,18 @@ export class DatabaseHelper {
       const cursor = await this.store.query(predicates)
       const songs: SongInfo[] = []
       while (cursor.goToNextRow()) {
+        // V2.1.9 在线音源直链有时效性，持久化的 playUrl 出库即过期（播放必失败、连环自动跳过），
+        // 出库时清空强制播放时重新取链（含自动换源兜底）；webdav/local 为稳定直链，原样保留
+        const src: string = cursor.getString(cursor.getColumnIndex('source'))
+        const storedUrl: string = cursor.getString(cursor.getColumnIndex('playUrl'))
         songs.push({
           songId: cursor.getString(cursor.getColumnIndex('songId')),
           songName: cursor.getString(cursor.getColumnIndex('songName')),
           artist: cursor.getString(cursor.getColumnIndex('artist')),
           album: cursor.getString(cursor.getColumnIndex('album')),
           coverUrl: cursor.getString(cursor.getColumnIndex('coverUrl')),
-          source: cursor.getString(cursor.getColumnIndex('source')),
-          playUrl: cursor.getString(cursor.getColumnIndex('playUrl')),
+          source: src,
+          playUrl: (src === 'webdav' || src === 'local') ? storedUrl : '',
           rawData: cursor.getString(cursor.getColumnIndex('rawData')) || undefined,
         })
       }
@@ -331,20 +335,50 @@ export class DatabaseHelper {
   async addSongToPlaylist(playlistId: string, song: SongInfo): Promise<boolean> {
     if (!this.store) return false
     try {
-      const valueBucket: relationalStore.ValuesBucket = {
-        'id': generateId(),
-        'playlistId': playlistId,
-        'songId': song.songId,
-        'songName': song.songName,
-        'artist': song.artist,
-        'album': song.album,
-        'coverUrl': song.coverUrl,
-        'source': song.source,
-        'playUrl': song.playUrl,
-        'rawData': song.rawData || '',
-        'createdAt': Date.now(),
+      // V2.1.9 同源同曲去重：判断依据为音源身份（songId+source）而非歌名。
+      // 歌单内已存在同一首歌时替换刷新其元数据（保留原加入位置），不再重复插入
+      // 造成"歌单里一模一样的两首歌，长按删除又同时消失"
+      const dupPred = new relationalStore.RdbPredicates('playlist_song')
+      dupPred.equalTo('playlistId', playlistId)
+        .equalTo('songId', song.songId)
+        .equalTo('source', song.source)
+        .orderByAsc('createdAt')
+        .limitAs(1)
+      const dupCursor = await this.store.query(dupPred)
+      let existRowId: string = ''
+      if (dupCursor.goToFirstRow()) {
+        existRowId = dupCursor.getString(dupCursor.getColumnIndex('id'))
       }
-      await this.store.insert('playlist_song', valueBucket)
+      dupCursor.close()
+
+      if (existRowId.length > 0) {
+        const refreshBucket: relationalStore.ValuesBucket = {
+          'songName': song.songName,
+          'artist': song.artist,
+          'album': song.album,
+          'coverUrl': song.coverUrl,
+          'playUrl': song.playUrl,
+          'rawData': song.rawData || '',
+        }
+        const refreshPred = new relationalStore.RdbPredicates('playlist_song')
+        refreshPred.equalTo('id', existRowId)
+        await this.store.update(refreshBucket, refreshPred)
+      } else {
+        const valueBucket: relationalStore.ValuesBucket = {
+          'id': generateId(),
+          'playlistId': playlistId,
+          'songId': song.songId,
+          'songName': song.songName,
+          'artist': song.artist,
+          'album': song.album,
+          'coverUrl': song.coverUrl,
+          'source': song.source,
+          'playUrl': song.playUrl,
+          'rawData': song.rawData || '',
+          'createdAt': Date.now(),
+        }
+        await this.store.insert('playlist_song', valueBucket)
+      }
       // 更新歌单的 updatedAt
       const updateBucket: relationalStore.ValuesBucket = { 'updatedAt': Date.now() }
       const updatePred = new relationalStore.RdbPredicates('playlist')
@@ -365,14 +399,17 @@ export class DatabaseHelper {
       const cursor = await this.store.query(predicates)
       const songs: SongInfo[] = []
       while (cursor.goToNextRow()) {
+        // V2.1.9 同 getFavorites：在线源持久化 playUrl 出库即过期，清空待播放时重新取链
+        const src: string = cursor.getString(cursor.getColumnIndex('source'))
+        const storedUrl: string = cursor.getString(cursor.getColumnIndex('playUrl'))
         songs.push({
           songId: cursor.getString(cursor.getColumnIndex('songId')),
           songName: cursor.getString(cursor.getColumnIndex('songName')),
           artist: cursor.getString(cursor.getColumnIndex('artist')),
           album: cursor.getString(cursor.getColumnIndex('album')),
           coverUrl: cursor.getString(cursor.getColumnIndex('coverUrl')),
-          source: cursor.getString(cursor.getColumnIndex('source')),
-          playUrl: cursor.getString(cursor.getColumnIndex('playUrl')),
+          source: src,
+          playUrl: (src === 'webdav' || src === 'local') ? storedUrl : '',
           rawData: cursor.getString(cursor.getColumnIndex('rawData')) || undefined,
           addedAt: cursor.getLong(cursor.getColumnIndex('createdAt')),
         })
@@ -437,11 +474,24 @@ export class DatabaseHelper {
   async removeSongFromPlaylist(playlistId: string, songId: string, source: string): Promise<void> {
     if (!this.store) return
     try {
-      const predicates = new relationalStore.RdbPredicates('playlist_song')
-      predicates.equalTo('playlistId', playlistId)
+      // V2.1.9 只删除最早加入的一条记录（按行 id 精确删除）：
+      // 历史数据可能存在同源同曲的重复行，按 songId+source 全量删除会"删一首、两首一起消失"
+      const pred = new relationalStore.RdbPredicates('playlist_song')
+      pred.equalTo('playlistId', playlistId)
         .equalTo('songId', songId)
         .equalTo('source', source)
-      await this.store.delete(predicates)
+        .orderByAsc('createdAt')
+        .limitAs(1)
+      const cursor = await this.store.query(pred)
+      let rowId: string = ''
+      if (cursor.goToFirstRow()) {
+        rowId = cursor.getString(cursor.getColumnIndex('id'))
+      }
+      cursor.close()
+      if (rowId.length === 0) return
+      const delPred = new relationalStore.RdbPredicates('playlist_song')
+      delPred.equalTo('id', rowId)
+      await this.store.delete(delPred)
     } catch (e) {
       console.error('[DB] removeSongFromPlaylist failed:', e)
     }

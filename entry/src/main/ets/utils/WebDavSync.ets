@@ -142,7 +142,7 @@ export class WebDavSync {
       } else {
         const bytes = result as Uint8Array
         const decoder = util.TextDecoder.create('utf-8')
-        jsonStr = decoder.decodeWithStream(bytes)
+        jsonStr = decoder.decodeToString(bytes)
       }
 
       if (jsonStr.length <= 2) {

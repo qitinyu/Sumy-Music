@@ -1,5 +1,9 @@
-// 音迹 Tab - 听歌记录页（样式初版，示例数据，后续接入真实听歌记录）
+// 音迹 Tab - 听歌记录页（顶部统计卡片为真实数据，榜单/最近播放仍为示例数据）
 // YinjiTab.ets
+
+import { DatabaseHelper } from '../database/DatabaseHelper'
+import { AccountManager } from '../utils/AccountManager'
+import { ListeningLevelManager } from '../utils/ListeningLevelManager'
 
 interface RecentItem {
   name: string
@@ -26,6 +30,15 @@ export struct YinjiTab {
   @StorageProp('theme_textSecondary') themeTextSecondary: string = '#999999'
   @StorageProp('theme_divider') themeDivider: string = '#E8E8E8'
   @StorageProp('theme_bgImageName') themeBgImageName: string = ''
+
+  // ==== 我的页听歌统计卡片同款数据（V2.0.9.3：复制到音迹顶部；与我的页同源同值） ====
+  @State playlistCount: number = 0
+  @State listenTime: number = 0      // 听歌时长（分钟）
+  @State listenSongs: number = 0     // 听歌曲目数
+  // 音迹 Tab 可见信号（时间戳）：切换到音迹时刷新统计数据
+  @StorageProp('yinjiTabVisible') @Watch('onTabVisibleSignal') tabVisibleSignal: number = 0
+
+  private db: DatabaseHelper = DatabaseHelper.getInstance()
 
   // ==== 示例统计数据（先做样式，后续替换为真实听歌记录数据源） ====
   @State totalMin: number = 4860       // 累计听歌分钟
@@ -92,9 +105,37 @@ export struct YinjiTab {
   // 下拉刷新状态
   @State isRefreshing: boolean = false
 
-  // 下拉刷新动作：接入真实数据后在此加载最新听歌记录
-  private refreshData(): void {
-    console.info('[YinjiTab] 下拉刷新 - 预留真实数据刷新入口')
+  aboutToAppear(): void {
+    this.loadMyStats()
+  }
+
+  // 音迹 Tab 可见：刷新与我的页同步的听歌统计
+  private onTabVisibleSignal(): void {
+    this.loadMyStats()
+  }
+
+  // 与我的页 StatsCard 同源同值：登录读取真实数据，未登录显示 0
+  private async loadMyStats() {
+    const savedUser = await AccountManager.loadSavedUserInfo()
+    if (!savedUser) {
+      this.playlistCount = 0
+      this.listenSongs = 0
+      this.listenTime = 0
+      return
+    }
+    const playlists = await this.db.getPlaylists()
+    this.playlistCount = playlists.length
+    const allSongs = await this.db.getAllSongs()
+    this.listenSongs = allSongs.length
+    const manager = ListeningLevelManager.getInstance()
+    await manager.init()
+    this.listenTime = Math.floor(manager.getTotalSeconds() / 60)
+  }
+
+  // 下拉刷新：刷新顶部统计卡片数据
+  private async refreshData(): Promise<void> {
+    await this.loadMyStats()
+    this.isRefreshing = false
   }
 
   // 返回当前选中的榜单（时间维度全局同步作用于三个子页）
@@ -146,22 +187,10 @@ export struct YinjiTab {
     Refresh({ refreshing: $$this.isRefreshing }) {
       Scroll() {
         Column({ space: 16 }) {
-          // 页头（去掉右上角刷新，改由下拉全页刷新）
-          Row() {
-            Column({ space: 2 }) {
-              Text('音迹')
-                .fontSize(24)
-                .fontWeight(FontWeight.Bold)
-                .fontColor(this.themeTextPrimary)
-              Text('每一次聆听，都值得被记录')
-                .fontSize(12)
-                .fontColor(this.themeTextSecondary)
-            }
-            .alignItems(HorizontalAlign.Start)
-          }
-          .width('100%')
-          .alignItems(VerticalAlign.Center)
-          .padding({ top: 4, bottom: 4 })
+          // V2.1.9：页头「音迹」移入顶部沉浸标题栏，此处不再重复展示
+
+          // 我的页听歌统计卡片同款（V2.0.9.3：歌单数 | 听歌时长 | 听歌曲目）
+          this.TopStatsCard()
 
           // 顶部统计卡片
           Row({ space: 10 }) {
@@ -427,6 +456,63 @@ export struct YinjiTab {
       this.refreshData()
     })
     .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
+  }
+
+  // ===== 我的页听歌统计卡片同款 =====
+  @Builder
+  TopStatsCard() {
+    Row({ space: 0 }) {
+      Column({ space: 2 }) {
+        Text(`${this.playlistCount}`)
+          .fontSize(28)
+          .fontColor(this.themeTextPrimary)
+          .fontWeight(FontWeight.Bold)
+        Text('歌单数')
+          .fontSize(12)
+          .fontColor(this.themeTextSecondary)
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Center)
+
+      Divider()
+        .width(1)
+        .height(40)
+        .color(this.themeDivider)
+
+      Column({ space: 2 }) {
+        Text(`${this.listenTime}`)
+          .fontSize(28)
+          .fontColor(this.themeTextPrimary)
+          .fontWeight(FontWeight.Bold)
+        Text('听歌时长(分钟)')
+          .fontSize(12)
+          .fontColor(this.themeTextSecondary)
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Center)
+
+      Divider()
+        .width(1)
+        .height(40)
+        .color(this.themeDivider)
+
+      Column({ space: 2 }) {
+        Text(`${this.listenSongs}`)
+          .fontSize(28)
+          .fontColor(this.themeTextPrimary)
+          .fontWeight(FontWeight.Bold)
+        Text('听歌曲目')
+          .fontSize(12)
+          .fontColor(this.themeTextSecondary)
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Center)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 20, bottom: 20 })
+    .backgroundColor(this.themeCardBg)
+    .borderRadius(16)
+    .shadow({ radius: 4, color: '#00000008', offsetY: 2 })
   }
 
   @Builder

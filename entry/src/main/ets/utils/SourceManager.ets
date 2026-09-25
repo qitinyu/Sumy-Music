@@ -99,7 +99,7 @@ export class SourceManager {
       fs.readSync(file.fd, buffer)
       fs.closeSync(file)
       const decoder: util.TextDecoder = util.TextDecoder.create('utf-8')
-      const content: string = decoder.decodeWithStream(new Uint8Array(buffer))
+      const content: string = decoder.decodeToString(new Uint8Array(buffer))
       const fileName: string = fileUri.substring(fileUri.lastIndexOf('/') + 1)
       const pluginName: string = fileName.replace(/\.(json|js)$/i, '')
       const name: string = await SourceManager.importJsConfig(content, pluginName)
@@ -210,7 +210,7 @@ export class SourceManager {
           if (typeof resp.result === 'string') content = resp.result as string
           else if (resp.result instanceof ArrayBuffer) {
             const dec = util.TextDecoder.create('utf-8')
-            content = dec.decodeWithStream(new Uint8Array(resp.result))
+            content = dec.decodeToString(new Uint8Array(resp.result))
           }
           if (content.length === 0) { results.push({ name, success: false, error: '下载内容为空' }); continue }
           const importedName = await SourceManager.importJsConfig(content, name)
@@ -972,7 +972,7 @@ export class SourceManager {
             body = result as string
           } else if (result instanceof ArrayBuffer) {
             const dec: util.TextDecoder = util.TextDecoder.create('utf-8')
-            body = dec.decodeWithStream(new Uint8Array(result))
+            body = dec.decodeToString(new Uint8Array(result))
           }
           if (body.length === 0) { resolve([]); return }
           const songs: SongInfo[] = SourceManager.parseJsonSearchResponse(body, respConf, config.name)
@@ -1167,7 +1167,7 @@ export class SourceManager {
           body = result as string
         } else if (result instanceof ArrayBuffer) {
           const dec: util.TextDecoder = util.TextDecoder.create('utf-8')
-          body = dec.decodeWithStream(new Uint8Array(result))
+          body = dec.decodeToString(new Uint8Array(result))
         }
         if (body.length === 0) { resolve(''); return }
         const playUrl: string = SourceManager.extractJsonPlayUrl(body, respConf)
@@ -1276,7 +1276,7 @@ export class SourceManager {
           body = result as string
         } else if (result instanceof ArrayBuffer) {
           const dec: util.TextDecoder = util.TextDecoder.create('utf-8')
-          body = dec.decodeWithStream(new Uint8Array(result))
+          body = dec.decodeToString(new Uint8Array(result))
         }
         if (body.length === 0) { resolve(''); return }
         const lrc: string = SourceManager.extractJsonLyric(body, respConf)
@@ -1303,7 +1303,7 @@ export class SourceManager {
         try {
           const bytes: Uint8Array = SourceManager.base64ToBytes(lrc)
           const dec: util.TextDecoder = util.TextDecoder.create('utf-8')
-          lrc = dec.decodeWithStream(bytes)
+          lrc = dec.decodeToString(bytes)
         } catch (_e) {
           return ''
         }
@@ -1401,7 +1401,7 @@ export class SourceManager {
         body = result as string
       } else if (result instanceof ArrayBuffer) {
         const dec: util.TextDecoder = util.TextDecoder.create('utf-8')
-        body = dec.decodeWithStream(new Uint8Array(result))
+        body = dec.decodeToString(new Uint8Array(result))
       }
       if (body.length === 0) return []
       return SourceManager.parseBuiltInSearchResult(platform, body, pluginName)

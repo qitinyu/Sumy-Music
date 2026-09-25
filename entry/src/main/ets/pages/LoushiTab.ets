@@ -3,7 +3,7 @@
 import { DEFAULT_SETTINGS } from '../model/MusicModel'
 import { DatabaseHelper } from '../database/DatabaseHelper'
 import { PluginManagerPage } from '../components/PluginManagerPage'
-import { promptAction } from '@kit.ArkUI'
+
 import { http } from '@kit.NetworkKit'
 import { util } from '@kit.ArkTS'
 import { common, Want, bundleManager } from '@kit.AbilityKit'
@@ -15,8 +15,15 @@ import { AccountManager } from '../utils/AccountManager'
 import { SourceManager } from '../utils/SourceManager'
 import { CacheManager, CacheInfo } from '../utils/CacheManager'
 import { ListeningLevelManager, LevelInfo } from '../utils/ListeningLevelManager'
-import { getLevelColor } from '../utils/LevelConfig'
+import { getLevelColor, LEVEL_TEXT_COLOR } from '../utils/LevelConfig'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
+import {
+  HdsNavigation,
+  HdsNavDestination,
+  HdsNavigationTitleBarOptions,
+  ScrollEffectType,
+  hdsMaterial
+} from '@kit.UIDesignKit'
 
 // 自建 API 访问密码（仅开发者本人可启用）
 const SELF_HOSTED_API_PASSWORD: string = '0723'
@@ -76,12 +83,15 @@ const aboutItems: AboutItem[] = [
   {
     label: '版本日志',
     type: 'text',
-    content: 'v2.0.8.2\n' +
-      '1. 重点：修复切歌后封面已切换但歌曲没变、无反馈、进度继承的问题\n' +
-      '2. 修复单击歌曲长时间无法播放：取链提速，失败提示并自动切下一首\n' +
-      '3. 修复播放页进度条无法拖动、本地音乐歌词乱码\n' +
-      '4. 播放结束自动接续下一首，控制中心切歌与封面显示修复\n' +
-      '5. 完整更新日志(----------https://github.com/qitinyu/Sumy-Music/wiki/)',
+    content: 'v2.0.9.6\n' +
+      '1. 搜索页/推荐页搜索栏迁入系统沉浸标题栏，推荐页分类标签对齐\n' +
+      '2. 修复歌单播放大量自动跳过：播放时强制重新取链，不再使用过期链接\n' +
+      '3. 歌单/收藏播放支持自动换源（全网兜底），失败自动跳下一首\n' +
+      '4. 播放设置新增「自动换源」开关，默认开启\n' +
+      '5. 歌单添加同曲同源自动替换不再重复；删除改单条精确删除\n' +
+      '6. APP 图标真实热更换（默认/备选即点即换），旧系统自动提示\n' +
+      '7. 个性化去除沉浸光感卡片；音源管理「订阅导入」长按彩蛋跳转帮助文档\n' +
+      '8. 完整更新日志(----------https://github.com/qitinyu/Sumy-Music/wiki/)',
   },
 
   {
@@ -132,13 +142,21 @@ interface SettingItem {
 
 @Component
 export struct LoushiTab {
+  // V2.1.9：loushi_subPage 不再驱动 build 分支，仅作为「当前是否在设置子页」的 AppStorage 标志，
+  // 供 Index.onBackPress 判断：子页内按返回 → 发信号 pop 路由栈；主页按返回 → 关闭侧边栏
   @StorageLink('loushi_subPage') subPage: SubPage = 'main'
+  // V2.1.9：设置子页路由栈（HdsNavDestination 由 SubPageMap 按路由名构造）
+  private loushiStack: NavPathStack = new NavPathStack()
+  // Index 返回键信号（时间戳）：设置子页内按返回 → pop 路由栈
+  @StorageProp('loushiNavBackSignal') @Watch('onNavBackSignal') navBackSignal: number = 0
   @State theme: string = DEFAULT_SETTINGS.theme
   @State autoPlay: boolean = DEFAULT_SETTINGS.autoPlay
   @State autoJumpDetail: boolean = DEFAULT_SETTINGS.autoJumpDetail
   @State rememberProgress: boolean = DEFAULT_SETTINGS.rememberProgress
   // 封面/歌词自动补全，默认关闭（开启后缺失封面/歌词时联网补全）
   @State autoEnrichTags: boolean = false
+  // 自动换源，默认开启（关闭后歌曲播放失败自动跳过不再换源）
+  @State autoSourceSwitch: boolean = true
   // 迷你栏歌曲来源徽章，默认开启
   @State miniBarShowSource: boolean = true
   @State searchMemory: boolean = true // 默认开启
@@ -194,7 +212,7 @@ export struct LoushiTab {
   @State accountAvatarUrl: string = ''
   @State accountIsLoggedIn: boolean = false
   @State accountLoggingIn: boolean = false
-  @State accountLevelInfo: LevelInfo = { level: 1, current: 0, need: 1160, totalSeconds: 0, percent: 0 }
+  @State accountLevelInfo: LevelInfo = { level: 1, current: 0, need: 1000, totalSeconds: 0, percent: 0 }
   @State accountSignature: string = ''
   @State accountShowMenu: boolean = false
 
@@ -220,7 +238,7 @@ export struct LoushiTab {
       this.accountUserName = '点击登录'
       this.accountAvatarUrl = ''
       this.accountIsLoggedIn = false
-      this.accountLevelInfo = { level: 1, current: 0, need: 1160, totalSeconds: 0, percent: 0 }
+      this.accountLevelInfo = { level: 1, current: 0, need: 1000, totalSeconds: 0, percent: 0 }
       this.accountSignature = ''
     }
   }
@@ -250,7 +268,7 @@ export struct LoushiTab {
     this.accountUserName = '点击登录'
     this.accountAvatarUrl = ''
     this.accountIsLoggedIn = false
-    this.accountLevelInfo = { level: 1, current: 0, need: 1160, totalSeconds: 0, percent: 0 }
+    this.accountLevelInfo = { level: 1, current: 0, need: 1000, totalSeconds: 0, percent: 0 }
     this.accountSignature = ''
     this.accountShowMenu = false
     this.showToastMsg('已退出登录')
@@ -259,7 +277,7 @@ export struct LoushiTab {
   // 彻底退出应用
   private accountExitApp(): void {
     try {
-      const ctx = getContext(this) as common.UIAbilityContext
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext
       ctx.terminateSelf()
     } catch (e) {
       console.error('[LoushiTab] exit app failed:', e)
@@ -270,7 +288,7 @@ export struct LoushiTab {
   // 重启应用
   private accountRestartApp(): void {
     try {
-      const ctx = getContext(this) as common.UIAbilityContext
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext
       ctx.startAbility({
         bundleName: ctx.abilityInfo.bundleName,
         abilityName: ctx.abilityInfo.name
@@ -309,6 +327,10 @@ export struct LoushiTab {
     // 封面/歌词自动补全：默认关闭，仅在用户开启时联网补全
     this.autoEnrichTags = (await this.db.getSetting('autoEnrichTags')) === 'true'
     AppStorage.setOrCreate('autoEnrichTags', this.autoEnrichTags)
+    // 自动换源：默认开启（关闭后歌曲播放失败自动跳过不再换源）
+    const autoSwitch = await this.db.getSetting('autoSourceSwitch')
+    this.autoSourceSwitch = autoSwitch !== 'false'
+    AppStorage.setOrCreate('autoSourceSwitch', this.autoSourceSwitch)
     // 迷你栏来源徽章：默认开启
     const showSource = await this.db.getSetting('miniBarShowSource')
     this.miniBarShowSource = showSource !== 'false'
@@ -358,7 +380,7 @@ export struct LoushiTab {
   }
 
   private showToastMsg(msg: string) {
-    promptAction.showToast({ message: msg, duration: 2000 })
+    this.getUIContext().getPromptAction().showToast({ message: msg, duration: 2000 })
   }
 
   // 保存自建 API 设置
@@ -408,7 +430,7 @@ export struct LoushiTab {
 
   private openUrl(url: string) {
     try {
-      const ctx = getContext(this) as common.UIAbilityContext
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext
       const want: Want = {
         action: 'ohos.want.action.viewData',
         uri: url,
@@ -420,7 +442,7 @@ export struct LoushiTab {
   }
 
   private showFeedback() {
-    promptAction.showActionMenu({
+    this.getUIContext().getPromptAction().showActionMenu({
       title: '选择反馈方式',
       buttons: [
         { text: 'QQ群聊', color: this.themePrimary },
@@ -439,7 +461,7 @@ export struct LoushiTab {
   }
 
   private showLinks(links: LinkOption[]) {
-    promptAction.showActionMenu({
+    this.getUIContext().getPromptAction().showActionMenu({
       title: '选择下载渠道',
       buttons: [
         { text: links[0].label, color: this.themePrimary },
@@ -454,27 +476,19 @@ export struct LoushiTab {
 
   build() {
     Column() {
-      if (this.subPage === 'main') {
-        this.MainPage()
-      } else if (this.subPage === 'personalization') {
-        this.PersonalizationPage()
-      } else if (this.subPage === 'player') {
-        this.PlayerSettingsPage()
-      } else if (this.subPage === 'webdev_config') {
-        this.WebdevConfigPage()
-      } else if (this.subPage === 'self_hosted_api') {
-        this.SelfHostedApiPage()
-      } else if (this.subPage === 'plugin_manager') {
-        PluginManagerPage({ onBack: () => { this.subPage = 'main' } })
-      } else if (this.subPage === 'about') {
-        this.AboutPage()
-      } else if (this.subPage === 'xuanchuang_settings') {
-        this.XuanchuangSettingsPage()
-      } else if (this.subPage === 'qinse_settings') {
-        this.QinseSettingsPage()
-      } else if (this.subPage === 'cache_settings') {
-        this.CacheSettingsPage()
+      // V2.1.9：设置子页改走 HdsNavigation 路由栈 —— 子页获得系统 MINI 标题栏（返回键自动 pop、沉浸材质、转场动画）
+      HdsNavigation(this.loushiStack) {
+        Column() {
+          this.MainPage()
+        }
+        .width('100%').height('100%')
+        .justifyContent(FlexAlign.Start)
       }
+      .mode(NavigationMode.Stack)
+      .hideTitleBar(true)
+      .navDestination(this.SubPageMap)
+      .width('100%')
+      .height('100%')
     }
     .width('100%').height('100%')
       .padding({ top: 44 })
@@ -486,6 +500,149 @@ export struct LoushiTab {
         dragBar: false,
         backgroundColor: this.themeCardBg
       })
+  }
+
+  // ======================== V2.1.9 子页路由 ========================
+
+  /** 子页沉浸标题栏（MINI 模式，返回键默认 pop）——静止时背景板透明；滚动后浮出浅灰模糊板（API23 规则） */
+  private getDestTitleBar(title: string): HdsNavigationTitleBarOptions {
+    return {
+      content: {
+        title: { mainTitle: title },
+      },
+      style: {
+        scrollEffectOpts: {
+          enableScrollEffect: true,
+          scrollEffectType: ScrollEffectType.GRADIENT_BLUR,
+        },
+        // 不配 systemMaterialEffect 时滚动板为 #99000000 黑板（API23 规则），与浅色状态栏割裂
+        systemMaterialEffect: {
+          materialType: hdsMaterial.MaterialType.IMMERSIVE,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+        },
+      },
+      // 官方样例必配：禁用标题栏内部安全区避让，防止贴边时 56vp 高度被压缩
+      avoidLayoutSafeArea: false,
+      enableComponentSafeArea: false,
+    }
+  }
+
+  /** 进入设置子页：压入路由栈并同步 AppStorage 标志（供 Index 返回键判断） */
+  private goSubPage(target: SubPage): void {
+    this.subPage = target
+    this.loushiStack.pushPathByName(target, '')
+  }
+
+  /** 返回设置主页（代码调用；子页标题栏返回键由系统自动 pop） */
+  private popSubPage(): void {
+    this.loushiStack.pop()
+    this.subPage = 'main'
+  }
+
+  /** 子页隐藏时同步标志（覆盖标题栏返回键自动 pop 的场景） */
+  private onDestHidden(): void {
+    if (this.loushiStack.size() === 0) {
+      this.subPage = 'main'
+    }
+  }
+
+  private onNavBackSignal(): void {
+    if (this.loushiStack.size() > 0) {
+      this.popSubPage()
+    }
+  }
+
+  /** 子页路由表：按路由名构造 HdsNavDestination（内容让出 56vp 标题栏高度） */
+  @Builder
+  SubPageMap(name: string) {
+    if (name === 'personalization') {
+      HdsNavDestination() {
+        Column() {
+          this.PersonalizationPage()
+        }
+        .width('100%').height('100%')
+        .padding({ top: 56 })
+      }
+      .titleBar(this.getDestTitleBar('个性化'))
+      .onHidden(() => { this.onDestHidden() })
+    } else if (name === 'player') {
+      HdsNavDestination() {
+        Column() {
+          this.PlayerSettingsPage()
+        }
+        .width('100%').height('100%')
+        .padding({ top: 56 })
+      }
+      .titleBar(this.getDestTitleBar('播放器'))
+      .onHidden(() => { this.onDestHidden() })
+    } else if (name === 'webdev_config') {
+      HdsNavDestination() {
+        Column() {
+          this.WebdevConfigPage()
+        }
+        .width('100%').height('100%')
+        .padding({ top: 56 })
+      }
+      .titleBar(this.getDestTitleBar('WebDAV'))
+      .onHidden(() => { this.onDestHidden() })
+    } else if (name === 'self_hosted_api') {
+      HdsNavDestination() {
+        Column() {
+          this.SelfHostedApiPage()
+        }
+        .width('100%').height('100%')
+        .padding({ top: 56 })
+      }
+      .titleBar(this.getDestTitleBar('自建 API'))
+      .onHidden(() => { this.onDestHidden() })
+    } else if (name === 'plugin_manager') {
+      // 音源管理为外部组件，自带头部（含返回键），隐藏系统标题栏避免重复
+      HdsNavDestination() {
+        PluginManagerPage({ onBack: () => { this.popSubPage() } })
+      }
+      .hideTitleBar(true)
+      .onHidden(() => { this.onDestHidden() })
+    } else if (name === 'about') {
+      HdsNavDestination() {
+        Column() {
+          this.AboutPage()
+        }
+        .width('100%').height('100%')
+        .padding({ top: 56 })
+      }
+      .titleBar(this.getDestTitleBar('关于 Sumy Music'))
+      .onHidden(() => { this.onDestHidden() })
+    } else if (name === 'xuanchuang_settings') {
+      HdsNavDestination() {
+        Column() {
+          this.XuanchuangSettingsPage()
+        }
+        .width('100%').height('100%')
+        .padding({ top: 56 })
+      }
+      .titleBar(this.getDestTitleBar('主页设置'))
+      .onHidden(() => { this.onDestHidden() })
+    } else if (name === 'qinse_settings') {
+      HdsNavDestination() {
+        Column() {
+          this.QinseSettingsPage()
+        }
+        .width('100%').height('100%')
+        .padding({ top: 56 })
+      }
+      .titleBar(this.getDestTitleBar('搜索设置'))
+      .onHidden(() => { this.onDestHidden() })
+    } else if (name === 'cache_settings') {
+      HdsNavDestination() {
+        Column() {
+          this.CacheSettingsPage()
+        }
+        .width('100%').height('100%')
+        .padding({ top: 56 })
+      }
+      .titleBar(this.getDestTitleBar('缓存清理'))
+      .onHidden(() => { this.onDestHidden() })
+    }
   }
 
   // ===== 密码锁弹窗 =====
@@ -535,7 +692,7 @@ export struct LoushiTab {
               const target = this.lockTarget
               this.showLockDialog = false
               this.lockInput = ''
-              this.subPage = target
+              this.goSubPage(target)
             } else {
               this.showToastMsg('密码错误')
               this.lockInput = ''
@@ -561,7 +718,7 @@ export struct LoushiTab {
       if (requireLogin) {
         this.navigateWithLoginCheck(target)
       } else {
-        this.subPage = target
+        this.goSubPage(target)
       }
     })
   }
@@ -572,7 +729,7 @@ export struct LoushiTab {
       if (locked) {
         this.verifyLock(target)
       } else {
-        this.subPage = target
+        this.goSubPage(target)
       }
     } else {
       this.showToastMsg('请先在主页登录华为账号')
@@ -719,8 +876,20 @@ export struct LoushiTab {
   }
 
   private async switchAppIcon(iconType: string): Promise<void> {
-    // 当前编译 SDK 的 bundleManager 不支持 setAlternateIcon 接口，保留图标选择 UI 但提示用户
-    this.showToastMsg('当前系统版本不支持切换应用图标')
+    // V2.1.9 bundleManager.setAlternateIcon 为 API26（HarmonyOS 7.0）新增接口，
+    // 旧系统设备上该方法不存在，typeof 兜底避免崩溃
+    if (typeof bundleManager.setAlternateIcon !== 'function') {
+      this.showToastMsg('当前系统版本过低，暂不支持切换应用图标')
+      return
+    }
+    try {
+      // 传空字符串取消备选图标，恢复默认；备选项 name 须与 app.json5 alternateIcons.name 一致
+      await bundleManager.setAlternateIcon(iconType === 'alternative' ? 'alternative' : '')
+      this.showToastMsg(iconType === 'alternative' ? '应用图标已切换' : '已恢复默认图标')
+    } catch (e) {
+      console.error('[LoushiTab] setAlternateIcon failed:', e)
+      this.showToastMsg('切换应用图标失败')
+    }
   }
 
   // ===== 子页面通用导航栏 =====
@@ -797,7 +966,7 @@ export struct LoushiTab {
       } else if (locked) {
         this.verifyLock(target)
       } else {
-        this.subPage = target
+        this.goSubPage(target)
       }
     })
   }
@@ -908,7 +1077,7 @@ export struct LoushiTab {
                   Text(`LV${this.accountLevelInfo.level}`)
                     .fontSize(11)
                     .fontWeight(FontWeight.Bold)
-                    .fontColor(this.themeCardBg)
+                    .fontColor(LEVEL_TEXT_COLOR)
                 }
                 .padding({ left: 8, right: 8, top: 3, bottom: 3 })
                 .backgroundColor(getLevelColor(this.accountLevelInfo.level))
@@ -1046,42 +1215,16 @@ export struct LoushiTab {
   @Builder
   PersonalizationPage() {
     Column() {
-      this.SubPageHeader('\u4E2A\u6027\u5316')
+      // V2.1.9：页头由 HdsNavDestination 系统标题栏提供（返回键自动 pop + 沉浸材质）
       Scroll() {
         Column({ space: 12 }) {
-          // 主题卡片（含缩略图）
-          this.ThemeCard()
+          // 主题卡片（含缩略图）——上架审核 UX 不过关，先隐藏（不删除代码）
+          // this.ThemeCard()
 
-          // APP 图标
+          // APP 图标（V2.1.9 设备实测 HarmonyOS 7.0 / API26，setAlternateIcon 已可用，恢复真实换图标）
           this.AppIconCard()
 
-          // 沉浸光感提示
-          Row({ space: 8 }) {
-            SymbolGlyph($r('sys.symbol.sun_max'))
-              .fontSize(18)
-              .fontColor([this.themePrimary])
-            Column({ space: 4 }) {
-              Text('沉浸光感')
-                .fontSize(15)
-                .fontColor(this.themeTextPrimary)
-                .fontWeight(FontWeight.Medium)
-              Text('已开启，强度可在系统设置中调节')
-                .fontSize(12)
-                .fontColor(this.themeTextSecondary)
-            }
-            .alignItems(HorizontalAlign.Start)
-            .layoutWeight(1)
-
-            SymbolGlyph($r('sys.symbol.chevron_right'))
-              .fontSize(16)
-              .fontColor([this.themeTextSecondary])
-          }
-          .width('100%')
-          .padding(16)
-          .backgroundColor(this.themeCardBg)
-          .borderRadius(12)
-          .onClick(() => { this.openImmersiveLightSettings() })
-
+          // V2.1.9 沉浸光感卡片去除
           Column().height(168)
         }
         .width('100%').padding({ top: 12, left: 16, right: 16 })
@@ -1093,38 +1236,11 @@ export struct LoushiTab {
       .justifyContent(FlexAlign.Start)
   }
 
-  // 跳转到系统显示设置（沉浸光感强度在显示设置内）
-  private openImmersiveLightSettings(): void {
-    try {
-      const context = getContext(this) as common.UIAbilityContext
-      context.startAbility({
-        bundleName: 'com.huawei.hmos.settings',
-        abilityName: 'com.huawei.hmos.settings.MainAbility',
-        uri: 'display_setting_entry',
-      }).then(() => {
-        console.info('[LoushiTab] opened display settings')
-      }).catch((e: Error) => {
-        console.error('[LoushiTab] open display settings failed:', e)
-        // 兜底：跳转到系统设置主页
-        context.startAbility({
-          bundleName: 'com.huawei.hmos.settings',
-          abilityName: 'com.huawei.hmos.settings.MainAbility',
-        }).catch((e2: Error) => {
-          console.error('[LoushiTab] open settings home failed:', e2)
-          promptAction.showToast({ message: '无法打开系统设置，请手动前往设置-桌面和个性化' })
-        })
-      })
-    } catch (e) {
-      console.error('[LoushiTab] openImmersiveLightSettings failed:', e)
-      promptAction.showToast({ message: '无法打开系统设置' })
-    }
-  }
-
   // ======================== 播放器 ========================
   @Builder
   PlayerSettingsPage() {
     Column() {
-      this.SubPageHeader('\u64AD\u653E\u5668')
+      // V2.1.9：页头由 HdsNavDestination 系统标题栏提供（返回键自动 pop + 沉浸材质）
       Scroll() {
         Column({ space: 12 }) {
           // 播放设置卡片
@@ -1179,6 +1295,15 @@ export struct LoushiTab {
           this.saveSetting('autoEnrichTags', String(v))
           AppStorage.setOrCreate('autoEnrichTags', v)
         })
+
+      Divider().height(1).color(this.themeDivider).width('100%').margin({ left: 16, right: 16 })
+
+      this.PlayerToggleItem('自动换源', '关闭后歌曲播放失败自动跳过不再换源',
+        this.autoSourceSwitch, (v) => {
+          this.autoSourceSwitch = v
+          this.saveSetting('autoSourceSwitch', String(v))
+          AppStorage.setOrCreate('autoSourceSwitch', v)
+        })
     }
     .width('100%')
     .backgroundColor(this.themeCardBg)
@@ -1227,7 +1352,7 @@ export struct LoushiTab {
   @Builder
   WebdevConfigPage() {
     Column() {
-      this.SubPageHeader('WebDAV')
+      // V2.1.9：页头由 HdsNavDestination 系统标题栏提供（返回键自动 pop + 沉浸材质）
       Scroll() {
         Column({ space: 12 }) {
           // 说明卡片
@@ -1520,7 +1645,7 @@ export struct LoushiTab {
   AboutPage() {
     Stack() {
       Column() {
-        this.SubPageHeader('\u5173\u4E8E Sumy Music')
+        // V2.1.9：页头由 HdsNavDestination 系统标题栏提供（返回键自动 pop + 沉浸材质）
         Scroll() {
           Column({ space: 12 }) {
             // Logo + 版本
@@ -1534,7 +1659,7 @@ export struct LoushiTab {
                 .fontSize(22)
                 .fontColor(this.themeTextPrimary)
                 .fontWeight(FontWeight.Bold)
-              Text('Version 2.0.8.2')
+              Text('Version 2.0.9.6')
                 .fontSize(13)
                 .fontColor(this.themeTextSecondary)
             }
@@ -1675,7 +1800,7 @@ export struct LoushiTab {
   @Builder
   SelfHostedApiPage() {
     Column() {
-      this.SubPageHeader('自建 API')
+      // V2.1.9：页头由 HdsNavDestination 系统标题栏提供（返回键自动 pop + 沉浸材质）
       Scroll() {
         Column({ space: 12 }) {
           Column({ space: 8 }) {
@@ -1781,7 +1906,7 @@ export struct LoushiTab {
   @Builder
   CacheSettingsPage() {
     Column() {
-      this.SubPageHeader('缓存清理')
+      // V2.1.9：页头由 HdsNavDestination 系统标题栏提供（返回键自动 pop + 沉浸材质）
       Scroll() {
         Column({ space: 12 }) {
           Column({ space: 8 }) {
@@ -1849,7 +1974,7 @@ export struct LoushiTab {
   @Builder
   XuanchuangSettingsPage() {
     Column() {
-      this.SubPageHeader('\u4E3B\u9875\u8BBE\u7F6E')
+      // V2.1.9：页头由 HdsNavDestination 系统标题栏提供（返回键自动 pop + 沉浸材质）
       Scroll() {
         Column({ space: 12 }) {
           // V2.1.0 精简：主页统计单行开关
@@ -1915,7 +2040,7 @@ export struct LoushiTab {
   @Builder
   QinseSettingsPage() {
     Column() {
-      this.SubPageHeader('\u641C\u7D22\u8BBE\u7F6E')
+      // V2.1.9：页头由 HdsNavDestination 系统标题栏提供（返回键自动 pop + 沉浸材质）
       Scroll() {
         Column({ space: 12 }) {
           // V2.1.0 精简：一区块一行功能

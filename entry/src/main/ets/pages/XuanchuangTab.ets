@@ -12,23 +12,22 @@ import { fileIo } from '@kit.CoreFileKit'
 import { picker } from '@kit.CoreFileKit'
 import { util } from '@kit.ArkTS'
 import { http } from '@kit.NetworkKit'
-import { promptAction } from '@kit.ArkUI'
+import { photoAccessHelper } from '@kit.MediaLibraryKit'
 import { CompatUtils } from '../utils/CompatUtils'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
 import { AccountManager, UserInfo } from '../utils/AccountManager'
-import { FloatingAction } from '../components/FloatingActionPopup'
 import { ListeningLevelManager, LevelInfo } from '../utils/ListeningLevelManager'
 import { WebDAVProfileSync } from '../utils/WebDAVProfileSync'
 import { SignatureEditDialog } from '../components/SignatureEditDialog'
 import { LevelGuideDialog } from '../components/LevelGuideDialog'
 import { CoverImage } from '../components/CoverImage'
-import { getLevelColor } from '../utils/LevelConfig'
+import { getLevelColor, LEVEL_TEXT_COLOR } from '../utils/LevelConfig'
 import { pasteboard } from '@kit.BasicServicesKit'
 import { systemShare } from '@kit.ShareKit'
 import { uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { common } from '@kit.AbilityKit'
 import { CloudTagEnricher } from '../utils/CloudTagEnricher'
-import { HdsNavDestination } from '@kit.UIDesignKit'
+import { HdsNavDestination, ScrollEffectType, hdsMaterial } from '@kit.UIDesignKit'
 
 type SubPage = 'main' | 'playlistDetail' | 'localMusicDetail' | 'cloudPlaylistDetail'
 
@@ -237,7 +236,7 @@ export struct XuanchuangTab {
       this.playlistCount = 0
       this.listenSongs = 0
       this.listenTime = 0
-      this.levelInfo = { level: 1, current: 0, need: 1160, totalSeconds: 0, percent: 0 }
+      this.levelInfo = { level: 1, current: 0, need: 1000, totalSeconds: 0, percent: 0 }
       this.signature = ''
     }
   }
@@ -450,9 +449,20 @@ export struct XuanchuangTab {
     if (!song.playUrl) {
       song.playUrl = await MusicApi.getPlayUrl(song.songId, song.source, song)
     }
+
+    let queue = customQueue ?? (this.playlistSongs.length > 0 ? this.playlistSongs : this.favorites)
+    let idx = queue.findIndex(s => s.songId === song.songId && s.source === song.source)
+    if (idx < 0) idx = 0
+
     if (!song.playUrl) {
       SourceStatus.markUnplayable(song.source)
       this.showToastMsg('无法获取播放链接')
+      // V2.1.9 取链失败不再原地卡死（点了没反应）：注册队列与当前曲目后自动跳到下一首；
+      // 自动换源开启时 getPlayUrl 内部已全网兜底，极少走到这里
+      PlayerStore.play(song, queue, idx)
+      const player = AudioPlayer.getInstance()
+      player.setCurrentSong(song)
+      player.playNext()
       return
     }
 
@@ -463,10 +473,6 @@ export struct XuanchuangTab {
         PlayerStore.refreshCurrentTrack(song)
       }).catch((_e: Error) => {})
     }
-
-    let queue = customQueue ?? (this.playlistSongs.length > 0 ? this.playlistSongs : this.favorites)
-    let idx = queue.findIndex(s => s.songId === song.songId && s.source === song.source)
-    if (idx < 0) idx = 0
 
     PlayerStore.play(song, queue, idx)
 
@@ -546,7 +552,7 @@ export struct XuanchuangTab {
   // ===== 导入本地音乐 =====
   private async importLocalMusic() {
     try {
-      const context: Context = getContext(this)
+      const context: Context = this.getUIContext().getHostContext() as Context
       const documentPicker = new picker.DocumentViewPicker()
       const uris = await documentPicker.select({
         maxSelectNumber: 50,
@@ -678,7 +684,7 @@ export struct XuanchuangTab {
   }
 
   private async deletePlaylist(id: string) {
-    promptAction.showDialog({
+    this.getUIContext().getPromptAction().showDialog({
       title: '移除歌单',
       message: '确定要移除该歌单吗？此操作不可恢复。',
       buttons: [
@@ -839,7 +845,7 @@ export struct XuanchuangTab {
       fileIo.readSync(file.fd, buffer)
       fileIo.closeSync(file.fd)
       const decoder = util.TextDecoder.create('utf-8')
-      const content = decoder.decodeWithStream(new Uint8Array(buffer))
+      const content = decoder.decodeToString(new Uint8Array(buffer))
       if (!content || content.length === 0) {
         this.showToastMsg('文件内容为空')
         return
@@ -982,13 +988,13 @@ export struct XuanchuangTab {
   }
 
   private showToastMsg(msg: string): void {
-    promptAction.showToast({ message: msg, duration: 2000 })
+    this.getUIContext().getPromptAction().showToast({ message: msg, duration: 2000 })
   }
 
   // 彻底退出应用
   private exitApp(): void {
     try {
-      const ctx = getContext(this) as common.UIAbilityContext
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext
       ctx.terminateSelf()
     } catch (e) {
       console.error('[XuanchuangTab] exit app failed:', e)
@@ -999,7 +1005,7 @@ export struct XuanchuangTab {
   // 重启应用
   private restartApp(): void {
     try {
-      const ctx = getContext(this) as common.UIAbilityContext
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext
       ctx.startAbility({
         bundleName: ctx.abilityInfo.bundleName,
         abilityName: ctx.abilityInfo.name
@@ -1080,22 +1086,6 @@ export struct XuanchuangTab {
     }
     .width('100%')
     .padding({ left: 16, right: 16 })
-  }
-
-  // 当前长按弹窗的操作列表
-  private get floatingActions(): FloatingAction[] {
-    const isCloud = this.floatingSong?.source === 'webdav'
-    const actions: FloatingAction[] = [
-      { icon: $r('sys.symbol.forward_end_fill'), label: '下首播放', action: 'play_next' },
-      { icon: $r('sys.symbol.list_bullet'), label: '移动到歌单', action: 'move_playlist' },
-      { icon: $r('sys.symbol.plus_square'), label: '复制到歌单', action: 'copy_playlist' },
-      { icon: $r('sys.symbol.chevron_up'), label: '调整位置', action: 'reorder' },
-      { icon: $r('sys.symbol.share'), label: '分享歌曲至', action: 'share_song' },
-    ]
-    if (!isCloud) {
-      actions.push({ icon: $r('sys.symbol.trash'), label: '移除歌曲', action: 'delete_song', isDanger: true })
-    }
-    return actions
   }
 
   private async handleFloatingAction(action: string, song: SongInfo): Promise<void> {
@@ -1295,7 +1285,7 @@ export struct XuanchuangTab {
       return
     }
     const count = songs.length
-    promptAction.showDialog({
+    this.getUIContext().getPromptAction().showDialog({
       title: '移除歌曲',
       message: `确定要移除选中的 ${count} 首歌曲吗？`,
       buttons: [
@@ -1344,7 +1334,7 @@ export struct XuanchuangTab {
         description: `${songs.length} 首歌曲`,
       })
       const controller: systemShare.ShareController = new systemShare.ShareController(shareData)
-      const context = getContext(this) as common.UIAbilityContext
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext
       await controller.show(context, {
         selectionMode: systemShare.SelectionMode.SINGLE,
         previewMode: systemShare.SharePreviewMode.DETAIL,
@@ -1408,16 +1398,64 @@ export struct XuanchuangTab {
     })
   }
 
+  // 可用性规则：云端歌曲仅 下首播放/调整位置 可用；本地歌曲禁用 分享歌曲/移动歌曲到
+  private isSongSheetActionDisabled(action: string): boolean {
+    const song = this.floatingSong
+    if (!song) {
+      return true
+    }
+    if (song.source === 'webdav') {
+      return action !== 'play_next' && action !== 'reorder'
+    }
+    if (song.source === 'local') {
+      return action === 'move_playlist' || action === 'share_song'
+    }
+    return false
+  }
+
+  private handleSongSheetAction(action: string): void {
+    if (this.isSongSheetActionDisabled(action)) {
+      return
+    }
+    const song = this.floatingSong
+    if (!song) {
+      return
+    }
+    switch (action) {
+      case 'play_next':
+      case 'share_song':
+      case 'delete_song':
+        this.handleFloatingAction(action, song)
+        break
+      case 'reorder':
+        this.showFloatingPopup = false
+        this.pendingReorder = true
+        break
+      case 'move_playlist':
+        this.showFloatingPopup = false
+        this.movePlaylistTarget = song
+        this.pendingMovePlaylist = true
+        break
+      case 'copy_playlist':
+        this.showFloatingPopup = false
+        this.copyPlaylistTarget = song
+        this.pendingCopyPlaylist = true
+        break
+      default:
+        break
+    }
+  }
+
   @Builder
-  SongActionPopupBuilder() {
+  SongActionSheetContent() {
     Column() {
       if (this.floatingSong) {
         Row({ space: 12 }) {
           if (this.floatingSong.coverUrl && this.floatingSong.coverUrl.length > 0) {
             CoverImage({
               url: this.floatingSong.coverUrl,
-              coverWidth: 40,
-              coverHeight: 40,
+              coverWidth: 48,
+              coverHeight: 48,
               radius: 8
             })
           } else {
@@ -1426,8 +1464,8 @@ export struct XuanchuangTab {
                 .width(18)
                 .height(18)
             }
-            .width(40)
-            .height(40)
+            .width(48)
+            .height(48)
             .borderRadius(8)
             .backgroundColor(this.themePrimary)
             .justifyContent(FlexAlign.Center)
@@ -1436,17 +1474,17 @@ export struct XuanchuangTab {
           Column({ space: 2 }) {
             Text(this.multiSelectMode
               ? `已选 ${this.selectedSongKeys.size} 项`
-              : this.floatingSong.songName)
-              .fontSize(14)
+              : (this.floatingSong.songName || '-'))
+              .fontSize(17)
               .fontColor(this.themeTextPrimary)
-              .fontWeight(FontWeight.Medium)
+              .fontWeight(FontWeight.Bold)
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
 
             Text(this.multiSelectMode
               ? '对选中歌曲批量操作'
-              : this.floatingSong.artist)
-              .fontSize(11)
+              : (this.floatingSong.artist || '-'))
+              .fontSize(13)
               .fontColor(this.themeTextSecondary)
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1455,16 +1493,15 @@ export struct XuanchuangTab {
           .alignItems(HorizontalAlign.Start)
         }
         .width('100%')
-        .padding({ left: 12, right: 12, top: 12, bottom: 4 })
+        .padding({ left: 16, right: 16, top: 8, bottom: 8 })
 
         Divider()
           .width('100%')
           .color(this.themeDivider)
-          .margin({ left: 12, right: 12 })
 
-        Column({ space: 0 }) {
-          if (this.multiSelectMode) {
-            // ===== 多选模式：批量操作 =====
+        if (this.multiSelectMode) {
+          // ===== 多选模式：批量操作 =====
+          Column({ space: 0 }) {
             // 移动到歌单（本地音乐详情页不显示，因为本地音乐不在歌单中）
             if (this.subPage !== 'localMusicDetail') {
               Row({ space: 12 }) {
@@ -1525,7 +1562,7 @@ export struct XuanchuangTab {
               this.batchShareSongs()
             })
 
-            // 彻底移除
+            // 移除歌曲
             Divider().color(this.themeDivider).margin({ left: 44, right: 16 })
             Row({ space: 12 }) {
               SymbolGlyph($r('sys.symbol.trash'))
@@ -1544,95 +1581,83 @@ export struct XuanchuangTab {
               this.showFloatingPopup = false
               this.batchRemoveSongs()
             })
-          } else {
-            // ===== 单选模式：原有操作 =====
-            // 下首播放
-            Row({ space: 12 }) {
-              SymbolGlyph($r('sys.symbol.forward_end_fill'))
-                .fontSize(18)
-                .fontColor([this.themePrimary])
-              Text('下首播放')
-                .fontSize(15)
-                .fontColor(this.themeTextPrimary)
-                .layoutWeight(1)
-            }
-            .width('100%')
-            .height(44)
-            .padding({ left: 16, right: 16 })
-            .onClick(() => {
-              this.showFloatingPopup = false
-              this.handleFloatingAction('play_next', this.floatingSong!)
-            })
-            Divider().color(this.themeDivider).margin({ left: 44, right: 16 })
-
-            // 调整位置
-            Row({ space: 12 }) {
-              SymbolGlyph($r('sys.symbol.chevron_up'))
-                .fontSize(18)
-                .fontColor([this.themePrimary])
-              Text('调整位置')
-                .fontSize(15)
-                .fontColor(this.themeTextPrimary)
-                .layoutWeight(1)
-            }
-            .width('100%')
-            .height(44)
-            .padding({ left: 16, right: 16 })
-            .onClick(() => {
-              this.showFloatingPopup = false
-              this.pendingReorder = true
-            })
-            Divider().color(this.themeDivider).margin({ left: 44, right: 16 })
-
-            // 分享歌曲至
-            Row({ space: 12 }) {
-              SymbolGlyph($r('sys.symbol.share'))
-                .fontSize(18)
-                .fontColor([this.themePrimary])
-              Text('分享歌曲至')
-                .fontSize(15)
-                .fontColor(this.themeTextPrimary)
-                .layoutWeight(1)
-            }
-            .width('100%')
-            .height(44)
-            .padding({ left: 16, right: 16 })
-            .onClick(() => {
-              this.showFloatingPopup = false
-              this.handleFloatingAction('share_song', this.floatingSong!)
-            })
-
-            // 移除歌曲（仅非云端歌单显示）
-            if (this.floatingSong?.source !== 'webdav') {
-              Divider().color(this.themeDivider).margin({ left: 44, right: 16 })
-              Row({ space: 12 }) {
-                SymbolGlyph($r('sys.symbol.trash'))
-                  .fontSize(18)
-                  .fontColor([this.themeDanger])
-                Text('移除歌曲')
-                  .fontSize(15)
-                  .fontColor(this.themeDanger)
-                  .fontWeight(FontWeight.Medium)
-                  .layoutWeight(1)
-              }
-              .width('100%')
-              .height(44)
-              .padding({ left: 16, right: 16 })
-              .onClick(() => {
-                this.showFloatingPopup = false
-                this.handleFloatingAction('delete_song', this.floatingSong!)
-              })
-            }
           }
+          .width('100%')
+          .padding({ top: 4, bottom: 4 })
+        } else {
+          // ===== 单曲模式：基础操作 3×2 宫格 + 歌曲信息 =====
+          Text('基础操作')
+            .fontSize(16)
+            .fontColor(this.themeTextPrimary)
+            .fontWeight(FontWeight.Bold)
+            .width('100%')
+            .padding({ left: 16, top: 12, bottom: 4 })
+
+          Row() {
+            this.SongSheetActionItem('xys.svg', '下首播放', 'play_next')
+            this.SongSheetActionItem('px.svg', '调整位置', 'reorder')
+            this.SongSheetActionItem('share.svg', '分享歌曲', 'share_song')
+          }
+          .width('100%')
+          .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+
+          Row() {
+            this.SongSheetActionItem('yd.svg', '移动歌曲到', 'move_playlist')
+            this.SongSheetActionItem('copy.svg', '复制歌曲到', 'copy_playlist')
+            this.SongSheetActionItem('delete.svg', '删除此歌曲', 'delete_song')
+          }
+          .width('100%')
+          .padding({ left: 8, right: 8, top: 12, bottom: 12 })
+
+          Divider()
+            .width('100%')
+            .color(this.themeDivider)
+
+          Text('歌曲信息')
+            .fontSize(16)
+            .fontColor(this.themeTextPrimary)
+            .fontWeight(FontWeight.Bold)
+            .width('100%')
+            .padding({ left: 16, top: 12, bottom: 4 })
+
+          Column({ space: 8 }) {
+            this.InfoRow('歌曲名称', this.floatingSong.songName || '-')
+            this.InfoRow('歌手', this.floatingSong.artist || '-')
+            this.InfoRow('专辑', this.floatingSong.album && this.floatingSong.album.length > 0 ? this.floatingSong.album : '-')
+            this.InfoRow('来源', this.getSourceLabel(this.floatingSong.source || ''))
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16, top: 2 })
         }
-        .width('100%')
-        .padding({ top: 4, bottom: 4 })
       }
     }
     .width('100%')
-    .backgroundColor(this.themeCardBg)
-    .borderRadius(14)
-    .shadow({ radius: 16, color: '#00000020', offsetY: 4 })
+    .padding({ top: 4, bottom: 16 })
+  }
+
+  @Builder
+  SongSheetActionItem(iconRaw: string, label: string, action: string) {
+    Column({ space: 6 }) {
+      if (action === 'delete_song') {
+        Image($rawfile(iconRaw))
+          .width(24)
+          .height(24)
+          .fillColor(this.themeDanger)
+      } else {
+        Image($rawfile(iconRaw))
+          .width(24)
+          .height(24)
+      }
+      Text(label)
+        .fontSize(12)
+        .fontColor(action === 'delete_song' ? this.themeDanger : this.themeTextPrimary)
+        .maxLines(1)
+    }
+    .layoutWeight(1)
+    .opacity(this.isSongSheetActionDisabled(action) ? 0.35 : 1)
+    .onClick(() => {
+      this.handleSongSheetAction(action)
+    })
   }
 
   private async shareSong(song: SongInfo): Promise<void> {
@@ -1645,7 +1670,7 @@ export struct XuanchuangTab {
         description: `${song.songName} - ${song.artist}`,
       })
       const controller: systemShare.ShareController = new systemShare.ShareController(shareData)
-      const context = getContext(this) as common.UIAbilityContext
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext
       await controller.show(context, {
         selectionMode: systemShare.SelectionMode.SINGLE,
         previewMode: systemShare.SharePreviewMode.DETAIL,
@@ -1711,8 +1736,11 @@ export struct XuanchuangTab {
 
   private async pickPlaylistCover(): Promise<void> {
     try {
-      const photoPicker = new picker.PhotoViewPicker()
-      const result = await photoPicker.select({ maxSelectNumber: 1 })
+      const photoPicker = new photoAccessHelper.PhotoViewPicker()
+      const selectOptions = new photoAccessHelper.PhotoSelectOptions()
+      selectOptions.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE
+      selectOptions.maxSelectNumber = 1
+      const result = await photoPicker.select(selectOptions)
       if (result.photoUris && result.photoUris.length > 0) {
         this.editPlaylistCoverUri = result.photoUris[0]
       }
@@ -1959,6 +1987,8 @@ export struct XuanchuangTab {
       .height('100%')
       .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
       .alignItems(HorizontalAlign.Start)
+      // V2.1.9：主页常规顶部留白；详情页自带浮动标题栏需全出血，不补偿
+      .padding({ top: this.subPage === 'main' ? 10 : 0 })
 
       // Sheet trigger: 重命名歌单
       Row()
@@ -2046,6 +2076,33 @@ export struct XuanchuangTab {
             this.showReorderDialog = false
             this.reorderInput = ''
             this.floatingSong = null
+          },
+        })
+
+      // Sheet trigger: 长按歌曲操作底部弹窗
+      Row()
+        .width(1)
+        .height(1)
+        .bindSheet($$this.showFloatingPopup, this.SongActionSheetContent(), {
+          height: SheetSize.FIT_CONTENT,
+          dragBar: true,
+          showClose: false,
+          backgroundColor: Color.Transparent,
+          systemMaterial: MaterialCompat.immersiveMaterial(MaterialCompatStyle.THICK),
+          onDisappear: () => {
+            this.showFloatingPopup = false
+            if (this.pendingReorder) {
+              this.pendingReorder = false
+              this.showReorderDialog = true
+            }
+            if (this.pendingMovePlaylist) {
+              this.pendingMovePlaylist = false
+              this.showMovePlaylistDialog = true
+            }
+            if (this.pendingCopyPlaylist) {
+              this.pendingCopyPlaylist = false
+              this.showCopyPlaylistDialog = true
+            }
           },
         })
 
@@ -2212,12 +2269,12 @@ export struct XuanchuangTab {
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
                 .flexShrink(1)
 
-              // LV 等级徽章：文字镂空（显示底部背景色），背景填充区段颜色
+              // LV 等级徽章：区段色均为浅/中亮度，黑色文字保证对比度
               Stack() {
                 Text(`LV${this.levelInfo.level}`)
                   .fontSize(11)
                   .fontWeight(FontWeight.Bold)
-                  .fontColor(this.themeCardBg)
+                  .fontColor(LEVEL_TEXT_COLOR)
               }
               .padding({ left: 8, right: 8, top: 3, bottom: 3 })
               .backgroundColor(getLevelColor(this.levelInfo.level))
@@ -2444,6 +2501,10 @@ export struct XuanchuangTab {
     .backgroundColor(this.themeCardBg)
     .borderRadius(16)
     .shadow({ radius: 4, color: '#00000008', offsetY: 2 })
+    .onClick(() => {
+      // V2.0.9.3：点击听歌统计卡片跳转音迹版块（时间戳信号由 Index 监听并切换 Tab）
+      AppStorage.setOrCreate('jumpToYinjiTab', Date.now())
+    })
   }
 
   // ===== 歌单列表 Section V2（区块包裹：题头与子歌单同一容器） =====
@@ -3052,7 +3113,7 @@ export struct XuanchuangTab {
       if (typeof result === 'string') return result
       if (result instanceof ArrayBuffer) {
         const decoder = util.TextDecoder.create('utf-8')
-        return decoder.decodeWithStream(new Uint8Array(result))
+        return decoder.decodeToString(new Uint8Array(result))
       }
       return ''
     } catch (e) {
@@ -3407,29 +3468,6 @@ export struct XuanchuangTab {
           this.showFloatingPopup = true
         })
     )
-    .bindPopup(this.showFloatingPopup && this.floatingSong?.songId === 'local_' + item.id && this.floatingSong?.source === 'local', {
-      builder: this.SongActionPopupBuilder(),
-      placement: Placement.Bottom,
-      systemMaterial: MaterialCompat.immersiveMaterial(MaterialCompatStyle.THIN),
-      width: '78%',
-      onStateChange: (e: PopupStateChangeParam) => {
-        if (!e.isVisible) {
-          this.showFloatingPopup = false
-          if (this.pendingReorder) {
-            this.pendingReorder = false
-            this.showReorderDialog = true
-          }
-          if (this.pendingMovePlaylist) {
-            this.pendingMovePlaylist = false
-            this.showMovePlaylistDialog = true
-          }
-          if (this.pendingCopyPlaylist) {
-            this.pendingCopyPlaylist = false
-            this.showCopyPlaylistDialog = true
-          }
-        }
-      }
-    })
   }
 
   // ===== 本地音乐 Section =====
@@ -3562,28 +3600,6 @@ export struct XuanchuangTab {
                     this.showFloatingPopup = true
                   })
               )
-              .bindPopup(this.showFloatingPopup && this.floatingSong?.songId === 'local_' + item.id && this.floatingSong?.source === 'local', {
-                builder: this.SongActionPopupBuilder(),
-                placement: Placement.Bottom,
-                width: '78%',
-                onStateChange: (e: PopupStateChangeParam) => {
-                  if (!e.isVisible) {
-                    this.showFloatingPopup = false
-                    if (this.pendingReorder) {
-                      this.pendingReorder = false
-                      this.showReorderDialog = true
-                    }
-                    if (this.pendingMovePlaylist) {
-                      this.pendingMovePlaylist = false
-                      this.showMovePlaylistDialog = true
-                    }
-                    if (this.pendingCopyPlaylist) {
-                      this.pendingCopyPlaylist = false
-                      this.showCopyPlaylistDialog = true
-                    }
-                  }
-                }
-              })
             })
 
             // 清空全部按钮
@@ -3947,28 +3963,6 @@ export struct XuanchuangTab {
                     }
                   })
               )
-              .bindPopup(this.showFloatingPopup && this.floatingSong?.songId === song.songId && this.floatingSong?.source === song.source, {
-                builder: this.SongActionPopupBuilder(),
-                placement: Placement.Bottom,
-                width: '78%',
-                onStateChange: (e: PopupStateChangeParam) => {
-                  if (!e.isVisible) {
-                    this.showFloatingPopup = false
-                    if (this.pendingReorder) {
-                      this.pendingReorder = false
-                      this.showReorderDialog = true
-                    }
-                    if (this.pendingMovePlaylist) {
-                      this.pendingMovePlaylist = false
-                      this.showMovePlaylistDialog = true
-                    }
-                    if (this.pendingCopyPlaylist) {
-                      this.pendingCopyPlaylist = false
-                      this.showCopyPlaylistDialog = true
-                    }
-                  }
-                }
-              })
             })
           }
           .width('100%')
@@ -4029,10 +4023,17 @@ export struct XuanchuangTab {
           },
         },
       },
+      // V2.1.9：GRADIENT_BLUR + enableScrollEffect:true + systemMaterialEffect——静止时背景板透明，
+      // 滚动后浮出浅灰模糊板（API23 规则：不配 systemMaterialEffect 时滚动板为 #99000000 黑板，与状态栏割裂）
       style: {
         scrollEffectOpts: {
-          enableScrollEffect: false
-        }
+          enableScrollEffect: true,
+          scrollEffectType: ScrollEffectType.GRADIENT_BLUR,
+        },
+        systemMaterialEffect: {
+          materialType: hdsMaterial.MaterialType.IMMERSIVE,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+        },
       },
     })
     .hideTitleBar(this.multiSelectMode)
@@ -4326,28 +4327,6 @@ export struct XuanchuangTab {
                     }
                   })
               )
-              .bindPopup(this.showFloatingPopup && this.floatingSong?.songId === 'local_' + item.id && this.floatingSong?.source === 'local', {
-                builder: this.SongActionPopupBuilder(),
-                placement: Placement.Bottom,
-                width: '78%',
-                onStateChange: (e: PopupStateChangeParam) => {
-                  if (!e.isVisible) {
-                    this.showFloatingPopup = false
-                    if (this.pendingReorder) {
-                      this.pendingReorder = false
-                      this.showReorderDialog = true
-                    }
-                    if (this.pendingMovePlaylist) {
-                      this.pendingMovePlaylist = false
-                      this.showMovePlaylistDialog = true
-                    }
-                    if (this.pendingCopyPlaylist) {
-                      this.pendingCopyPlaylist = false
-                      this.showCopyPlaylistDialog = true
-                    }
-                  }
-                }
-              })
             })
           }
           .width('100%').padding({ left: 16, right: 16, top: 8, bottom: 168 })
@@ -4410,10 +4389,17 @@ export struct XuanchuangTab {
           },
         },
       },
+      // V2.1.9：GRADIENT_BLUR + enableScrollEffect:true + systemMaterialEffect——静止时背景板透明，
+      // 滚动后浮出浅灰模糊板（API23 规则：不配 systemMaterialEffect 时滚动板为 #99000000 黑板，与状态栏割裂）
       style: {
         scrollEffectOpts: {
-          enableScrollEffect: false
-        }
+          enableScrollEffect: true,
+          scrollEffectType: ScrollEffectType.GRADIENT_BLUR,
+        },
+        systemMaterialEffect: {
+          materialType: hdsMaterial.MaterialType.IMMERSIVE,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+        },
       },
     })
     .hideTitleBar(this.multiSelectMode)
@@ -4497,28 +4483,6 @@ export struct XuanchuangTab {
                   this.showFloatingPopup = true
                 })
               )
-              .bindPopup(this.showFloatingPopup && this.floatingSong?.songId === song.songId && this.floatingSong?.source === song.source, {
-                builder: this.SongActionPopupBuilder(),
-                placement: Placement.Bottom,
-                width: '78%',
-                onStateChange: (e: PopupStateChangeParam) => {
-                  if (!e.isVisible) {
-                    this.showFloatingPopup = false
-                    if (this.pendingReorder) {
-                      this.pendingReorder = false
-                      this.showReorderDialog = true
-                    }
-                    if (this.pendingMovePlaylist) {
-                      this.pendingMovePlaylist = false
-                      this.showMovePlaylistDialog = true
-                    }
-                    if (this.pendingCopyPlaylist) {
-                      this.pendingCopyPlaylist = false
-                      this.showCopyPlaylistDialog = true
-                    }
-                  }
-                }
-              })
             })
           }
           .width('100%').padding({ top: 12, left: 16, right: 16, bottom: 200 })
@@ -4567,10 +4531,17 @@ export struct XuanchuangTab {
           },
         },
       },
+      // V2.1.9：GRADIENT_BLUR + enableScrollEffect:true + systemMaterialEffect——静止时背景板透明，
+      // 滚动后浮出浅灰模糊板（API23 规则：不配 systemMaterialEffect 时滚动板为 #99000000 黑板，与状态栏割裂）
       style: {
         scrollEffectOpts: {
-          enableScrollEffect: false
-        }
+          enableScrollEffect: true,
+          scrollEffectType: ScrollEffectType.GRADIENT_BLUR,
+        },
+        systemMaterialEffect: {
+          materialType: hdsMaterial.MaterialType.IMMERSIVE,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+        },
       },
     })
     .width('100%')

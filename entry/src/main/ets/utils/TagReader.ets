@@ -501,7 +501,7 @@ export class TagReader {
   private static tryDecodeLabel(label: string, bytes: Uint8Array): string {
     try {
       const decoder: util.TextDecoder = util.TextDecoder.create(label)
-      let s: string = decoder.decodeWithStream(bytes)
+      let s: string = decoder.decodeToString(bytes)
       // 去除尾部 null
       let end: number = s.length
       while (end > 0 && (s.charCodeAt(end - 1) === 0)) {

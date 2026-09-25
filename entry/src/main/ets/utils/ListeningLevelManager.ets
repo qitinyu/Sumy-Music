@@ -2,10 +2,8 @@
 // 本地持久化 + WebDAV 同步支持
 import { DatabaseHelper } from '../database/DatabaseHelper'
 import { WebDAVProfileSync, ProfileData } from './WebDAVProfileSync'
+import { MAX_LEVEL, getNeedForLevel } from './LevelConfig'
 
-const MAX_LEVEL: number = 16
-const BASE_NEED_MINUTES: number = 1160
-const GROWTH_RATE: number = 1.25
 const KEY_TOTAL_SECONDS: string = 'listening_total_seconds'
 const KEY_SIGNATURE: string = 'user_signature'
 const KEY_SIGNATURE_UPDATED_AT: string = 'user_signature_updated_at'
@@ -153,39 +151,23 @@ export class ListeningLevelManager {
       })
   }
 
+  // V2.1.7：等级改为 LV1-8 八区段阈值表（LevelConfig），按累计分钟查表定位
   getLevelInfo(): LevelInfo {
     const totalMinutes: number = Math.floor(this.totalSeconds / 60)
-    let currentLevel: number = 1
-    let current: number = totalMinutes
-    let need: number = this.getNeedForLevel(1)
+    let currentLevel: number = MAX_LEVEL
     let accumulated: number = 0
 
-    for (let i: number = 1; i <= MAX_LEVEL; i++) {
-      const levelNeed = this.getNeedForLevel(i)
-      if (totalMinutes >= accumulated + levelNeed) {
-        currentLevel = i + 1
-        accumulated += levelNeed
-        if (i < MAX_LEVEL) {
-          need = this.getNeedForLevel(i + 1)
-          current = totalMinutes - accumulated
-        }
-      } else {
-        need = levelNeed
-        current = totalMinutes - accumulated
+    for (let i: number = 1; i < MAX_LEVEL; i++) {
+      const levelNeed = getNeedForLevel(i)
+      if (totalMinutes < accumulated + levelNeed) {
+        currentLevel = i
         break
       }
+      accumulated += levelNeed
     }
 
-    if (currentLevel > MAX_LEVEL) {
-      currentLevel = MAX_LEVEL
-      accumulated = 0
-      for (let i: number = 1; i < MAX_LEVEL; i++) {
-        accumulated += this.getNeedForLevel(i)
-      }
-      current = totalMinutes - accumulated
-      need = this.getNeedForLevel(MAX_LEVEL)
-    }
-
+    const need: number = getNeedForLevel(currentLevel)
+    const current: number = Math.min(totalMinutes - accumulated, need)
     const percent = need > 0 ? Math.min(100, Math.floor((current / need) * 100)) : 100
 
     const result: LevelInfo = {
@@ -230,13 +212,6 @@ export class ListeningLevelManager {
       last_sync_time: Date.now()
     }
     return result
-  }
-
-  private getNeedForLevel(level: number): number {
-    if (level <= 1) {
-      return BASE_NEED_MINUTES
-    }
-    return Math.floor(BASE_NEED_MINUTES * Math.pow(GROWTH_RATE, level - 1))
   }
 
   private notifyUpdate(): void {

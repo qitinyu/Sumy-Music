@@ -4,18 +4,17 @@
 import { SourceManager } from '../utils/SourceManager'
 import { MusicApi } from '../utils/MusicApi'
 import { DatabaseHelper } from '../database/DatabaseHelper'
-import { promptAction } from '@kit.ArkUI'
+
 import type { SongInfo } from '../model/MusicModel'
 import { JsPluginEngine } from '../utils/JsPluginEngine'
 import { PluginDiagnostics } from '../utils/PluginDiagnostics'
-import { MFSubscription } from '../utils/MFSubscription'
+import { MFSubscription, MFSyncResult } from '../utils/MFSubscription'
 import { MFEngine } from '../utils/MFEngine'
 import { playLog, clearPlayLog } from '../utils/PlayLog'
 import { systemShare } from '@kit.ShareKit'
 import { uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { common } from '@kit.AbilityKit'
 import { pasteboard } from '@kit.BasicServicesKit'
-import { ChipGroup, ChipSize, SymbolGlyphModifier } from '@kit.ArkUI'
 
 /** 自检步骤详情 */
 interface TestDetail {
@@ -98,12 +97,6 @@ export struct PluginManagerPage {
   @State expandedTestSource: string = ''
   @State currentTabIndex: number = 0
   @State chipSelectedIndex: Array<number> = [0]
-  @State prefixModifierSub: SymbolGlyphModifier = new SymbolGlyphModifier($r('sys.symbol.link'))
-  @State prefixModifierSubActivated: SymbolGlyphModifier = new SymbolGlyphModifier($r('sys.symbol.link'))
-  @State prefixModifierManage: SymbolGlyphModifier = new SymbolGlyphModifier($r('sys.symbol.list_bullet'))
-  @State prefixModifierManageActivated: SymbolGlyphModifier = new SymbolGlyphModifier($r('sys.symbol.list_bullet'))
-  @State prefixModifierLog: SymbolGlyphModifier = new SymbolGlyphModifier($r('sys.symbol.waveform'))
-  @State prefixModifierLogActivated: SymbolGlyphModifier = new SymbolGlyphModifier($r('sys.symbol.waveform'))
   @State testLogHistory: TestLogRecord[] = []
   // 自检四项能力记录（歌手/可播放/歌词/封面），键为音源名
   private sourceCaps: Map<string, SourceCaps> = new Map()
@@ -112,8 +105,8 @@ export struct PluginManagerPage {
   @State mfSubEnabled: boolean = true
   @State mfChecking: boolean = false
   @State mfCheckLines: string[] = []
-  // 当前启用的订阅源地址（单一启用，''=未启用任何订阅）
-  @State mfActiveUrl: string = ''
+  // 已启用的订阅源地址列表（支持多源同时启用，空数组=未启用任何订阅）
+  @State mfActiveUrls: string[] = []
   private mfSubSeq: number = 1
   onBack?: () => void
 
@@ -121,6 +114,7 @@ export struct PluginManagerPage {
     await this.loadSources()
     await this.loadEnabledStates()
     await this.loadTestLogHistory()
+    await this.loadSourceTestStatus()
     await this.loadMfSubscription()
     const active = AppStorage.get<string>('lxActiveSource') || ''
     if (!active && this.sourceNames.length > 0) {
@@ -158,7 +152,7 @@ export struct PluginManagerPage {
       try {
         const arr: TestLogRecord[] = JSON.parse(raw) as TestLogRecord[]
         if (arr instanceof Array && arr.length > 0) {
-          this.testLogHistory = arr.slice(0, 3)
+          this.testLogHistory = arr.slice(0, 10)
         }
       } catch (_e) {}
     }
@@ -168,6 +162,35 @@ export struct PluginManagerPage {
     const db = DatabaseHelper.getInstance()
     try {
       await db.setSetting('testLogHistory', JSON.stringify(this.testLogHistory))
+    } catch (_e) {}
+  }
+
+  /** 加载持久化的自检可用状态（支持跨页面/退出重进常驻显示徽章） */
+  private async loadSourceTestStatus(): Promise<void> {
+    const db = DatabaseHelper.getInstance()
+    const raw = await db.getSetting('sourceTestStatusMap')
+    if (raw && raw.length > 2) {
+      try {
+        const map: Record<string, string> = JSON.parse(raw) as Record<string, string>
+        const m: Map<string, string> = new Map()
+        const keys: string[] = Object.keys(map)
+        for (let i = 0; i < keys.length; i++) {
+          m.set(keys[i], map[keys[i]])
+        }
+        this.sourceTestStatus = m
+      } catch (_e) {}
+    }
+  }
+
+  /** 持久化当前自检可用状态 */
+  private async saveSourceTestStatus(): Promise<void> {
+    const db = DatabaseHelper.getInstance()
+    try {
+      const obj: Record<string, string> = {}
+      this.sourceTestStatus.forEach((v: string, k: string) => {
+        obj[k] = v
+      })
+      await db.setSetting('sourceTestStatusMap', JSON.stringify(obj))
     } catch (_e) {}
   }
 
@@ -195,7 +218,7 @@ export struct PluginManagerPage {
   }
 
   showToastMsg(msg: string) {
-    promptAction.showToast({ message: msg, duration: 2000 })
+    this.getUIContext().getPromptAction().showToast({ message: msg, duration: 2000 })
   }
 
   /**
@@ -241,7 +264,7 @@ export struct PluginManagerPage {
         description: '音源自检结果与诊断日志',
       })
       const controller: systemShare.ShareController = new systemShare.ShareController(shareData)
-      const context = getContext(this) as common.UIAbilityContext
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext
       await controller.show(context, {
         selectionMode: systemShare.SelectionMode.SINGLE,
         previewMode: systemShare.SharePreviewMode.DETAIL,
@@ -258,6 +281,77 @@ export struct PluginManagerPage {
         this.showToastMsg('分享失败')
       }
     }
+  }
+
+  /** 长按删除单条历史自检日志（带确认弹窗） */
+  private confirmDeleteHistory(record: TestLogRecord): void {
+    this.getUIContext().getPromptAction().showDialog({
+      title: '删除日志',
+      message: `确定删除 ${record.timestamp} 的自检日志吗？`,
+      buttons: [
+        { text: '取消', color: this.themeTextSecondary },
+        { text: '删除', color: this.themeDanger },
+      ],
+    }).then((result) => {
+      if (result.index === 1) {
+        const next: TestLogRecord[] = []
+        for (let i = 0; i < this.testLogHistory.length; i++) {
+          if (this.testLogHistory[i].timestamp !== record.timestamp) {
+            next.push(this.testLogHistory[i])
+          }
+        }
+        this.testLogHistory = next
+        this.saveTestLogHistory()
+        this.showToastMsg('日志已删除')
+      }
+    })
+  }
+
+  // V2.1.9 彩蛋：长按「订阅导入」chip 跳转浏览器帮助文档
+  private openHelpLink(): void {
+    try {
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext
+      context.openLink('https://yqamm.top/posts/harmony/260914sumymusic/', { appLinkingOnly: false })
+        .then(() => {
+          console.info('[PluginManagerPage] opened help link')
+        })
+        .catch((e: Error) => {
+          console.error('[PluginManagerPage] open help link failed:', e)
+          this.showToastMsg('打开链接失败')
+        })
+    } catch (_e) {
+      this.showToastMsg('打开链接失败')
+    }
+  }
+
+  // V2.1.9 顶部标签 chip（视觉对齐原 ChipGroup：NORMAL 尺寸胶囊，选中态主题色填充白字）
+  @Builder
+  TabChip(index: number, label: string, icon: Resource) {
+    Row({ space: 4 }) {
+      SymbolGlyph(icon)
+        .fontSize(16)
+        .fontColor([this.currentTabIndex === index ? Color.White : this.themeTextSecondary])
+      Text(label)
+        .fontSize(14)
+        .fontColor(this.currentTabIndex === index ? Color.White : this.themeTextSecondary)
+    }
+    .height(36)
+    .padding({ left: 14, right: 14 })
+    .justifyContent(FlexAlign.Center)
+    .borderRadius(18)
+    .backgroundColor(this.currentTabIndex === index ? this.themePrimary
+      : (this.isDarkMode ? '#333333' : '#F0F0F0'))
+    .onClick(() => {
+      this.currentTabIndex = index
+      this.chipSelectedIndex = [index]
+    })
+    // V2.1.9 彩蛋：仅「订阅导入」chip 响应长按，跳转浏览器帮助页（Row 无 onLongPress，用长按手势）
+    .gesture(LongPressGesture()
+      .onAction(() => {
+        if (index === 0) {
+          this.openHelpLink()
+        }
+      }))
   }
 
   // ===== 音源自测（验证闭环） =====
@@ -360,7 +454,7 @@ export struct PluginManagerPage {
         failCount: 1,
         lines: results.slice(),
       }
-      this.testLogHistory = [record, ...this.testLogHistory].slice(0, 3)
+      this.testLogHistory = [record, ...this.testLogHistory].slice(0, 10)
       this.saveTestLogHistory()
       return
     }
@@ -516,7 +610,7 @@ export struct PluginManagerPage {
       failCount: failCount,
       lines: results.slice(),
     }
-    this.testLogHistory = [record, ...this.testLogHistory].slice(0, 3)
+    this.testLogHistory = [record, ...this.testLogHistory].slice(0, 10)
   }
 
   /**
@@ -614,10 +708,28 @@ export struct PluginManagerPage {
 
     let okCount = 0
     let failCount = 0
+    const unusable: string[] = []
     for (let i = 0; i < this.sourceNames.length; i++) {
-      const st = this.sourceTestStatus.get(this.sourceNames[i])
+      const name: string = this.sourceNames[i]
+      const st = this.sourceTestStatus.get(name)
       if (st === 'ok') okCount++
-      else if (st === 'fail') failCount++
+      else if (st === 'fail') {
+        failCount++
+        unusable.push(name)
+      }
+    }
+    // 持久化可用状态，确保可用徽章常驻（切页/退出重进仍显示）
+    await this.saveSourceTestStatus()
+    // 自检不可用源：自动删除
+    if (unusable.length > 0) {
+      this.showToastMsg(`自检发现 ${unusable.length} 个不可用音源，已自动删除`)
+      for (let i = 0; i < unusable.length; i++) {
+        this.sourceTestStatus.delete(unusable[i])
+        await SourceManager.removeSource(unusable[i])
+      }
+      this.sourceNames = SourceManager.getSourceNames()
+      await this.saveSourceTestStatus()
+      await this.loadEnabledStates()
     }
     const record: TestLogRecord = {
       timestamp: this.formatLogTimestamp(),
@@ -626,7 +738,7 @@ export struct PluginManagerPage {
       failCount: failCount,
       lines: summary.slice(),
     }
-    this.testLogHistory = [record, ...this.testLogHistory].slice(0, 3)
+    this.testLogHistory = [record, ...this.testLogHistory].slice(0, 10)
   }
 
   /**
@@ -721,7 +833,7 @@ export struct PluginManagerPage {
   // ===== MusicFree 订阅导入（多订阅卡片） =====
   private async loadMfSubscription(): Promise<void> {
     this.mfSubEnabled = await MFSubscription.getEnabled()
-    this.mfActiveUrl = await MFSubscription.getActive()
+    this.mfActiveUrls = await MFSubscription.getActiveList()
     const urls: string[] = await MFSubscription.getList()
     const cards: MFSubCard[] = []
     this.mfSubSeq = 1
@@ -738,14 +850,26 @@ export struct PluginManagerPage {
   }
 
   private updateSubUrl(sub: MFSubCard, url: string): void {
-    // 已启用的订阅地址被修改时自动释放启用状态，避免标记与实际地址不符
-    if (this.mfActiveUrl.length > 0 && sub.url.trim() === this.mfActiveUrl && url.trim() !== this.mfActiveUrl) {
-      this.mfActiveUrl = ''
-      MFSubscription.saveActive('')
+    // 已启用的订阅地址被修改时自动移出启用列表，避免标记与实际地址不符
+    const oldUrl: string = sub.url.trim()
+    if (oldUrl.length > 0 && this.mfActiveUrls.indexOf(oldUrl) >= 0 && url.trim() !== oldUrl) {
+      this.removeActiveUrl(oldUrl)
       this.showToastMsg('订阅地址已修改，请重新启用')
     }
     sub.url = url
     this.touchSubs()
+  }
+
+  /** 从启用列表移除一个地址并持久化 */
+  private removeActiveUrl(url: string): void {
+    const next: string[] = []
+    for (let i = 0; i < this.mfActiveUrls.length; i++) {
+      if (this.mfActiveUrls[i] !== url) {
+        next.push(this.mfActiveUrls[i])
+      }
+    }
+    this.mfActiveUrls = next
+    MFSubscription.saveActiveList(next)
   }
 
   private addMfSub(): void {
@@ -755,6 +879,11 @@ export struct PluginManagerPage {
   }
 
   private async removeMfSub(sub: MFSubCard): Promise<void> {
+    // 删除卡片时同步移出启用列表
+    const oldUrl: string = sub.url.trim()
+    if (oldUrl.length > 0 && this.mfActiveUrls.indexOf(oldUrl) >= 0) {
+      this.removeActiveUrl(oldUrl)
+    }
     const next: MFSubCard[] = []
     for (let i = 0; i < this.mfSubs.length; i++) {
       if (this.mfSubs[i].id !== sub.id) {
@@ -766,7 +895,7 @@ export struct PluginManagerPage {
   }
 
   private confirmRemoveMfSub(sub: MFSubCard): void {
-    promptAction.showDialog({
+    this.getUIContext().getPromptAction().showDialog({
       title: '删除订阅源',
       message: '确定要删除该订阅源吗？\n（已安装的插件不受影响，可在「插件管理」页管理）',
       buttons: [
@@ -812,25 +941,12 @@ export struct PluginManagerPage {
     this.showToastMsg(url.length > 0 ? '订阅已保存' : '订阅已清空')
   }
 
-  /** 该订阅是否为当前启用的订阅（按地址匹配） */
+  /** 该订阅是否已启用（按地址匹配，支持多源同时启用） */
   private isSubActive(sub: MFSubCard): boolean {
-    return this.mfActiveUrl.length > 0 && sub.url.trim() === this.mfActiveUrl
+    return sub.url.trim().length > 0 && this.mfActiveUrls.indexOf(sub.url.trim()) >= 0
   }
 
-  /** 是否存在已启用的订阅（存在时其余订阅的「启用」按钮锁定为黑色） */
-  private hasAnyActiveSub(): boolean {
-    if (this.mfActiveUrl.length === 0) {
-      return false
-    }
-    for (let i = 0; i < this.mfSubs.length; i++) {
-      if (this.mfSubs[i].url.trim() === this.mfActiveUrl) {
-        return true
-      }
-    }
-    return false
-  }
-
-  /** 启用订阅（只允许单一启用）：标记后立即拉取安装该订阅的插件 */
+  /** 启用订阅（支持多源同时启用）：标记后立即拉取安装该订阅的插件 */
   private async enableMfSub(sub: MFSubCard): Promise<void> {
     if (this.mfChecking) {
       return
@@ -844,17 +960,20 @@ export struct PluginManagerPage {
       this.showToastMsg('地址需为 http(s) 且以 .js 或 .json 结尾')
       return
     }
-    await MFSubscription.saveActive(url)
-    this.mfActiveUrl = url
+    const next: string[] = this.mfActiveUrls.slice()
+    if (next.indexOf(url) < 0) {
+      next.push(url)
+    }
+    this.mfActiveUrls = next
+    await MFSubscription.saveActiveList(next)
     this.showToastMsg('已启用该订阅源，开始安装插件…')
     await this.runMfCheck(sub, true)
   }
 
-  /** 释放已启用的订阅（再次点击已启用订阅的「已启用」按钮触发，之后才能启用其它订阅） */
-  private async releaseMfSub(): Promise<void> {
-    await MFSubscription.saveActive('')
-    this.mfActiveUrl = ''
-    this.showToastMsg('已释放订阅源，可启用其它订阅源')
+  /** 停用已启用的订阅（再次点击已启用订阅的「已启用」按钮触发，不影响其它已启用订阅） */
+  private async releaseMfSub(sub: MFSubCard): Promise<void> {
+    this.removeActiveUrl(sub.url.trim())
+    this.showToastMsg('已停用该订阅源，已安装插件不受影响')
   }
 
   // 把订阅启用状态应用到全部已安装的 MusicFree 插件
@@ -876,7 +995,7 @@ export struct PluginManagerPage {
       failCount: failCount,
       lines: lines.slice(),
     }
-    this.testLogHistory = [record, ...this.testLogHistory].slice(0, 3)
+    this.testLogHistory = [record, ...this.testLogHistory].slice(0, 10)
     this.saveTestLogHistory()
   }
 
@@ -1052,6 +1171,63 @@ export struct PluginManagerPage {
     }
   }
 
+  // 一键刷新（插件管理 more 菜单）：逐个重新同步所有已启用的订阅源（重新拉取并安装插件）
+  private async refreshAllActiveSubs(): Promise<void> {
+    if (this.mfChecking) {
+      this.showToastMsg('正在执行订阅任务，请稍候')
+      return
+    }
+    if (this.mfActiveUrls.length === 0) {
+      this.showToastMsg('尚未启用任何订阅源')
+      return
+    }
+    this.mfChecking = true
+    this.mfCheckLines = []
+    const lines: string[] = []
+    let mainStep = 0
+    let totalOk = 0
+    let totalFail = 0
+    const push = (line: string, isSub: boolean = false): void => {
+      if (!isSub) {
+        mainStep++
+        lines.push(`${mainStep}. ${line}`)
+      } else {
+        lines.push(`- ${line}`)
+      }
+      this.mfCheckLines = lines.slice()
+    }
+    playLog('订阅刷新', `开始一键刷新 ${this.mfActiveUrls.length} 个已启用订阅源`)
+    push(`一键刷新 ${this.mfActiveUrls.length} 个已启用订阅源`)
+    const engineReady: boolean = await this.waitMfEngineReady(10000)
+    if (!engineReady) {
+      push('MF 沙箱引擎未就绪（WebView 加载失败）', true)
+      this.showToastMsg('沙箱引擎未就绪，刷新已中止')
+      this.finishMfCheck(0, 1, lines)
+      return
+    }
+    push('沙箱引擎就绪', true)
+    for (let i = 0; i < this.mfActiveUrls.length; i++) {
+      const url: string = this.mfActiveUrls[i]
+      push(`刷新订阅源 ${i + 1}/${this.mfActiveUrls.length}: ${url}`)
+      const started: number = Date.now()
+      const result: MFSyncResult = await MFSubscription.sync(url, (line: string) => {
+        push(line, true)
+      })
+      totalOk += result.okCount
+      totalFail += result.failCount
+      push(`完成：成功 ${result.okCount} 个，失败 ${result.failCount} 个，耗时 ${Date.now() - started}ms`, true)
+    }
+    push('刷新汇总')
+    push(`插件安装：成功 ${totalOk}，失败 ${totalFail}`, true)
+    playLog('订阅刷新', `一键刷新结束 安装成功=${totalOk} 失败=${totalFail}`)
+    // 刷新插件列表并应用订阅启用状态
+    await this.loadSources()
+    await this.applyMfEnabledToSources()
+    await this.loadEnabledStates()
+    this.finishMfCheck(totalOk, totalFail, lines)
+    this.showToastMsg(totalOk > 0 ? `一键刷新完成，安装成功 ${totalOk} 个插件` : '一键刷新完成，但插件安装失败，详见订阅自检')
+  }
+
   getPluginType(name: string): string {
     const config = SourceManager.getConfig(name)
     if (config && config.jsMode === 'mf') {
@@ -1061,7 +1237,7 @@ export struct PluginManagerPage {
   }
 
   async deleteSource(name: string) {
-    promptAction.showDialog({
+    this.getUIContext().getPromptAction().showDialog({
       title: '删除音源',
       message: `确定要删除音源「${name}」吗？`,
       buttons: [
@@ -1148,7 +1324,7 @@ export struct PluginManagerPage {
       return
     }
     const count = this.selectedForDelete.size
-    promptAction.showDialog({
+    this.getUIContext().getPromptAction().showDialog({
       title: '批量删除',
       message: `确定要删除选中的 ${count} 个插件吗？`,
       buttons: [
@@ -1189,6 +1365,7 @@ export struct PluginManagerPage {
       { value: '一键关闭', action: (): void => { this.disableAllSources() } },
       { value: '插件多选', action: (): void => { this.enterBatchDeleteMode() } },
       { value: '全部自检', action: (): void => { this.runAllSourceTests() } },
+      { value: '一键刷新', action: (): void => { this.refreshAllActiveSubs() } },
     ]
   }
 
@@ -1323,52 +1500,15 @@ export struct PluginManagerPage {
         .width('100%')
         .padding({ left: 16, right: 16, top: 12, bottom: 4 })
 
-        // ChipGroup 标签切换
-        Row() {
-          ChipGroup({
-            items: [
-              {
-                prefixSymbol: {
-                  normal: this.prefixModifierSub,
-                  activated: this.prefixModifierSubActivated
-                },
-                label: { text: '订阅导入' },
-              },
-              {
-                prefixSymbol: {
-                  normal: this.prefixModifierManage,
-                  activated: this.prefixModifierManageActivated
-                },
-                label: { text: '插件管理' },
-              },
-              {
-                prefixSymbol: {
-                  normal: this.prefixModifierLog,
-                  activated: this.prefixModifierLogActivated
-                },
-                label: { text: '自检日志' },
-              },
-            ],
-            itemStyle: {
-              size: ChipSize.NORMAL,
-              backgroundColor: this.isDarkMode ? '#333333' : '#F0F0F0',
-              fontColor: this.themeTextSecondary,
-              selectedBackgroundColor: this.themePrimary,
-              selectedFontColor: Color.White,
-            },
-            selectedIndexes: this.chipSelectedIndex,
-            multiple: false,
-            chipGroupSpace: { itemSpace: 8, startSpace: 16, endSpace: 16 },
-            chipGroupPadding: { top: 6, bottom: 6 },
-            onChange: (activatedChipsIndex: Array<number>) => {
-              if (activatedChipsIndex.length > 0) {
-                this.chipSelectedIndex = activatedChipsIndex
-                this.currentTabIndex = activatedChipsIndex[0]
-              }
-            },
-          })
+        // V2.1.9 自定义标签条（替代 ChipGroup）：ChipGroup 无法为单个 chip 绑定长按手势，
+        // 「订阅导入」chip 长按为彩蛋入口，跳转浏览器帮助页
+        Row({ space: 8 }) {
+          this.TabChip(0, '订阅导入', $r('sys.symbol.link'))
+          this.TabChip(1, '插件管理', $r('sys.symbol.list_bullet'))
+          this.TabChip(2, '自检日志', $r('sys.symbol.waveform'))
         }
         .width('100%')
+        .padding({ left: 16, right: 16, top: 6, bottom: 6 })
 
         // Swiper 左右滑动页面
         Swiper() {
@@ -1407,23 +1547,9 @@ export struct PluginManagerPage {
 
                 // 订阅源卡片（多个，竖排）
                 ForEach(this.mfSubs, (sub: MFSubCard) => {
-                  Column({ space: 12 }) {
-                    Row() {
-                      Text('订阅源')
-                        .fontSize(15)
-                        .fontColor(this.themeTextPrimary)
-                        .fontWeight(FontWeight.Medium)
-                      Blank()
-                      SymbolGlyph($r('sys.symbol.trash'))
-                        .fontSize(16)
-                        .fontColor([this.themeTextSecondary])
-                        .onClick(() => {
-                          this.confirmRemoveMfSub(sub)
-                        })
-                    }
-                    .width('100%')
-
-                    Row({ space: 8 }) {
+                  Row({ space: 10 }) {
+                    // 输入框（清空 × 置于输入框内部最右侧）
+                    Stack({ alignContent: Alignment.End }) {
                       TextInput({ placeholder: 'https://example.com/plugins.json', text: sub.url })
                         .layoutWeight(1)
                         .height(44)
@@ -1432,7 +1558,7 @@ export struct PluginManagerPage {
                         .placeholderColor(this.themeTextSecondary)
                         .backgroundColor(this.themePlaceholder)
                         .borderRadius(10)
-                        .padding({ left: 12, right: 12 })
+                        .padding({ left: 12, right: 40 })
                         .onChange((value: string) => {
                           this.updateSubUrl(sub, value)
                         })
@@ -1441,57 +1567,35 @@ export struct PluginManagerPage {
                         SymbolGlyph($r('sys.symbol.xmark_circle_fill'))
                           .fontSize(18)
                           .fontColor([this.themeTextSecondary])
+                          .margin({ right: 12 })
                           .onClick(() => {
                             this.updateSubUrl(sub, '')
                           })
                       }
                     }
-                    .width('100%')
+                    .layoutWeight(1)
 
-                    Row({ space: 10 }) {
-                      // 启用：单一启用；已启用=红色背景，再点释放；存在已启用订阅时其余「启用」标黑锁定
-                      Button(this.isSubActive(sub) ? '已启用' : '启用')
-                        .fontSize(13)
-                        .fontColor(this.isSubActive(sub) || this.hasAnyActiveSub() ? Color.White : this.themeTextPrimary)
-                        .backgroundColor(this.isSubActive(sub) ? this.themeDanger : (this.hasAnyActiveSub() ? (this.isDarkMode ? '#333333' : '#000000') : this.themePlaceholder))
-                        .borderRadius(10)
-                        .layoutWeight(1)
-                        .enabled(!this.mfChecking && (!this.hasAnyActiveSub() || this.isSubActive(sub)))
-                        .onClick(() => {
-                          if (this.isSubActive(sub)) {
-                            this.releaseMfSub()
-                          } else if (!this.hasAnyActiveSub()) {
-                            this.enableMfSub(sub)
-                          }
-                        })
-
-                      Button('保存')
-                        .fontSize(13)
-                        .fontColor(this.themeTextPrimary)
-                        .backgroundColor(this.themePlaceholder)
-                        .borderRadius(10)
-                        .layoutWeight(1)
-                        .onClick(() => {
-                          this.saveMfSubscription(sub)
-                        })
-
-                      Button(this.mfChecking ? '自检中…' : '自检')
-                        .fontSize(13)
-                        .fontColor(Color.White)
-                        .backgroundColor(this.themePrimary)
-                        .borderRadius(10)
-                        .layoutWeight(1)
-                        .enabled(!this.mfChecking)
-                        .onClick(() => {
-                          this.runMfCheck(sub)
-                        })
-                    }
-                    .width('100%')
+                    // 启用开关：点击即启用该音源并开始安装插件
+                    Toggle({ type: ToggleType.Switch, isOn: this.isSubActive(sub) })
+                      .selectedColor(this.themePrimary)
+                      .width(44)
+                      .enabled(!this.mfChecking)
+                      .onChange((isOn: boolean) => {
+                        if (isOn) {
+                          this.enableMfSub(sub)
+                        } else {
+                          this.releaseMfSub(sub)
+                        }
+                      })
                   }
                   .width('100%')
-                  .padding(16)
+                  .padding(14)
                   .backgroundColor(this.themeCardBg)
                   .borderRadius(14)
+                  .gesture(LongPressGesture()
+                    .onAction(() => {
+                      this.confirmRemoveMfSub(sub)
+                    }))
                 }, (sub: MFSubCard) => sub.id.toString())
 
                 // 添加订阅源
@@ -1506,15 +1610,15 @@ export struct PluginManagerPage {
                     this.addMfSub()
                   })
 
-                // 订阅自检输出
+                // 插件安装进程输出
                 Column() {
                   Row() {
                     Column({ space: 2 }) {
-                      Text('订阅自检')
+                      Text('插件安装进程')
                         .fontSize(15)
                         .fontColor(this.themeTextPrimary)
                         .fontWeight(FontWeight.Medium)
-                      Text('拉取订阅 → 安装插件 → 沙箱挂载 → 搜索/取链冒烟')
+                      Text('拉取订阅 → 安装插件 → 沙箱挂载')
                         .fontSize(11)
                         .fontColor(this.themeTextSecondary)
                     }
@@ -1533,7 +1637,7 @@ export struct PluginManagerPage {
                   .padding({ bottom: 8 })
 
                   if (this.mfCheckLines.length === 0) {
-                    Text('点击「自检」开始验证订阅源')
+                    Text('点击右侧开关启用订阅源，开始安装插件')
                       .fontSize(12)
                       .fontColor(this.themeTextSecondary)
                       .width('100%')
@@ -1643,7 +1747,7 @@ export struct PluginManagerPage {
                   .fontSize(16)
                   .fontColor(this.themeTextPrimary)
                   .fontWeight(FontWeight.Medium)
-                Text('点击「订阅导入」页的「自检」按钮\n或使用「插件管理」的「全部自检」')
+                Text('在「订阅导入」开启开关安装插件\n或使用「插件管理」的「全部自检」')
                   .fontSize(13)
                   .fontColor(this.themeTextSecondary)
                   .textAlign(TextAlign.Center)
@@ -1779,6 +1883,10 @@ export struct PluginManagerPage {
                         .padding({ left: 10, right: 10, top: 8, bottom: 8 })
                         .backgroundColor(this.themeCardBg)
                         .borderRadius(10)
+                        .gesture(LongPressGesture()
+                          .onAction(() => {
+                            this.confirmDeleteHistory(record)
+                          }))
                       })
                     }
                     .width('100%')

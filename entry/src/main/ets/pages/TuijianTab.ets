@@ -2,7 +2,7 @@ import { MusicApi } from '../utils/MusicApi'
 import { SourceInfo } from '../model/MusicModel'
 import type { SongInfo } from '../model/MusicModel'
 import { CoverImage } from '../components/CoverImage'
-import { HdsTabs } from '@kit.UIDesignKit'
+import { HdsTabs, HdsNavDestination, ScrollEffectType, hdsMaterial } from '@kit.UIDesignKit'
 
 interface RecommendCategory {
   title: string
@@ -71,30 +71,54 @@ export struct TuijianTab {
   }
 
   build() {
-    Column() {
-      this.SearchBar()
-
-      // 分类标签 HdsTabs：顶部分类栏可横向滚动，各分类懒加载缓存
-      HdsTabs() {
-        ForEach(this.categories, (cat: RecommendCategory, index: number) => {
-          TabContent() {
-            this.CategoryContent(index)
-          }
-          .tabBar(this.CategoryTabBar(cat, index))
-        }, (cat: RecommendCategory) => cat.title)
+    // V2.1.9：搜索栏迁入 HdsNavDestination 标题栏 bottomBuilder（HDS 官方模式：自定义区放搜索框），
+    // 栏体静止透明、样式与歌单详情页一致（GRADIENT_BLUR + systemMaterialEffect）
+    HdsNavDestination() {
+      Column() {
+        // 分类标签 HdsTabs：顶部分类栏可横向滚动，各分类懒加载缓存
+        HdsTabs() {
+          ForEach(this.categories, (cat: RecommendCategory, index: number) => {
+            TabContent() {
+              this.CategoryContent(index)
+            }
+            .tabBar(this.CategoryTabBar(cat, index))
+          }, (cat: RecommendCategory) => cat.title)
+        }
+        .barPosition(BarPosition.Start)
+        // V2.1.9：margin=TabBar 左右边距——首/末标签与搜索栏、内容区 16vp 对齐
+        .barMode(BarMode.Scrollable, { margin: 16 })
+        .onChange((index: number) => {
+          this.currentCategoryIndex = index
+          this.loadCategorySongs(index)
+        })
+        .layoutWeight(1)
+        .width('100%')
       }
-      .barPosition(BarPosition.Start)
-      .barMode(BarMode.Scrollable)
-      .onChange((index: number) => {
-        this.currentCategoryIndex = index
-        this.loadCategorySongs(index)
-      })
-      .layoutWeight(1)
       .width('100%')
+      .height('100%')
+      // V2.1.9：为浮动标题栏让位（stackBuilder 56vp + 8vp 间隙）
+      .padding({ top: 64 })
+      .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
     }
+    .titleBar({
+      content: {
+        // V2.1.9：stackBuilder 叠加于标题行，栏高保持 56vp（bottomBuilder 会附加 56vp 空标题行，弃用）
+        stackBuilder: (): void => this.SearchBar(),
+      },
+      // V2.1.9：与详情页同款——静止透明，滚动浮出浅灰模糊板
+      style: {
+        scrollEffectOpts: {
+          enableScrollEffect: true,
+          scrollEffectType: ScrollEffectType.GRADIENT_BLUR,
+        },
+        systemMaterialEffect: {
+          materialType: hdsMaterial.MaterialType.IMMERSIVE,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+        },
+      },
+    })
     .width('100%')
     .height('100%')
-    .backgroundColor(this.themeBgImageName.length > 0 ? Color.Transparent : this.themeBg)
   }
 
   @Builder SearchBar() {
@@ -116,7 +140,9 @@ export struct TuijianTab {
       .padding({ right: 10 })
     }
     .width('100%')
-    .padding({ left: 20, right: 20, top: 10, bottom: 6 })
+    .height(56)
+    // V2.1.9：标题栏 stackBuilder 行高 56vp，左右 16vp 与下方分类标签、内容区对齐
+    .padding({ left: 16, right: 16 })
     .onClick(() => {
       // 跳转到搜索 Tab（由 Index 监听信号切换）
       AppStorage.setOrCreate('jumpToSearchTab', Date.now())
@@ -124,19 +150,21 @@ export struct TuijianTab {
   }
 
   @Builder CategoryTabBar(cat: RecommendCategory, index: number) {
-    Row({ space: 4 }) {
+    Row({ space: 6 }) {
       SymbolGlyph(cat.icon)
-        .fontSize(14)
+        .fontSize(13)
         .fontColor([index === this.currentCategoryIndex ? Color.White : this.themeTextPrimary])
       Text(cat.title)
-        .fontSize(13)
+        .fontSize(14)
         .fontColor(index === this.currentCategoryIndex ? Color.White : this.themeTextPrimary)
-        .fontWeight(index === this.currentCategoryIndex ? FontWeight.Medium : FontWeight.Normal)
+        .fontWeight(index === this.currentCategoryIndex ? FontWeight.Medium : FontWeight.Regular)
     }
-    .height(30)
-    .padding({ left: 12, right: 12 })
+    .height(32)
+    // V2.1.9：标签背景原本紧贴相邻，增加标签间距使其更美观（首/末标签边距由 barMode margin 统一控制）
+    .margin({ left: index === 0 ? 0 : 6, right: index === this.categories.length - 1 ? 0 : 6 })
+    .padding({ left: 12, right: 12, top: 0, bottom: 0 })
     .justifyContent(FlexAlign.Center)
-    .borderRadius(15)
+    .borderRadius(16)
     .backgroundColor(index === this.currentCategoryIndex ? this.themePrimary : this.themeCardBg)
   }
 

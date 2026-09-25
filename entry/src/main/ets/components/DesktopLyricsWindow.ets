@@ -19,7 +19,7 @@ export struct DesktopLyricsWindow {
   private timer: number = -1
 
   aboutToAppear(): void {
-    this.ctx = getContext(this)
+    this.ctx = this.getUIContext().getHostContext() as Context
   }
 
   aboutToDisappear(): void {

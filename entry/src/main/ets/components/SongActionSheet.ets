@@ -10,7 +10,7 @@ import { systemShare } from '@kit.ShareKit'
 import { uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { MaterialCompat, MaterialCompatStyle } from '../utils/MaterialCompat'
 import { CompatUtils } from '../utils/CompatUtils'
-import { promptAction } from '@kit.ArkUI'
+
 
 interface ActionItem {
   icon: Resource
@@ -131,7 +131,7 @@ export struct SongActionSheet {
         description: `${this.song.songName} - ${this.song.artist}`,
       })
       const controller: systemShare.ShareController = new systemShare.ShareController(shareData)
-      const context = getContext(this) as common.UIAbilityContext
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext
       await controller.show(context, {
         selectionMode: systemShare.SelectionMode.SINGLE,
         previewMode: systemShare.SharePreviewMode.DETAIL,
@@ -196,7 +196,7 @@ export struct SongActionSheet {
   }
 
   private showToastMsg(msg: string): void {
-    promptAction.showToast({ message: msg, duration: 2000 })
+    this.getUIContext().getPromptAction().showToast({ message: msg, duration: 2000 })
   }
 
   private dismiss(): void {

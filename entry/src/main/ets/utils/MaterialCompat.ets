@@ -6,6 +6,7 @@
 // 统一返回 undefined（systemMaterial 参数接受 undefined，走默认弹窗背景）。
 
 import { uiMaterial } from '@kit.ArkUI'
+import { hdsMaterial } from '@kit.UIDesignKit'
 import { CompatUtils } from './CompatUtils'
 
 // 材质分档，对应 uiMaterial.ImmersiveStyle（从薄到厚）
@@ -136,6 +137,20 @@ export class MaterialCompat {
     } catch (_e) {
       // 兜底：个别设备 API 版本达标但材质接口异常时降级为默认样式，不崩溃
       return undefined
+    }
+  }
+
+  /**
+   * 设备是否支持沉浸式材质（IMMERSIVE）类型（hdsMaterial，6.1.0(23) 起）。
+   * 支持 → HDS 组件可安全使用 MaterialLevel.EXQUISITE 精美档；
+   * 不支持或查询异常 → 回落 ADAPTIVE 由系统按算力自适应，避免低配设备卡顿发热。
+   */
+  static supportsImmersiveMaterial(): boolean {
+    try {
+      const types: Array<hdsMaterial.MaterialType> = hdsMaterial.getSystemMaterialTypes()
+      return types.includes(hdsMaterial.MaterialType.IMMERSIVE)
+    } catch (_e) {
+      return false
     }
   }
 

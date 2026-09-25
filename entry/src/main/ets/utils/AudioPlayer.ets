@@ -404,6 +404,9 @@ export class AudioPlayer {
         AppStorage.setOrCreate('isPlaying', false)
         this.bgHelper.setPlaybackState(false, this._currentTime * 1000, 1.0, this._duration * 1000).catch(() => {
         })
+        // V2.0.9.3：暂停即结束听歌计时（音频焦点丢失等系统暂停不再漏计播放会话）
+        ListeningLevelManager.getInstance().endSession().catch(() => {
+        })
       } else if (state === 'stopped' || state === 'idle' || state === 'error') {
         this._isPlaying = false
         this._isPrepared = false
@@ -962,7 +965,7 @@ export class AudioPlayer {
 
     try {
       const decoder: util.TextDecoder = util.TextDecoder.create(primaryEncoding)
-      const result = decoder.decodeWithStream(textBytes)
+      const result = decoder.decodeToString(textBytes)
       if (AudioPlayer.isValidLyricText(result)) {
         return result
       }
@@ -974,7 +977,7 @@ export class AudioPlayer {
     if (encoding === 0x01) {
       try {
         const utf16leDecoder: util.TextDecoder = util.TextDecoder.create('utf-16le')
-        const utf16leResult = utf16leDecoder.decodeWithStream(textBytes)
+        const utf16leResult = utf16leDecoder.decodeToString(textBytes)
         if (AudioPlayer.isValidLyricText(utf16leResult)) {
           return utf16leResult
         }
@@ -1008,7 +1011,7 @@ export class AudioPlayer {
     }
     try {
       const latin1Decoder: util.TextDecoder = util.TextDecoder.create('iso-8859-1')
-      const latin1Result: string = latin1Decoder.decodeWithStream(textBytes)
+      const latin1Result: string = latin1Decoder.decodeToString(textBytes)
       return latin1Result
     } catch (_e) {
       // 所有编码都失败
@@ -1019,7 +1022,7 @@ export class AudioPlayer {
   private static tryDecodeLabel(label: string, bytes: Uint8Array): string {
     try {
       const decoder: util.TextDecoder = util.TextDecoder.create(label)
-      return decoder.decodeWithStream(bytes)
+      return decoder.decodeToString(bytes)
     } catch (_e) {
       return ''
     }
@@ -1157,7 +1160,7 @@ export class AudioPlayer {
             offset += len
 
             const decoder: util.TextDecoder = util.TextDecoder.create('utf-8')
-            const comment = decoder.decodeWithStream(commentBytes)
+            const comment = decoder.decodeToString(commentBytes)
 
             const eqIdx = comment.indexOf('=')
             if (eqIdx > 0) {

@@ -270,6 +270,17 @@ export class PlayerStore {
     }
   }
 
+  // V2.1.8：换源成功后改写当前曲目身份（source/songId/rawData 已变，refreshCurrentTrack
+  // 的同曲守卫会拦截），由调用方确认会话仍有效后无条件克隆刷新
+  static forceRefreshCurrentTrack(track: SongInfo): void {
+    try {
+      const clone: SongInfo = JSON.parse(JSON.stringify(track)) as SongInfo
+      AppStorage.setOrCreate(PlayerKeys.CURRENT_TRACK, clone)
+    } catch (_e) {
+      AppStorage.setOrCreate(PlayerKeys.CURRENT_TRACK, track)
+    }
+  }
+
   // 获取队列
   static getQueue(): SongInfo[] {
     const queue = AppStorage.get(PlayerKeys.QUEUE) as SongInfo[]

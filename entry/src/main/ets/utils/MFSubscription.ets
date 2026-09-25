@@ -1,6 +1,6 @@
 // MFSubscription.ets - MusicFree 订阅源管理
 // 订阅源 = 聚合插件地址：.json 为插件列表（{"plugins":[{"name","url"},...]}），.js 为单个插件
-// 存储：DatabaseHelper settings（mfSubscriptionUrl / mfSubscriptionEnabled）
+// 存储：DatabaseHelper settings（mfSubscriptionList / mfSubscriptionEnabled / mfSubscriptionActiveList）
 // 同步：解析订阅 → 逐个下载插件 → SourceManager.importMusicFreePlugin（沙箱挂载验证后注册）
 
 import { http } from '@kit.NetworkKit'
@@ -14,6 +14,7 @@ const KEY_URL: string = 'mfSubscriptionUrl'
 const KEY_LIST: string = 'mfSubscriptionList'
 const KEY_ENABLED: string = 'mfSubscriptionEnabled'
 const KEY_ACTIVE: string = 'mfSubscriptionActive'
+const KEY_ACTIVE_LIST: string = 'mfSubscriptionActiveList'
 
 /** 订阅内插件条目 */
 export interface MFSubPlugin {
@@ -84,14 +85,42 @@ export class MFSubscription {
     await DatabaseHelper.getInstance().setSetting(KEY_ENABLED, enabled ? 'true' : 'false')
   }
 
-  /** 读取当前启用的订阅源地址（''=未启用任何订阅，只允许单一启用） */
-  static async getActive(): Promise<string> {
-    return await DatabaseHelper.getInstance().getSetting(KEY_ACTIVE)
+  /** 读取已启用的订阅源地址列表（支持多源同时启用，空列表=未启用任何订阅）；旧版单启用配置自动迁移为列表 */
+  static async getActiveList(): Promise<string[]> {
+    const raw: string = await DatabaseHelper.getInstance().getSetting(KEY_ACTIVE_LIST)
+    if (raw.length > 0) {
+      try {
+        const arr: Object[] = JSON.parse(raw) as Object[]
+        const out: string[] = []
+        for (let i = 0; i < arr.length; i++) {
+          if (typeof arr[i] === 'string' && (arr[i] as string).length > 0) {
+            out.push(arr[i] as string)
+          }
+        }
+        return out
+      } catch (_e) {
+      }
+    }
+    // 旧版单启用迁移：迁移完成后清空旧键，避免释放后又被回迁
+    const legacy: string = await DatabaseHelper.getInstance().getSetting(KEY_ACTIVE)
+    if (legacy.length > 0) {
+      await MFSubscription.saveActiveList([legacy])
+      await DatabaseHelper.getInstance().setSetting(KEY_ACTIVE, '')
+      return [legacy]
+    }
+    return []
   }
 
-  /** 保存当前启用的订阅源地址（传空串即释放） */
-  static async saveActive(url: string): Promise<void> {
-    await DatabaseHelper.getInstance().setSetting(KEY_ACTIVE, url)
+  /** 保存已启用的订阅源地址列表（去重、过滤空项） */
+  static async saveActiveList(urls: string[]): Promise<void> {
+    const cleaned: string[] = []
+    for (let i = 0; i < urls.length; i++) {
+      const u: string = urls[i].trim()
+      if (u.length > 0 && cleaned.indexOf(u) < 0) {
+        cleaned.push(u)
+      }
+    }
+    await DatabaseHelper.getInstance().setSetting(KEY_ACTIVE_LIST, JSON.stringify(cleaned))
   }
 
   /** 校验订阅源地址：http(s) 且以 .js 或 .json 结尾 */
@@ -223,7 +252,7 @@ export class MFSubscription {
         }
         if (result instanceof ArrayBuffer) {
           const decoder: util.TextDecoder = util.TextDecoder.create('utf-8')
-          r.text = decoder.decodeWithStream(new Uint8Array(result as ArrayBuffer))
+          r.text = decoder.decodeToString(new Uint8Array(result as ArrayBuffer))
           return r
         }
         r.error = '响应格式异常'
